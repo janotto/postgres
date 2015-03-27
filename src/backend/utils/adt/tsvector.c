@@ -3,7 +3,7 @@
  * tsvector.c
  *	  I/O functions for tsvector
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -124,7 +124,8 @@ uniqueentry(WordEntryIN *a, int l, char *buf, int *outbuflen)
 				buflen += res->poslen * sizeof(WordEntryPos) + sizeof(uint16);
 			}
 			res++;
-			memcpy(res, ptr, sizeof(WordEntryIN));
+			if (res != ptr)
+				memcpy(res, ptr, sizeof(WordEntryIN));
 		}
 		else if (ptr->entry.haspos)
 		{
@@ -197,8 +198,6 @@ tsvectorin(PG_FUNCTION_ARGS)
 	char	   *tmpbuf;
 	char	   *cur;
 	int			buflen = 256;	/* allocated size of tmpbuf */
-
-	pg_verifymbstr(buf, strlen(buf), false);
 
 	state = init_tsvector_parser(buf, false, false);
 
@@ -311,7 +310,7 @@ tsvectorout(PG_FUNCTION_ARGS)
 {
 	TSVector	out = PG_GETARG_TSVECTOR(0);
 	char	   *outbuf;
-	int4		i,
+	int32		i,
 				lenbuf = 0,
 				pp;
 	WordEntry  *ptr = ARRPTR(out);

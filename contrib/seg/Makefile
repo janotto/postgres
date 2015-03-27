@@ -1,10 +1,11 @@
 # contrib/seg/Makefile
 
 MODULE_big = seg
-OBJS = seg.o segparse.o
+OBJS = seg.o segparse.o $(WIN32RES)
 
 EXTENSION = seg
 DATA = seg--1.0.sql seg--unpackaged--1.0.sql
+PGFILEDESC = "seg - line segment data type"
 
 REGRESS = seg
 
@@ -24,20 +25,6 @@ endif
 
 # segscan is compiled as part of segparse
 segparse.o: segscan.c
-
-segparse.c: segparse.y
-ifdef BISON
-	$(BISON) $(BISONFLAGS) -o $@ $<
-else
-	@$(missing) bison $< $@
-endif
-
-segscan.c: segscan.l
-ifdef FLEX
-	$(FLEX) $(FLEXFLAGS) -o'$@' $<
-else
-	@$(missing) flex $< $@
-endif
 
 distprep: segparse.c segscan.c
 

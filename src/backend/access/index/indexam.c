@@ -3,7 +3,7 @@
  * indexam.c
  *	  general index access method routines
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -67,7 +67,10 @@
 
 #include "access/relscan.h"
 #include "access/transam.h"
+#include "access/xlog.h"
+
 #include "catalog/index.h"
+#include "catalog/catalog.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -81,7 +84,7 @@
  *
  * Note: the ReindexIsProcessingIndex() check in RELATION_CHECKS is there
  * to check that we don't try to scan or do retail insertions into an index
- * that is currently being rebuilt or pending rebuild.	This helps to catch
+ * that is currently being rebuilt or pending rebuild.  This helps to catch
  * things that don't work when reindexing system catalogs.  The assertion
  * doesn't prevent the actual rebuild because we don't use RELATION_CHECKS
  * when calling the index AM's ambuild routine, and there is no reason for
@@ -114,6 +117,13 @@ do { \
 	} \
 } while(0)
 
+#define GET_UNCACHED_REL_PROCEDURE(pname) \
+do { \
+	if (!RegProcedureIsValid(indexRelation->rd_am->pname)) \
+		elog(ERROR, "invalid %s regproc", CppAsString(pname)); \
+	fmgr_info(indexRelation->rd_am->pname, &procedure); \
+} while(0)
+
 #define GET_SCAN_PROCEDURE(pname) \
 do { \
 	procedure = &scan->indexRelation->rd_aminfo->pname; \
@@ -139,7 +149,7 @@ static IndexScanDesc index_beginscan_internal(Relation indexRelation,
  *		index_open - open an index relation by relation OID
  *
  *		If lockmode is not "NoLock", the specified kind of lock is
- *		obtained on the index.	(Generally, NoLock should only be
+ *		obtained on the index.  (Generally, NoLock should only be
  *		used if the caller knows it has some appropriate lock on the
  *		index already.)
  *
@@ -404,7 +414,7 @@ index_markpos(IndexScanDesc scan)
  * returnable tuple in each HOT chain, and so restoring the prior state at the
  * granularity of the index AM is sufficient.  Since the only current user
  * of mark/restore functionality is nodeMergejoin.c, this effectively means
- * that merge-join plans only work for MVCC snapshots.	This could be fixed
+ * that merge-join plans only work for MVCC snapshots.  This could be fixed
  * if necessary, but for now it seems unimportant.
  * ----------------
  */
@@ -435,7 +445,7 @@ index_restrpos(IndexScanDesc scan)
 ItemPointer
 index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 {
-	FmgrInfo   	*procedure;
+	FmgrInfo   *procedure;
 	bool		found;
 
 	SCAN_CHECKS;
@@ -495,7 +505,7 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 HeapTuple
 index_fetch_heap(IndexScanDesc scan)
 {
-	ItemPointer	tid = &scan->xs_ctup.t_self;
+	ItemPointer tid = &scan->xs_ctup.t_self;
 	bool		all_dead = false;
 	bool		got_heap_tuple;
 
@@ -513,8 +523,7 @@ index_fetch_heap(IndexScanDesc scan)
 		 * Prune page, but only if we weren't already on this page
 		 */
 		if (prev_buf != scan->xs_cbuf)
-			heap_page_prune_opt(scan->heapRelation, scan->xs_cbuf,
-								RecentGlobalXmin);
+			heap_page_prune_opt(scan->heapRelation, scan->xs_cbuf);
 	}
 
 	/* Obtain share-lock on the buffer so we can examine visibility */
@@ -530,8 +539,8 @@ index_fetch_heap(IndexScanDesc scan)
 	if (got_heap_tuple)
 	{
 		/*
-		 * Only in a non-MVCC snapshot can more than one member of the
-		 * HOT chain be visible.
+		 * Only in a non-MVCC snapshot can more than one member of the HOT
+		 * chain be visible.
 		 */
 		scan->xs_continue_hot = !IsMVCCSnapshot(scan->xs_snapshot);
 		pgstat_count_heap_fetch(scan->indexRelation);
@@ -581,7 +590,7 @@ index_getnext(IndexScanDesc scan, ScanDirection direction)
 		{
 			/*
 			 * We are resuming scan of a HOT chain after having returned an
-			 * earlier member.	Must still hold pin on current heap page.
+			 * earlier member.  Must still hold pin on current heap page.
 			 */
 			Assert(BufferIsValid(scan->xs_cbuf));
 			Assert(ItemPointerGetBlockNumber(&scan->xs_ctup.t_self) ==
@@ -671,14 +680,14 @@ index_bulk_delete(IndexVacuumInfo *info,
 				  void *callback_state)
 {
 	Relation	indexRelation = info->index;
-	FmgrInfo   *procedure;
+	FmgrInfo	procedure;
 	IndexBulkDeleteResult *result;
 
 	RELATION_CHECKS;
-	GET_REL_PROCEDURE(ambulkdelete);
+	GET_UNCACHED_REL_PROCEDURE(ambulkdelete);
 
 	result = (IndexBulkDeleteResult *)
-		DatumGetPointer(FunctionCall4(procedure,
+		DatumGetPointer(FunctionCall4(&procedure,
 									  PointerGetDatum(info),
 									  PointerGetDatum(stats),
 									  PointerGetDatum((Pointer) callback),
@@ -698,14 +707,14 @@ index_vacuum_cleanup(IndexVacuumInfo *info,
 					 IndexBulkDeleteResult *stats)
 {
 	Relation	indexRelation = info->index;
-	FmgrInfo   *procedure;
+	FmgrInfo	procedure;
 	IndexBulkDeleteResult *result;
 
 	RELATION_CHECKS;
-	GET_REL_PROCEDURE(amvacuumcleanup);
+	GET_UNCACHED_REL_PROCEDURE(amvacuumcleanup);
 
 	result = (IndexBulkDeleteResult *)
-		DatumGetPointer(FunctionCall2(procedure,
+		DatumGetPointer(FunctionCall2(&procedure,
 									  PointerGetDatum(info),
 									  PointerGetDatum(stats)));
 
@@ -713,11 +722,14 @@ index_vacuum_cleanup(IndexVacuumInfo *info,
 }
 
 /* ----------------
- *		index_can_return - does index support index-only scans?
+ *		index_can_return
+ *
+ *		Does the index access method support index-only scans for the given
+ *		column?
  * ----------------
  */
 bool
-index_can_return(Relation indexRelation)
+index_can_return(Relation indexRelation, int attno)
 {
 	FmgrInfo   *procedure;
 
@@ -729,8 +741,9 @@ index_can_return(Relation indexRelation)
 
 	GET_REL_PROCEDURE(amcanreturn);
 
-	return DatumGetBool(FunctionCall1(procedure,
-									  PointerGetDatum(indexRelation)));
+	return DatumGetBool(FunctionCall2(procedure,
+									  PointerGetDatum(indexRelation),
+									  Int32GetDatum(attno)));
 }
 
 /* ----------------
@@ -751,7 +764,7 @@ index_can_return(Relation indexRelation)
  *		particular indexed attribute are those with both types equal to
  *		the index opclass' opcintype (note that this is subtly different
  *		from the indexed attribute's own type: it may be a binary-compatible
- *		type instead).	Only the default functions are stored in relcache
+ *		type instead).  Only the default functions are stored in relcache
  *		entries --- access methods can use the syscache to look up non-default
  *		functions.
  *
@@ -785,7 +798,7 @@ index_getprocid(Relation irel,
  *		index_getprocinfo
  *
  *		This routine allows index AMs to keep fmgr lookup info for
- *		support procs in the relcache.	As above, only the "default"
+ *		support procs in the relcache.  As above, only the "default"
  *		functions for any particular indexed attribute are cached.
  *
  * Note: the return value points into cached data that will be lost during

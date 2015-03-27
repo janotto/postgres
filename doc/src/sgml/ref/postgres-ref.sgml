@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="app-postgres">
+ <indexterm zone="app-postgres">
+  <primary>postgres</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle><application>postgres</application></refentrytitle>
   <manvolnum>1</manvolnum>
@@ -14,10 +18,6 @@ PostgreSQL documentation
   <refname>postgres</refname>
   <refpurpose><productname>PostgreSQL</productname> database server</refpurpose>
  </refnamediv>
-
- <indexterm zone="app-postgres">
-  <primary>postgres</primary>
- </indexterm>
 
  <refsynopsisdiv>
   <cmdsynopsis>
@@ -102,18 +102,6 @@ PostgreSQL documentation
 
     <variablelist>
      <varlistentry>
-      <term><option>-A 0|1</option></term>
-      <listitem>
-       <para>
-        Enables run-time assertion checks, which is a debugging aid to
-        detect programming mistakes.  This option is only available if
-        assertions were enabled when <productname>PostgreSQL</> was
-        compiled. If so, the default is on.
-       </para>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
       <term><option>-B <replaceable class="parameter">nbuffers</replaceable></option></term>
       <listitem>
        <para>
@@ -144,12 +132,19 @@ PostgreSQL documentation
       <term><option>-C <replaceable>name</replaceable></option></term>
       <listitem>
        <para>
-        Returns the value of a named run-time parameter, and exits.
+        Prints the value of the named run-time parameter, and exits.
         (See the <option>-c</> option above for details.)  This can
         be used on a running server, and returns values from
         <filename>postgresql.conf</>, modified by any parameters
         supplied in this invocation.  It does not reflect parameters
         supplied when the cluster was started.
+       </para>
+
+       <para>
+        This option is meant for other programs that interact with a server
+        instance, such as <xref linkend="app-pg-ctl">, to query configuration
+        parameter values.  User-facing applications should instead use <xref
+        linkend="sql-show"> or the <structname>pg_settings</structname> view.
        </para>
       </listitem>
      </varlistentry>
@@ -172,8 +167,8 @@ PostgreSQL documentation
       <term><option>-D <replaceable class="parameter">datadir</replaceable></option></term>
       <listitem>
        <para>
-        Specifies the file system location of the data directory or
-        configuration file(s).  See
+        Specifies the file system location of the database
+        configuration files.  See
         <xref linkend="runtime-config-file-locations"> for details.
        </para>
       </listitem>
@@ -247,8 +242,14 @@ PostgreSQL documentation
        <para>
         Specifies the directory of the Unix-domain socket on which
         <command>postgres</command> is to listen for
-        connections from client applications.  The default is normally
-        <filename>/tmp</filename>, but can be changed at build time.
+        connections from client applications.  The value can also be a
+        comma-separated list of directories.  An empty value
+        specifies not listening on any Unix-domain sockets, in which case
+        only TCP/IP sockets can be used to connect to the server.
+        The default value is normally
+        <filename>/tmp</filename>, but that can be changed at build time.
+        Specifying this option is equivalent to setting the <xref
+        linkend="guc-unix-socket-directories"> configuration parameter.
        </para>
       </listitem>
      </varlistentry>
@@ -287,7 +288,8 @@ PostgreSQL documentation
         class="parameter">extra-options</replaceable> are passed to
         all server processes started by this
         <command>postgres</command> process.  If the option string contains
-        any spaces, the entire string must be quoted.
+        any spaces, the entire string must be quoted;  multiple
+        option invocations are appended.
        </para>
 
        <para>
@@ -339,6 +341,16 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-V</></term>
+      <term><option>--version</></term>
+      <listitem>
+       <para>
+        Print the <application>postgres</application> version and exit.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--<replaceable>name</replaceable>=<replaceable>value</replaceable></option></term>
       <listitem>
        <para>
@@ -355,6 +367,17 @@ PostgreSQL documentation
         This option dumps out the server's internal configuration variables,
         descriptions, and defaults in tab-delimited <command>COPY</> format.
         It is designed primarily for use by administration tools.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-?</></term>
+      <term><option>--help</></term>
+      <listitem>
+       <para>
+        Show help about <application>postgres</application> command line
+        arguments, and exit.
        </para>
       </listitem>
      </varlistentry>
@@ -495,6 +518,10 @@ PostgreSQL documentation
    <refsect2>
     <title>Options for Single-User Mode</title>
 
+    <indexterm>
+     <primary>single-user mode</primary>
+    </indexterm>
+
     <para>
      The following options only apply to the single-user mode.
     </para>
@@ -544,9 +571,8 @@ PostgreSQL documentation
       <listitem>
        <para>
         Send all server log output to <replaceable
-        class="parameter">filename</replaceable>.  In normal multiuser
-        mode, this option is ignored, and <systemitem>stderr</> is
-        used by all processes.
+        class="parameter">filename</replaceable>.  This option is only
+        honored when supplied as a command-line option.
        </para>
       </listitem>
      </varlistentry>
@@ -698,14 +724,18 @@ PostgreSQL documentation
 
   <para>
    To cancel a running query, send the <literal>SIGINT</literal> signal
-   to the process running that command.
+   to the process running that command. To terminate a backend process
+   cleanly, send <literal>SIGTERM</literal> to that process. See
+   also <function>pg_cancel_backend</> and <function>pg_terminate_backend</>
+   in <xref linkend="functions-admin-signal"> for the SQL-callable equivalents
+   of these two actions.
   </para>
 
   <para>
-   The <command>postgres</command> server uses <literal>SIGTERM</literal>
-   to tell subordinate server processes to quit normally and
-   <literal>SIGQUIT</literal> to terminate without the normal cleanup.
-   These signals <emphasis>should not</emphasis> be used by users.  It
+   The <command>postgres</command> server uses <literal>SIGQUIT</literal>
+   to tell subordinate server processes to terminate without normal
+   cleanup.
+   This signal <emphasis>should not</emphasis> be used by users.  It
    is also unwise to send <literal>SIGKILL</literal> to a server
    process &mdash; the main <command>postgres</command> process will
    interpret this as a crash and will force all the sibling processes

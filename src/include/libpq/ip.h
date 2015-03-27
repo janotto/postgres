@@ -6,7 +6,7 @@
  * These definitions are used by both frontend and backend code.  Be careful
  * what you include here!
  *
- * Copyright (c) 2003-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2003-2015, PostgreSQL Global Development Group
  *
  * src/include/libpq/ip.h
  *
@@ -15,8 +15,8 @@
 #ifndef IP_H
 #define IP_H
 
-#include "getaddrinfo.h"	/* pgrminclude ignore */
-#include "libpq/pqcomm.h"	/* pgrminclude ignore */
+#include "getaddrinfo.h"		/* pgrminclude ignore */
+#include "libpq/pqcomm.h"		/* pgrminclude ignore */
 
 
 #ifdef	HAVE_UNIX_SOCKETS
@@ -45,11 +45,6 @@ extern int pg_range_sockaddr(const struct sockaddr_storage * addr,
 
 extern int pg_sockaddr_cidr_mask(struct sockaddr_storage * mask,
 					  char *numbits, int family);
-
-#ifdef HAVE_IPV6
-extern void pg_promote_v4_to_v6_addr(struct sockaddr_storage * addr);
-extern void pg_promote_v4_to_v6_mask(struct sockaddr_storage * addr);
-#endif
 
 extern int	pg_foreach_ifaddr(PgIfAddrCallback callback, void *cb_data);
 

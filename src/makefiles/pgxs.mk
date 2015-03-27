@@ -9,11 +9,12 @@
 # Use the following layout for your Makefile:
 #
 #   [variable assignments, see below]
-#   [custom rules, rarely necessary]
 #
 #   PG_CONFIG = pg_config
 #   PGXS := $(shell $(PG_CONFIG) --pgxs)
 #   include $(PGXS)
+#
+#   [custom rules, rarely necessary]
 #
 # Set one of these three variables to specify what is built:
 #
@@ -62,8 +63,29 @@ top_builddir := $(dir $(PGXS))../..
 include $(top_builddir)/src/Makefile.global
 
 top_srcdir = $(top_builddir)
+# If VPATH is set or Makefile is not in current directory we are building
+# the extension with VPATH so we set the variable here.
+ifdef VPATH
+srcdir = $(VPATH)
+else
+ifeq ($(CURDIR),$(dir $(firstword $(MAKEFILE_LIST))))
 srcdir = .
 VPATH =
+else
+srcdir = $(dir $(firstword $(MAKEFILE_LIST)))
+VPATH = $(srcdir)
+endif
+endif
+
+# These might be set in Makefile.global, but if they were not found
+# during the build of PostgreSQL, supply default values so that users
+# of pgxs can use the variables.
+ifeq ($(BISON),)
+BISON = bison
+endif
+ifeq ($(FLEX),)
+FLEX = flex
+endif
 endif
 
 
@@ -136,6 +158,9 @@ endif # MODULE_big
 
 
 installdirs:
+ifneq (,$(EXTENSION))
+	$(MKDIR_P) '$(DESTDIR)$(datadir)/extension'
+endif
 ifneq (,$(DATA)$(DATA_built))
 	$(MKDIR_P) '$(DESTDIR)$(datadir)/$(datamoduledir)'
 endif
@@ -192,7 +217,7 @@ endif # MODULE_big
 
 clean:
 ifdef MODULES
-	rm -f $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .o, $(MODULES))
+	rm -f $(addsuffix $(DLSUFFIX), $(MODULES)) $(addsuffix .o, $(MODULES)) $(WIN32RES)
 endif
 ifdef DATA_built
 	rm -f $(DATA_built)
@@ -227,7 +252,11 @@ distclean maintainer-clean: clean
 ifdef REGRESS
 
 # Select database to use for running the tests
-REGRESS_OPTS += --dbname=$(CONTRIB_TESTDB)
+ifneq ($(USE_MODULE_DB),)
+  REGRESS_OPTS += --dbname=$(CONTRIB_TESTDB_MODULE)
+else
+  REGRESS_OPTS += --dbname=$(CONTRIB_TESTDB)
+endif
 
 # where to find psql for running the tests
 PSQLDIR = $(bindir)
@@ -246,6 +275,7 @@ test_files_build := $(patsubst $(srcdir)/%, $(abs_builddir)/%, $(test_files_src)
 
 all: $(test_files_build)
 $(test_files_build): $(abs_builddir)/%: $(srcdir)/%
+	$(MKDIR_P) $(dir $@)
 	ln -s $< $@
 endif # VPATH
 
@@ -279,5 +309,5 @@ endif
 
 ifdef PROGRAM
 $(PROGRAM): $(OBJS)
-	$(CC) $(CFLAGS) $(OBJS) $(PG_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+	$(CC) $(CFLAGS) $(OBJS) $(PG_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 endif

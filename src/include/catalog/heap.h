@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/heap.c
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/heap.h
@@ -14,8 +14,9 @@
 #ifndef HEAP_H
 #define HEAP_H
 
-#include "parser/parse_node.h"
 #include "catalog/indexing.h"
+#include "catalog/objectaddress.h"
+#include "parser/parse_node.h"
 
 
 typedef struct RawColumnDefault
@@ -27,13 +28,15 @@ typedef struct RawColumnDefault
 typedef struct CookedConstraint
 {
 	ConstrType	contype;		/* CONSTR_DEFAULT or CONSTR_CHECK */
+	Oid			conoid;			/* constr OID if created, otherwise Invalid */
 	char	   *name;			/* name, or NULL if none */
 	AttrNumber	attnum;			/* which attr (only for DEFAULT) */
 	Node	   *expr;			/* transformed default or check expr */
 	bool		skip_validation;	/* skip validation? (only for CHECK) */
 	bool		is_local;		/* constraint has local (non-inherited) def */
 	int			inhcount;		/* number of times constraint is inherited */
-	bool		is_only;		/* constraint has local def and cannot be inherited */
+	bool		is_no_inherit;	/* constraint has local def and cannot be
+								 * inherited */
 } CookedConstraint;
 
 extern Relation heap_create(const char *relname,
@@ -66,7 +69,11 @@ extern Oid heap_create_with_catalog(const char *relname,
 						 OnCommitAction oncommit,
 						 Datum reloptions,
 						 bool use_user_acl,
-						 bool allow_system_table_mods);
+						 bool allow_system_table_mods,
+						 bool is_internal,
+						 ObjectAddress *typaddress);
+
+extern void heap_create_init_fork(Relation rel);
 
 extern void heap_drop_with_catalog(Oid relid);
 
@@ -93,9 +100,10 @@ extern List *AddRelationNewConstraints(Relation rel,
 						  List *newConstraints,
 						  bool allow_merge,
 						  bool is_local,
-						  bool is_only);
+						  bool is_internal);
 
-extern void StoreAttrDefault(Relation rel, AttrNumber attnum, Node *expr);
+extern Oid StoreAttrDefault(Relation rel, AttrNumber attnum,
+				 Node *expr, bool is_internal);
 
 extern Node *cookDefault(ParseState *pstate,
 			Node *raw_default,
@@ -105,6 +113,7 @@ extern Node *cookDefault(ParseState *pstate,
 
 extern void DeleteRelationTuple(Oid relid);
 extern void DeleteAttributeTuples(Oid relid);
+extern void DeleteSystemAttributeTuples(Oid relid);
 extern void RemoveAttributeById(Oid relid, AttrNumber attnum);
 extern void RemoveAttrDefault(Oid relid, AttrNumber attnum,
 				  DropBehavior behavior, bool complain, bool internal);

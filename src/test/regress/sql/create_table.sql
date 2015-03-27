@@ -232,6 +232,10 @@ CREATE TABLE array_index_op_test (
 	t			text[]
 );
 
+CREATE TABLE testjsonb (
+       j jsonb
+);
+
 CREATE TABLE IF NOT EXISTS test_tsvector(
 	t text,
 	a tsvector
@@ -250,3 +254,8 @@ CREATE TEMP TABLE explicitly_temp (a int primary key);			-- also OK
 CREATE TEMP TABLE pg_temp.doubly_temp (a int primary key);		-- also OK
 CREATE TEMP TABLE public.temp_to_perm (a int primary key);		-- not OK
 DROP TABLE unlogged1, public.unlogged2;
+
+CREATE TABLE as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
+CREATE TABLE as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
+CREATE TABLE IF NOT EXISTS as_select1 AS SELECT * FROM pg_class WHERE relkind = 'r';
+DROP TABLE as_select1;

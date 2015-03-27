@@ -4,7 +4,7 @@
  *	  prototypes for costsize.c and clausesel.c.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/optimizer/cost.h
@@ -27,7 +27,7 @@
 #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
 #define DEFAULT_CPU_OPERATOR_COST  0.0025
 
-#define DEFAULT_EFFECTIVE_CACHE_SIZE  16384		/* measured in pages */
+#define DEFAULT_EFFECTIVE_CACHE_SIZE  524288	/* measured in pages */
 
 typedef enum
 {
@@ -66,22 +66,26 @@ extern int	constraint_exclusion;
 extern double clamp_row_est(double nrows);
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
 					double index_pages, PlannerInfo *root);
-extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel);
+extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+			 ParamPathInfo *param_info);
 extern void cost_index(IndexPath *path, PlannerInfo *root,
-					   double loop_count);
+		   double loop_count);
 extern void cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+					  ParamPathInfo *param_info,
 					  Path *bitmapqual, double loop_count);
 extern void cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root);
 extern void cost_bitmap_or_node(BitmapOrPath *path, PlannerInfo *root);
 extern void cost_bitmap_tree_node(Path *path, Cost *cost, Selectivity *selec);
 extern void cost_tidscan(Path *path, PlannerInfo *root,
-			 RelOptInfo *baserel, List *tidquals);
-extern void cost_subqueryscan(Path *path, RelOptInfo *baserel);
+			 RelOptInfo *baserel, List *tidquals, ParamPathInfo *param_info);
+extern void cost_subqueryscan(Path *path, PlannerInfo *root,
+				  RelOptInfo *baserel, ParamPathInfo *param_info);
 extern void cost_functionscan(Path *path, PlannerInfo *root,
-				  RelOptInfo *baserel);
+				  RelOptInfo *baserel, ParamPathInfo *param_info);
 extern void cost_valuesscan(Path *path, PlannerInfo *root,
-				RelOptInfo *baserel);
-extern void cost_ctescan(Path *path, PlannerInfo *root, RelOptInfo *baserel);
+				RelOptInfo *baserel, ParamPathInfo *param_info);
+extern void cost_ctescan(Path *path, PlannerInfo *root,
+			 RelOptInfo *baserel, ParamPathInfo *param_info);
 extern void cost_recursive_union(Plan *runion, Plan *nrterm, Plan *rterm);
 extern void cost_sort(Path *path, PlannerInfo *root,
 		  List *pathkeys, Cost input_cost, double tuples, int width,
@@ -149,6 +153,15 @@ extern void compute_semi_anti_join_factors(PlannerInfo *root,
 							   List *restrictlist,
 							   SemiAntiJoinFactors *semifactors);
 extern void set_baserel_size_estimates(PlannerInfo *root, RelOptInfo *rel);
+extern double get_parameterized_baserel_size(PlannerInfo *root,
+							   RelOptInfo *rel,
+							   List *param_clauses);
+extern double get_parameterized_joinrel_size(PlannerInfo *root,
+							   RelOptInfo *rel,
+							   double outer_rows,
+							   double inner_rows,
+							   SpecialJoinInfo *sjinfo,
+							   List *restrict_clauses);
 extern void set_joinrel_size_estimates(PlannerInfo *root, RelOptInfo *rel,
 						   RelOptInfo *outer_rel,
 						   RelOptInfo *inner_rel,

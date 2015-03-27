@@ -29,6 +29,7 @@ SELECT '2006-08-13 12:34:56'::timestamptz;
 
 -- SET LOCAL has no effect outside of a transaction
 SET LOCAL vacuum_cost_delay TO 50;
+WARNING:  SET LOCAL can only be used in transaction blocks
 SHOW vacuum_cost_delay;
  vacuum_cost_delay 
 -------------------
@@ -36,6 +37,7 @@ SHOW vacuum_cost_delay;
 (1 row)
 
 SET LOCAL datestyle = 'SQL';
+WARNING:  SET LOCAL can only be used in transaction blocks
 SHOW datestyle;
  DateStyle 
 -----------
@@ -605,6 +607,31 @@ SELECT current_user = 'temp_reset_user';
 
 DROP ROLE temp_reset_user;
 --
+-- search_path should react to changes in pg_namespace
+--
+set search_path = foo, public, not_there_initially;
+select current_schemas(false);
+ current_schemas 
+-----------------
+ {public}
+(1 row)
+
+create schema not_there_initially;
+select current_schemas(false);
+       current_schemas        
+------------------------------
+ {public,not_there_initially}
+(1 row)
+
+drop schema not_there_initially;
+select current_schemas(false);
+ current_schemas 
+-----------------
+ {public}
+(1 row)
+
+reset search_path;
+--
 -- Tests for function-local GUC settings
 --
 set work_mem = '3MB';
@@ -617,14 +644,7 @@ select report_guc('work_mem'), current_setting('work_mem');
  1MB        | 3MB
 (1 row)
 
--- this should draw only a warning
-alter function report_guc(text) set search_path = no_such_schema;
-NOTICE:  schema "no_such_schema" does not exist
--- with error occurring here
-select report_guc('work_mem'), current_setting('work_mem');
-ERROR:  invalid value for parameter "search_path": "no_such_schema"
-DETAIL:  schema "no_such_schema" does not exist
-alter function report_guc(text) reset search_path set work_mem = '2MB';
+alter function report_guc(text) set work_mem = '2MB';
 select report_guc('work_mem'), current_setting('work_mem');
  report_guc | current_setting 
 ------------+-----------------
@@ -700,3 +720,19 @@ select myfunc(1), current_setting('work_mem');
  2MB    | 2MB
 (1 row)
 
+-- Normally, CREATE FUNCTION should complain about invalid values in
+-- function SET options; but not if check_function_bodies is off,
+-- because that creates ordering hazards for pg_dump
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+NOTICE:  text search configuration "no_such_config" does not exist
+ERROR:  invalid value for parameter "default_text_search_config": "no_such_config"
+set check_function_bodies = off;
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+NOTICE:  text search configuration "no_such_config" does not exist
+select func_with_bad_set();
+ERROR:  invalid value for parameter "default_text_search_config": "no_such_config"
+reset check_function_bodies;

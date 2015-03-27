@@ -1,7 +1,7 @@
 /*
  * re_*exec and friends - match REs
  *
- * Copyright (c) 1998, 1999 Henry Spencer.	All rights reserved.
+ * Copyright (c) 1998, 1999 Henry Spencer.  All rights reserved.
  *
  * Development of this software was funded, in part, by Cray Research Inc.,
  * UUNET Communications Services Inc., Sun Microsystems Inc., and Scriptics
@@ -259,6 +259,7 @@ pg_regexec(regex_t *re,
 	/* clean up */
 	if (v->pmatch != pmatch && v->pmatch != mat)
 		FREE(v->pmatch);
+	n = (size_t) v->g->ntree;
 	for (i = 0; i < n; i++)
 	{
 		if (v->subdfas[i] != NULL)
@@ -487,19 +488,21 @@ cfindloop(struct vars * v,
 					*coldp = cold;
 					return er;
 				}
-				if ((shorter) ? end == estop : end == begin)
-				{
-					/* no point in trying again */
-					*coldp = cold;
-					return REG_NOMATCH;
-				}
-				/* go around and try again */
+				/* try next shorter/longer match with same begin point */
 				if (shorter)
+				{
+					if (end == estop)
+						break;	/* NOTE BREAK OUT */
 					estart = end + 1;
+				}
 				else
+				{
+					if (end == begin)
+						break;	/* NOTE BREAK OUT */
 					estop = end - 1;
-			}
-		}
+				}
+			}					/* end loop over endpoint positions */
+		}						/* end loop over beginning positions */
 	} while (close < v->stop);
 
 	*coldp = cold;
@@ -531,9 +534,14 @@ zaptreesubs(struct vars * v,
 {
 	if (t->op == '(')
 	{
-		assert(t->subno > 0);
-		v->pmatch[t->subno].rm_so = -1;
-		v->pmatch[t->subno].rm_eo = -1;
+		int			n = t->subno;
+
+		assert(n > 0);
+		if ((size_t) n < v->nmatch)
+		{
+			v->pmatch[n].rm_so = -1;
+			v->pmatch[n].rm_eo = -1;
+		}
 	}
 
 	if (t->left != NULL)
@@ -543,7 +551,7 @@ zaptreesubs(struct vars * v,
 }
 
 /*
- * subset - set any subexpression relevant to a successful subre
+ * subset - set subexpression match data for a successful subre
  */
 static void
 subset(struct vars * v,
@@ -587,6 +595,10 @@ cdissect(struct vars * v,
 
 	assert(t != NULL);
 	MDEBUG(("cdissect %ld-%ld %c\n", LOFF(begin), LOFF(end), t->op));
+
+	/* handy place to check for operation cancel */
+	if (CANCEL_REQUESTED(v->re))
+		return REG_CANCEL;
 
 	switch (t->op)
 	{
@@ -1023,10 +1035,10 @@ citerdissect(struct vars * v,
 		}
 
 		/*
-		 * We've identified a way to divide the string into k sub-matches
-		 * that works so far as the child DFA can tell.  If k is an allowed
-		 * number of matches, start the slow part: recurse to verify each
-		 * sub-match.  We always have k <= max_matches, needn't check that.
+		 * We've identified a way to divide the string into k sub-matches that
+		 * works so far as the child DFA can tell.  If k is an allowed number
+		 * of matches, start the slow part: recurse to verify each sub-match.
+		 * We always have k <= max_matches, needn't check that.
 		 */
 		if (k < min_matches)
 			goto backtrack;
@@ -1060,13 +1072,14 @@ citerdissect(struct vars * v,
 		/* match failed to verify, so backtrack */
 
 backtrack:
+
 		/*
 		 * Must consider shorter versions of the current sub-match.  However,
 		 * we'll only ask for a zero-length match if necessary.
 		 */
 		while (k > 0)
 		{
-			chr	   *prev_end = endpts[k - 1];
+			chr		   *prev_end = endpts[k - 1];
 
 			if (endpts[k] > prev_end)
 			{
@@ -1177,6 +1190,10 @@ creviterdissect(struct vars * v,
 			(k >= min_matches || min_matches - k < end - limit))
 			limit++;
 
+		/* if this is the last allowed sub-match, it must reach to the end */
+		if (k >= max_matches)
+			limit = end;
+
 		/* try to find an endpoint for the k'th sub-match */
 		endpts[k] = shortest(v, d, endpts[k - 1], limit, end,
 							 (chr **) NULL, (int *) NULL);
@@ -1209,10 +1226,10 @@ creviterdissect(struct vars * v,
 		}
 
 		/*
-		 * We've identified a way to divide the string into k sub-matches
-		 * that works so far as the child DFA can tell.  If k is an allowed
-		 * number of matches, start the slow part: recurse to verify each
-		 * sub-match.  We always have k <= max_matches, needn't check that.
+		 * We've identified a way to divide the string into k sub-matches that
+		 * works so far as the child DFA can tell.  If k is an allowed number
+		 * of matches, start the slow part: recurse to verify each sub-match.
+		 * We always have k <= max_matches, needn't check that.
 		 */
 		if (k < min_matches)
 			goto backtrack;
@@ -1246,6 +1263,7 @@ creviterdissect(struct vars * v,
 		/* match failed to verify, so backtrack */
 
 backtrack:
+
 		/*
 		 * Must consider longer versions of the current sub-match.
 		 */

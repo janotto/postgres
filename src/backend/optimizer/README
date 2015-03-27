@@ -297,9 +297,6 @@ planner()
   handle UNION/INTERSECT/EXCEPT, GROUP BY, HAVING, aggregates,
 	ORDER BY, DISTINCT, LIMIT
 --query_planner()
-   pull out constant quals, which can be used to gate execution of the
-	whole plan (if any are found, we make a top-level Result node
-	to do the gating)
    make list of base relations used in query
    split up the qual into restrictions (a=1) and joins (b=c)
    find qual clauses that enable merge and hash joins
@@ -318,11 +315,11 @@ planner()
       Back at standard_join_search(), apply set_cheapest() to extract the
       cheapest path for each newly constructed joinrel.
       Loop back if this wasn't the top join level.
-   Back at query_planner:
-    put back any constant quals by adding a Result node
  Back at grouping_planner:
+ convert Path tree returned by query_planner into a Plan tree
  do grouping(GROUP)
  do aggregates
+ do window functions
  make unique(DISTINCT)
  make sort(ORDER BY)
  make limit(LIMIT/OFFSET)
@@ -372,10 +369,10 @@ generated during the optimization process are marked with their sort order
 
 It is also possible to avoid an explicit sort step to implement a user's
 ORDER BY clause if the final path has the right ordering already, so the
-sort ordering is of interest even at the top level.  query_planner() will
+sort ordering is of interest even at the top level.  grouping_planner() will
 look for the cheapest path with a sort order matching the desired order,
-and grouping_planner() will compare its cost to the cost of using the
-cheapest-overall path and doing an explicit sort.
+then compare its cost to the cost of using the cheapest-overall path and
+doing an explicit sort on that.
 
 When we are generating paths for a particular RelOptInfo, we discard a path
 if it is more expensive than another known path that has the same or better
@@ -496,6 +493,14 @@ it's possible that it belongs to more than one.  We keep track of all the
 families to ensure that we can make use of an index belonging to any one of
 the families for mergejoin purposes.)
 
+An EquivalenceClass can contain "em_is_child" members, which are copies
+of members that contain appendrel parent relation Vars, transposed to
+contain the equivalent child-relation variables or expressions.  These
+members are *not* full-fledged members of the EquivalenceClass and do not
+affect the class's overall properties at all.  They are kept only to
+simplify matching of child-relation expressions to EquivalenceClasses.
+Most operations on EquivalenceClasses should ignore child members.
+
 
 PathKeys
 --------
@@ -581,16 +586,6 @@ since they are easily compared to the pathkeys of a potential candidate
 path.  So, SortGroupClause lists are turned into pathkeys lists for use
 inside the optimizer.
 
-Because we have to generate pathkeys lists from the sort clauses before
-we've finished EquivalenceClass merging, we cannot use the pointer-equality
-method of comparing PathKeys in the earliest stages of the planning
-process.  Instead, we generate "non canonical" PathKeys that reference
-single-element EquivalenceClasses that might get merged later.  After we
-complete EquivalenceClass merging, we replace these with "canonical"
-PathKeys that reference only fully-merged classes, and after that we make
-sure we don't generate more than one copy of each "canonical" PathKey.
-Then it is safe to use pointer comparison on canonical PathKeys.
-
 An additional refinement we can make is to insist that canonical pathkey
 lists (sort orderings) do not mention the same EquivalenceClass more than
 once.  For example, in all these cases the second sort column is redundant,
@@ -643,12 +638,11 @@ mergejoinable clauses found in the quals.  At the end of this process,
 we know all we can know about equivalence of different variables, so
 subsequently there will be no further merging of EquivalenceClasses.
 At that point it is possible to consider the EquivalenceClasses as
-"canonical" and build canonical PathKeys that reference them.  Before
-we reach that point (actually, before entering query_planner at all)
-we also ensure that we have constructed EquivalenceClasses for all the
-expressions used in the query's ORDER BY and related clauses.  These
-classes might or might not get merged together, depending on what we
-find in the quals.
+"canonical" and build canonical PathKeys that reference them.  At this
+time we construct PathKeys for the query's ORDER BY and related clauses.
+(Any ordering expressions that do not appear elsewhere will result in
+the creation of new EquivalenceClasses, but this cannot result in merging
+existing classes, so canonical-ness is not lost.)
 
 Because all the EquivalenceClasses are known before we begin path
 generation, we can use them as a guide to which indexes are of interest:
@@ -708,17 +702,37 @@ intermediate layers of joins, for example:
 			-> Index Scan using C_Z_IDX on C
 				Index Condition: C.Z = A.X
 
-If all joins are plain inner joins then this is unnecessary, because
-it's always possible to reorder the joins so that a parameter is used
+If all joins are plain inner joins then this is usually unnecessary,
+because it's possible to reorder the joins so that a parameter is used
 immediately below the nestloop node that provides it.  But in the
-presence of outer joins, join reordering may not be possible, and then
-this option can be critical.  Before version 9.2, Postgres used ad-hoc
-methods for planning and executing such queries, and those methods could
-not handle passing parameters down through multiple join levels.
+presence of outer joins, such join reordering may not be possible.
+
+Also, the bottom-level scan might require parameters from more than one
+other relation.  In principle we could join the other relations first
+so that all the parameters are supplied from a single nestloop level.
+But if those other relations have no join clause in common (which is
+common in star-schema queries for instance), the planner won't consider
+joining them directly to each other.  In such a case we need to be able
+to create a plan like
+
+    NestLoop
+        -> Seq Scan on SmallTable1 A
+        NestLoop
+            -> Seq Scan on SmallTable2 B
+            NestLoop
+                -> Index Scan using XYIndex on LargeTable C
+                      Index Condition: C.X = A.AID and C.Y = B.BID
+
+so we should be willing to pass down A.AID through a join even though
+there is no join order constraint forcing the plan to look like this.
+
+Before version 9.2, Postgres used ad-hoc methods for planning and
+executing nestloop queries of this kind, and those methods could not
+handle passing parameters down through multiple join levels.
 
 To plan such queries, we now use a notion of a "parameterized path",
 which is a path that makes use of a join clause to a relation that's not
-scanned by the path.  In the example just above, we would construct a
+scanned by the path.  In the example two above, we would construct a
 path representing the possibility of doing this:
 
 	-> Index Scan using C_Z_IDX on C
@@ -743,6 +757,32 @@ possible join types.  So we will form a join path representing the query
 plan shown above, and it will compete in the usual way with paths built
 from non-parameterized scans.
 
+While all ordinary paths for a particular relation generate the same set
+of rows (since they must all apply the same set of restriction clauses),
+parameterized paths typically generate fewer rows than less-parameterized
+paths, since they have additional clauses to work with.  This means we
+must consider the number of rows generated as an additional figure of
+merit.  A path that costs more than another, but generates fewer rows,
+must be kept since the smaller number of rows might save work at some
+intermediate join level.  (It would not save anything if joined
+immediately to the source of the parameters.)
+
+To keep cost estimation rules relatively simple, we make an implementation
+restriction that all paths for a given relation of the same parameterization
+(i.e., the same set of outer relations supplying parameters) must have the
+same rowcount estimate.  This is justified by insisting that each such path
+apply *all* join clauses that are available with the named outer relations.
+Different paths might, for instance, choose different join clauses to use
+as index clauses; but they must then apply any other join clauses available
+from the same outer relations as filter conditions, so that the set of rows
+returned is held constant.  This restriction doesn't degrade the quality of
+the finished plan: it amounts to saying that we should always push down
+movable join clauses to the lowest possible evaluation level, which is a
+good thing anyway.  The restriction is useful in particular to support
+pre-filtering of join paths in add_path_precheck.  Without this rule we
+could never reject a parameterized path in advance of computing its rowcount
+estimate, which would greatly reduce the value of the pre-filter mechanism.
+
 To limit planning time, we have to avoid generating an unreasonably large
 number of parameterized paths.  We do this by only generating parameterized
 relation scan paths for index scans, and then only for indexes for which
@@ -755,14 +795,42 @@ a nestloop that provides parameters to the lower join's inputs).  While we
 do not ignore merge joins entirely, joinpath.c does not fully explore the
 space of potential merge joins with parameterized inputs.  Also, add_path
 treats parameterized paths as having no pathkeys, so that they compete
-only on cost and don't get preference for producing a special sort order.
-This creates additional bias against merge joins, since we might discard
-a path that could have been useful for performing a merge without an
-explicit sort step.  Since a parameterized path must ultimately be used
-on the inside of a nestloop, where its sort order is uninteresting, these
-choices do not affect any requirement for the final output order of a
-query --- they only make it harder to use a merge join at a lower level.
-The savings in planning work justifies that.
+only on total cost and rowcount; they don't get preference for producing a
+special sort order.  This creates additional bias against merge joins,
+since we might discard a path that could have been useful for performing
+a merge without an explicit sort step.  Since a parameterized path must
+ultimately be used on the inside of a nestloop, where its sort order is
+uninteresting, these choices do not affect any requirement for the final
+output order of a query --- they only make it harder to use a merge join
+at a lower level.  The savings in planning work justifies that.
+
+
+LATERAL subqueries
+------------------
+
+As of 9.3 we support SQL-standard LATERAL references from subqueries in
+FROM (and also functions in FROM).  The planner implements these by
+generating parameterized paths for any RTE that contains lateral
+references.  In such cases, *all* paths for that relation will be
+parameterized by at least the set of relations used in its lateral
+references.  (And in turn, join relations including such a subquery might
+not have any unparameterized paths.)  All the other comments made above for
+parameterized paths still apply, though; in particular, each such path is
+still expected to enforce any join clauses that can be pushed down to it,
+so that all paths of the same parameterization have the same rowcount.
+
+We also allow LATERAL subqueries to be flattened (pulled up into the parent
+query) by the optimizer, but only when this does not introduce lateral
+references into JOIN/ON quals that would refer to relations outside the
+lowest outer join at/above that qual.  The semantics of such a qual would
+be unclear.  Note that even with this restriction, pullup of a LATERAL
+subquery can result in creating PlaceHolderVars that contain lateral
+references to relations outside their syntactic scope.  We still evaluate
+such PHVs at their syntactic location or lower, but the presence of such a
+PHV in the quals or targetlist of a plan node requires that node to appear
+on the inside of a nestloop join relative to the rel(s) supplying the
+lateral reference.  (Perhaps now that that stuff works, we could relax the
+pullup restriction?)
 
 
 -- bjm & tgl

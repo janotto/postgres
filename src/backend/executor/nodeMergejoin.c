@@ -3,7 +3,7 @@
  * nodeMergejoin.c
  *	  routines supporting merge joins
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -41,7 +41,7 @@
  *
  *		Therefore, rather than directly executing the merge join clauses,
  *		we evaluate the left and right key expressions separately and then
- *		compare the columns one at a time (see MJCompare).	The planner
+ *		compare the columns one at a time (see MJCompare).  The planner
  *		passes us enough information about the sort ordering of the inputs
  *		to allow us to determine how to make the comparison.  We may use the
  *		appropriate btree comparison function, since Postgres' only notion
@@ -229,25 +229,33 @@ MJExamineQuals(List *mergeclauses,
 			elog(ERROR, "cannot merge using non-equality operator %u",
 				 qual->opno);
 
+		/*
+		 * sortsupport routine must know if abbreviation optimization is
+		 * applicable in principle.  It is never applicable for merge joins
+		 * because there is no convenient opportunity to convert to alternative
+		 * representation.
+		 */
+		clause->ssup.abbreviate = false;
+
 		/* And get the matching support or comparison function */
+		Assert(clause->ssup.comparator == NULL);
 		sortfunc = get_opfamily_proc(opfamily,
 									 op_lefttype,
 									 op_righttype,
 									 BTSORTSUPPORT_PROC);
 		if (OidIsValid(sortfunc))
 		{
-			/* The sort support function should provide a comparator */
+			/* The sort support function can provide a comparator */
 			OidFunctionCall1(sortfunc, PointerGetDatum(&clause->ssup));
-			Assert(clause->ssup.comparator != NULL);
 		}
-		else
+		if (clause->ssup.comparator == NULL)
 		{
-			/* opfamily doesn't provide sort support, get comparison func */
+			/* support not available, get comparison func */
 			sortfunc = get_opfamily_proc(opfamily,
 										 op_lefttype,
 										 op_righttype,
 										 BTORDER_PROC);
-			if (!OidIsValid(sortfunc))		/* should not happen */
+			if (!OidIsValid(sortfunc))	/* should not happen */
 				elog(ERROR, "missing support function %d(%u,%u) in opfamily %u",
 					 BTORDER_PROC, op_lefttype, op_righttype, opfamily);
 			/* We'll use a shim to call the old-style btree comparator */
@@ -269,7 +277,7 @@ MJExamineQuals(List *mergeclauses,
  * input, since we assume mergejoin operators are strict.  If the NULL
  * is in the first join column, and that column sorts nulls last, then
  * we can further conclude that no following tuple can match anything
- * either, since they must all have nulls in the first column.	However,
+ * either, since they must all have nulls in the first column.  However,
  * that case is only interesting if we're not in FillOuter mode, else
  * we have to visit all the tuples anyway.
  *
@@ -325,7 +333,7 @@ MJEvalOuterValues(MergeJoinState *mergestate)
 /*
  * MJEvalInnerValues
  *
- * Same as above, but for the inner tuple.	Here, we have to be prepared
+ * Same as above, but for the inner tuple.  Here, we have to be prepared
  * to load data from either the true current inner, or the marked inner,
  * so caller must tell us which slot to load from.
  */
@@ -405,7 +413,7 @@ MJCompare(MergeJoinState *mergestate)
 		 */
 		if (clause->lisnull && clause->risnull)
 		{
-			nulleqnull = true;		/* NULL "=" NULL */
+			nulleqnull = true;	/* NULL "=" NULL */
 			continue;
 		}
 
@@ -419,8 +427,8 @@ MJCompare(MergeJoinState *mergestate)
 
 	/*
 	 * If we had any NULL-vs-NULL inputs, we do not want to report that the
-	 * tuples are equal.  Instead, if result is still 0, change it to +1.
-	 * This will result in advancing the inner side of the join.
+	 * tuples are equal.  Instead, if result is still 0, change it to +1. This
+	 * will result in advancing the inner side of the join.
 	 *
 	 * Likewise, if there was a constant-false joinqual, do not report
 	 * equality.  We have to check this as part of the mergequals, else the
@@ -736,7 +744,7 @@ ExecMergeJoin(MergeJoinState *node)
 					case MJEVAL_MATCHABLE:
 
 						/*
-						 * OK, we have the initial tuples.	Begin by skipping
+						 * OK, we have the initial tuples.  Begin by skipping
 						 * non-matching tuples.
 						 */
 						node->mj_JoinState = EXEC_MJ_SKIP_TEST;
@@ -1131,7 +1139,7 @@ ExecMergeJoin(MergeJoinState *node)
 					 *	which means that all subsequent outer tuples will be
 					 *	larger than our marked inner tuples.  So we need not
 					 *	revisit any of the marked tuples but can proceed to
-					 *	look for a match to the current inner.	If there's
+					 *	look for a match to the current inner.  If there's
 					 *	no more inners, no more matches are possible.
 					 * ----------------
 					 */
@@ -1361,7 +1369,7 @@ ExecMergeJoin(MergeJoinState *node)
 				/*
 				 * EXEC_MJ_ENDOUTER means we have run out of outer tuples, but
 				 * are doing a right/full join and therefore must null-fill
-				 * any remaing unmatched inner tuples.
+				 * any remaining unmatched inner tuples.
 				 */
 			case EXEC_MJ_ENDOUTER:
 				MJ_printf("ExecMergeJoin: EXEC_MJ_ENDOUTER\n");
@@ -1407,7 +1415,7 @@ ExecMergeJoin(MergeJoinState *node)
 				/*
 				 * EXEC_MJ_ENDINNER means we have run out of inner tuples, but
 				 * are doing a left/full join and therefore must null- fill
-				 * any remaing unmatched outer tuples.
+				 * any remaining unmatched outer tuples.
 				 */
 			case EXEC_MJ_ENDINNER:
 				MJ_printf("ExecMergeJoin: EXEC_MJ_ENDINNER\n");
@@ -1522,7 +1530,7 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 	 * For certain types of inner child nodes, it is advantageous to issue
 	 * MARK every time we advance past an inner tuple we will never return to.
 	 * For other types, MARK on a tuple we cannot return to is a waste of
-	 * cycles.	Detect which case applies and set mj_ExtraMarks if we want to
+	 * cycles.  Detect which case applies and set mj_ExtraMarks if we want to
 	 * issue "unnecessary" MARK calls.
 	 *
 	 * Currently, only Material wants the extra MARKs, and it will be helpful

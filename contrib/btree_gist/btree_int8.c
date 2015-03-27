@@ -23,14 +23,6 @@ PG_FUNCTION_INFO_V1(gbt_int8_distance);
 PG_FUNCTION_INFO_V1(gbt_int8_penalty);
 PG_FUNCTION_INFO_V1(gbt_int8_same);
 
-Datum		gbt_int8_compress(PG_FUNCTION_ARGS);
-Datum		gbt_int8_union(PG_FUNCTION_ARGS);
-Datum		gbt_int8_picksplit(PG_FUNCTION_ARGS);
-Datum		gbt_int8_consistent(PG_FUNCTION_ARGS);
-Datum		gbt_int8_distance(PG_FUNCTION_ARGS);
-Datum		gbt_int8_penalty(PG_FUNCTION_ARGS);
-Datum		gbt_int8_same(PG_FUNCTION_ARGS);
-
 
 static bool
 gbt_int8gt(const void *a, const void *b)
@@ -86,6 +78,7 @@ static const gbtree_ninfo tinfo =
 {
 	gbt_t_int8,
 	sizeof(int64),
+	16,							/* sizeof(gbtreekey16) */
 	gbt_int8gt,
 	gbt_int8ge,
 	gbt_int8eq,
@@ -97,7 +90,6 @@ static const gbtree_ninfo tinfo =
 
 
 PG_FUNCTION_INFO_V1(int8_dist);
-Datum		int8_dist(PG_FUNCTION_ARGS);
 Datum
 int8_dist(PG_FUNCTION_ARGS)
 {
@@ -128,9 +120,8 @@ Datum
 gbt_int8_compress(PG_FUNCTION_ARGS)
 {
 	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
-	GISTENTRY  *retval = NULL;
 
-	PG_RETURN_POINTER(gbt_num_compress(retval, entry, &tinfo));
+	PG_RETURN_POINTER(gbt_num_compress(entry, &tinfo));
 }
 
 

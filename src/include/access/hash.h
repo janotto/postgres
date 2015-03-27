@@ -4,7 +4,7 @@
  *	  header file for postgres hash access method implementation
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/hash.h
@@ -20,8 +20,9 @@
 #include "access/genam.h"
 #include "access/itup.h"
 #include "access/sdir.h"
-#include "access/xlog.h"
+#include "access/xlogreader.h"
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 #include "storage/bufmgr.h"
 #include "storage/lock.h"
 #include "utils/relcache.h"
@@ -185,7 +186,7 @@ typedef HashMetaPageData *HashMetaPage;
 #define ALL_SET					((uint32) ~0)
 
 /*
- * Bitmap pages do not contain tuples.	They do contain the standard
+ * Bitmap pages do not contain tuples.  They do contain the standard
  * page headers and trailers; however, everything in between is a
  * giant bit array.  The number of bits that fit on a page obviously
  * depends on the page size and the header/trailer overhead.  We require
@@ -334,9 +335,10 @@ extern bool _hash_step(IndexScanDesc scan, Buffer *bufP, ScanDirection dir);
 /* hashsort.c */
 typedef struct HSpool HSpool;	/* opaque struct in hashsort.c */
 
-extern HSpool *_h_spoolinit(Relation index, uint32 num_buckets);
+extern HSpool *_h_spoolinit(Relation heap, Relation index, uint32 num_buckets);
 extern void _h_spooldestroy(HSpool *hspool);
-extern void _h_spool(IndexTuple itup, HSpool *hspool);
+extern void _h_spool(HSpool *hspool, ItemPointer self,
+					 Datum *values, bool *isnull);
 extern void _h_indexbuild(HSpool *hspool);
 
 /* hashutil.c */
@@ -354,7 +356,8 @@ extern OffsetNumber _hash_binsearch(Page page, uint32 hash_value);
 extern OffsetNumber _hash_binsearch_last(Page page, uint32 hash_value);
 
 /* hash.c */
-extern void hash_redo(XLogRecPtr lsn, XLogRecord *record);
-extern void hash_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void hash_redo(XLogReaderState *record);
+extern void hash_desc(StringInfo buf, XLogReaderState *record);
+extern const char *hash_identify(uint8 info);
 
 #endif   /* HASH_H */

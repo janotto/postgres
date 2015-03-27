@@ -36,10 +36,15 @@ LANGUAGES = $(AVAIL_LANGUAGES)
 endif
 
 PO_FILES = $(addprefix po/, $(addsuffix .po, $(LANGUAGES)))
+ALL_PO_FILES = $(addprefix po/, $(addsuffix .po, $(AVAIL_LANGUAGES)))
 MO_FILES = $(addprefix po/, $(addsuffix .mo, $(LANGUAGES)))
 
 ifdef XGETTEXT
-XGETTEXT += -ctranslator --copyright-holder='PostgreSQL Global Development Group' --msgid-bugs-address=pgsql-bugs@postgresql.org
+XGETTEXT += -ctranslator --copyright-holder='PostgreSQL Global Development Group' --msgid-bugs-address=pgsql-bugs@postgresql.org --no-wrap --sort-by-file --package-name='$(CATALOG_NAME) (PostgreSQL)' --package-version='$(MAJORVERSION)'
+endif
+
+ifdef MSGMERGE
+MSGMERGE += --no-wrap --previous --sort-by-file
 endif
 
 # _ is defined in c.h, so it's global
@@ -52,7 +57,10 @@ BACKEND_COMMON_GETTEXT_TRIGGERS = \
     errmsg errmsg_plural:1,2 \
     errdetail errdetail_log errdetail_plural:1,2 \
     errhint \
-    errcontext
+    errcontext \
+    XactLockTableWait:4 \
+    MultiXactIdWait:6 \
+    ConditionalMultiXactIdWait:6
 BACKEND_COMMON_GETTEXT_FLAGS = \
     errmsg:1:c-format errmsg_plural:1:c-format errmsg_plural:2:c-format \
     errdetail:1:c-format errdetail_log:1:c-format errdetail_plural:1:c-format errdetail_plural:2:c-format \
@@ -63,7 +71,7 @@ BACKEND_COMMON_GETTEXT_FLAGS = \
 all-po: $(MO_FILES)
 
 %.mo: %.po
-	$(MSGFMT) -o $@ $<
+	$(MSGFMT) $(MSGFMT_FLAGS) -o $@ $<
 
 ifeq ($(word 1,$(GETTEXT_FILES)),+)
 po/$(CATALOG_NAME).pot: $(word 2, $(GETTEXT_FILES)) $(MAKEFILE_LIST)
@@ -87,7 +95,7 @@ endif # GETTEXT_FILES
 	rm messages.po
 
 
-# catalog name extentions must match behavior of PG_TEXTDOMAIN() in c.h
+# catalog name extensions must match behavior of PG_TEXTDOMAIN() in c.h
 install-po: all-po installdirs-po
 ifneq (,$(LANGUAGES))
 	for lang in $(LANGUAGES); do \
@@ -106,12 +114,6 @@ clean-po:
 	$(if $(MO_FILES),rm -f $(MO_FILES))
 	@$(if $(wildcard po/*.po.new),rm -f po/*.po.new)
 	rm -f po/$(CATALOG_NAME).pot
-
-
-maintainer-check-po: $(PO_FILES)
-	for file in $^; do \
-	  $(MSGFMT) -c -v -o /dev/null $$file || exit 1; \
-	done
 
 
 init-po: po/$(CATALOG_NAME).pot
@@ -135,14 +137,14 @@ endif
 update-po: $(ALL_LANGUAGES:%=po/%.po.new)
 
 $(AVAIL_LANGUAGES:%=po/%.po.new): po/%.po.new: po/%.po po/$(CATALOG_NAME).pot $(all_compendia)
-	$(MSGMERGE) $(word 1, $^) $(word 2,$^) -o $@ $(addprefix --compendium=,$(filter %/$*.po,$(wordlist 3,$(words $^),$^)))
+	$(MSGMERGE) --lang=$* $(word 1, $^) $(word 2,$^) -o $@ $(addprefix --compendium=,$(filter %/$*.po,$(wordlist 3,$(words $^),$^)))
 
 # For languages not yet available, merge against oneself, to pick
 # up translations from the compendia.  (Merging against /dev/null
 # doesn't work so well; it inserts the headers from the first-named
 # compendium.)
 po/%.po.new: po/$(CATALOG_NAME).pot $(all_compendia)
-	$(MSGMERGE) $(word 1,$^) $(word 1,$^) -o $@ $(addprefix --compendium=,$(filter %/$*.po,$(wordlist 2,$(words $^),$^)))
+	$(MSGMERGE) --lang=$* $(word 1,$^) $(word 1,$^) -o $@ $(addprefix --compendium=,$(filter %/$*.po,$(wordlist 2,$(words $^),$^)))
 
 
 all: all-po
@@ -150,7 +152,6 @@ install: install-po
 installdirs: installdirs-po
 uninstall: uninstall-po
 clean distclean maintainer-clean: clean-po
-maintainer-check: maintainer-check-po
 
 .PHONY: all-po install-po installdirs-po uninstall-po clean-po \
-        maintainer-check-po init-po update-po
+        init-po update-po

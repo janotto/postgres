@@ -11,10 +11,7 @@
 #include "funcapi.h"
 #include "storage/freespace.h"
 
-
 PG_MODULE_MAGIC;
-
-Datum		pg_freespace(PG_FUNCTION_ARGS);
 
 /*
  * Returns the amount of free space on a given page, according to the

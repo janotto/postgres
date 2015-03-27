@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ANALYZE">
+ <indexterm zone="sql-analyze">
+  <primary>ANALYZE</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ANALYZE</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>collect statistics about a database</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-analyze">
-  <primary>ANALYZE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ANALYZE [ VERBOSE ] [ <replaceable class="PARAMETER">table</replaceable> [ ( <replaceable class="PARAMETER">column</replaceable> [, ...] ) ] ]
+ANALYZE [ VERBOSE ] [ <replaceable class="PARAMETER">table_name</replaceable> [ ( <replaceable class="PARAMETER">column_name</replaceable> [, ...] ) ] ]
 </synopsis>
  </refsynopsisdiv>
 
@@ -59,17 +59,18 @@ ANALYZE [ VERBOSE ] [ <replaceable class="PARAMETER">table</replaceable> [ ( <re
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">table</replaceable></term>
+    <term><replaceable class="PARAMETER">table_name</replaceable></term>
     <listitem>
      <para>
       The name (possibly schema-qualified) of a specific table to
-      analyze. Defaults to all tables in the current database.
+      analyze.  If omitted, all regular tables (but not foreign tables)
+      in the current database are analyzed.
      </para>
     </listitem>
    </varlistentry>
 
    <varlistentry>
-    <term><replaceable class="PARAMETER">column</replaceable></term>
+    <term><replaceable class="PARAMETER">column_name</replaceable></term>
     <listitem>
      <para>
       The name of a specific column to analyze. Defaults to all columns.
@@ -91,6 +92,13 @@ ANALYZE [ VERBOSE ] [ <replaceable class="PARAMETER">table</replaceable> [ ( <re
 
  <refsect1>
   <title>Notes</title>
+
+  <para>
+   Foreign tables are analyzed only when explicitly selected.  Not all
+   foreign data wrappers support <command>ANALYZE</>.  If the table's
+   wrapper does not support <command>ANALYZE</>, the command prints a
+   warning and does nothing.
+  </para>
 
   <para>
    In the default <productname>PostgreSQL</productname> configuration,
@@ -189,6 +197,12 @@ ANALYZE [ VERBOSE ] [ <replaceable class="PARAMETER">table</replaceable> [ ( <re
     automatic analyze for that table.  If that table is rarely inserted into
     or updated, the inheritance statistics will not be up to date unless you
     run <command>ANALYZE</command> manually.
+  </para>
+
+  <para>
+    If any of the child tables are foreign tables whose foreign data wrappers
+    do not support <command>ANALYZE</>, those child tables are ignored while
+    gathering inheritance statistics.
   </para>
 
   <para>

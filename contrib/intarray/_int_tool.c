@@ -184,40 +184,34 @@ rt__int_size(ArrayType *a, float *size)
 	*size = (float) ARRNELEMS(a);
 }
 
-/* Sort the given data (len >= 2).	Return true if any duplicates found */
-bool
-isort(int4 *a, int len)
+/* qsort_arg comparison function for isort() */
+static int
+isort_cmp(const void *a, const void *b, void *arg)
 {
-	int4		cur,
-				prev;
-	int4	   *pcur,
-			   *pprev,
-			   *end;
-	bool		r = FALSE;
+	int32		aval = *((const int32 *) a);
+	int32		bval = *((const int32 *) b);
+
+	if (aval < bval)
+		return -1;
+	if (aval > bval)
+		return 1;
 
 	/*
-	 * We use a simple insertion sort.	While this is O(N^2) in the worst
-	 * case, it's quite fast if the input is already sorted or nearly so.
-	 * Also, for not-too-large inputs it's faster than more complex methods
-	 * anyhow.
+	 * Report if we have any duplicates.  If there are equal keys, qsort must
+	 * compare them at some point, else it wouldn't know whether one should go
+	 * before or after the other.
 	 */
-	end = a + len;
-	for (pcur = a + 1; pcur < end; pcur++)
-	{
-		cur = *pcur;
-		for (pprev = pcur - 1; pprev >= a; pprev--)
-		{
-			prev = *pprev;
-			if (prev <= cur)
-			{
-				if (prev == cur)
-					r = TRUE;
-				break;
-			}
-			pprev[1] = prev;
-		}
-		pprev[1] = cur;
-	}
+	*((bool *) arg) = true;
+	return 0;
+}
+
+/* Sort the given data (len >= 2).  Return true if any duplicates found */
+bool
+isort(int32 *a, int len)
+{
+	bool		r = false;
+
+	qsort_arg(a, len, sizeof(int32), isort_cmp, (void *) &r);
 	return r;
 }
 
@@ -246,6 +240,13 @@ resize_intArrayType(ArrayType *a, int num)
 	int			nbytes = ARR_DATA_OFFSET(a) + sizeof(int) * num;
 	int			i;
 
+	/* if no elements, return a zero-dimensional array */
+	if (num == 0)
+	{
+		ARR_NDIM(a) = 0;
+		return a;
+	}
+
 	if (num == ARRNELEMS(a))
 		return a;
 
@@ -268,7 +269,7 @@ copy_intArrayType(ArrayType *a)
 	int			n = ARRNELEMS(a);
 
 	r = new_intArrayType(n);
-	memcpy(ARRPTR(r), ARRPTR(a), n * sizeof(int4));
+	memcpy(ARRPTR(r), ARRPTR(a), n * sizeof(int32));
 	return r;
 }
 
@@ -389,15 +390,15 @@ int_to_intset(int32 n)
 int
 compASC(const void *a, const void *b)
 {
-	if (*(const int4 *) a == *(const int4 *) b)
+	if (*(const int32 *) a == *(const int32 *) b)
 		return 0;
-	return (*(const int4 *) a > *(const int4 *) b) ? 1 : -1;
+	return (*(const int32 *) a > *(const int32 *) b) ? 1 : -1;
 }
 
 int
 compDESC(const void *a, const void *b)
 {
-	if (*(const int4 *) a == *(const int4 *) b)
+	if (*(const int32 *) a == *(const int32 *) b)
 		return 0;
-	return (*(const int4 *) a < *(const int4 *) b) ? 1 : -1;
+	return (*(const int32 *) a < *(const int32 *) b) ? 1 : -1;
 }

@@ -29,14 +29,16 @@ endif
 endif
 
 
-SHLIB_LINK = $(TCL_LIB_SPEC)
+# On Windows, we don't link directly with the Tcl library; see below
 ifneq ($(PORTNAME), win32)
-SHLIB_LINK += $(TCL_LIBS) -lc
+SHLIB_LINK = $(TCL_LIB_SPEC) $(TCL_LIBS) -lc
 endif
+
+PGFILEDESC = "PL/Tcl - procedural language"
 
 NAME = pltcl
 
-OBJS = pltcl.o
+OBJS = pltcl.o $(WIN32RES)
 
 DATA = pltcl.control pltcl--1.0.sql pltcl--unpackaged--1.0.sql \
        pltclu.control pltclu--1.0.sql pltclu--unpackaged--1.0.sql
@@ -45,6 +47,25 @@ REGRESS_OPTS = --dbname=$(PL_TESTDB) --load-extension=pltcl
 REGRESS = pltcl_setup pltcl_queries
 # where to find psql for running the tests
 PSQLDIR = $(bindir)
+
+# Tcl on win32 ships with import libraries only for Microsoft Visual C++,
+# which are not compatible with mingw gcc. Therefore we need to build a
+# new import library to link with.
+ifeq ($(PORTNAME), win32)
+
+tclwithver = $(subst -l,,$(filter -l%, $(TCL_LIB_SPEC)))
+TCLDLL = $(dir $(TCLSH))/$(tclwithver).dll
+
+OBJS += lib$(tclwithver).a
+
+lib$(tclwithver).a: $(tclwithver).def
+	dlltool --dllname $(tclwithver).dll --def $(tclwithver).def --output-lib lib$(tclwithver).a
+
+$(tclwithver).def: $(TCLDLL)
+	pexports $^ > $@
+
+endif # win32
+
 
 include $(top_srcdir)/src/Makefile.shlib
 
@@ -96,4 +117,7 @@ endif # TCL_SHARED_BUILD = 0
 clean distclean maintainer-clean: clean-lib
 	rm -f $(OBJS)
 	rm -rf $(pg_regress_clean_files)
+ifeq ($(PORTNAME), win32)
+	rm -f $(tclwithver).def
+endif
 	$(MAKE) -C modules $@

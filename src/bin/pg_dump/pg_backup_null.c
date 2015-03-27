@@ -21,22 +21,19 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
 #include "pg_backup_archiver.h"
-#include "dumpmem.h"
-#include "dumputils.h"
-
-#include <unistd.h>				/* for dup */
+#include "pg_backup_utils.h"
 
 #include "libpq/libpq-fs.h"
 
-
-static size_t _WriteData(ArchiveHandle *AH, const void *data, size_t dLen);
-static size_t _WriteBlobData(ArchiveHandle *AH, const void *data, size_t dLen);
+static void _WriteData(ArchiveHandle *AH, const void *data, size_t dLen);
+static void _WriteBlobData(ArchiveHandle *AH, const void *data, size_t dLen);
 static void _EndData(ArchiveHandle *AH, TocEntry *te);
 static int	_WriteByte(ArchiveHandle *AH, const int i);
-static size_t _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
-static void _CloseArchive(ArchiveHandle *AH);
+static void _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len);
+static void _CloseArchive(ArchiveHandle *AH, DumpOptions *dopt);
 static void _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
 static void _StartBlobs(ArchiveHandle *AH, TocEntry *te);
 static void _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid);
@@ -74,7 +71,7 @@ InitArchiveFmt_Null(ArchiveHandle *AH)
 	 * Now prevent reading...
 	 */
 	if (AH->mode == archModeRead)
-		die_horribly(AH, NULL, "this format cannot be read\n");
+		exit_horribly(NULL, "this format cannot be read\n");
 }
 
 /*
@@ -84,19 +81,19 @@ InitArchiveFmt_Null(ArchiveHandle *AH)
 /*
  * Called by dumper via archiver from within a data dump routine
  */
-static size_t
+static void
 _WriteData(ArchiveHandle *AH, const void *data, size_t dLen)
 {
-	/* Just send it to output */
+	/* Just send it to output, ahwrite() already errors on failure */
 	ahwrite(data, 1, dLen, AH);
-	return dLen;
+	return;
 }
 
 /*
  * Called by dumper via archiver from within a data dump routine
  * We substitute this for _WriteData while emitting a BLOB
  */
-static size_t
+static void
 _WriteBlobData(ArchiveHandle *AH, const void *data, size_t dLen)
 {
 	if (dLen > 0)
@@ -112,7 +109,7 @@ _WriteBlobData(ArchiveHandle *AH, const void *data, size_t dLen)
 
 		destroyPQExpBuffer(buf);
 	}
-	return dLen;
+	return;
 }
 
 static void
@@ -149,7 +146,7 @@ _StartBlob(ArchiveHandle *AH, TocEntry *te, Oid oid)
 	bool		old_blob_style = (AH->version < K_VERS_1_12);
 
 	if (oid == 0)
-		die_horribly(AH, NULL, "invalid OID for large object\n");
+		exit_horribly(NULL, "invalid OID for large object\n");
 
 	/* With an old archive we must do drop and create logic here */
 	if (old_blob_style && AH->ropt->dropSchema)
@@ -199,12 +196,16 @@ _PrintTocData(ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt)
 {
 	if (te->dataDumper)
 	{
+		DumpOptions *dopt;
+
 		AH->currToc = te;
 
 		if (strcmp(te->desc, "BLOBS") == 0)
 			_StartBlobs(AH, te);
 
-		(*te->dataDumper) ((Archive *) AH, te->dataDumperArg);
+		dopt = dumpOptionsFromRestoreOptions(ropt);
+		(*te->dataDumper) ((Archive *) AH, dopt, te->dataDumperArg);
+		pg_free(dopt);
 
 		if (strcmp(te->desc, "BLOBS") == 0)
 			_EndBlobs(AH, te);
@@ -220,15 +221,15 @@ _WriteByte(ArchiveHandle *AH, const int i)
 	return 0;
 }
 
-static size_t
+static void
 _WriteBuf(ArchiveHandle *AH, const void *buf, size_t len)
 {
 	/* Don't do anything */
-	return len;
+	return;
 }
 
 static void
-_CloseArchive(ArchiveHandle *AH)
+_CloseArchive(ArchiveHandle *AH, DumpOptions *dopt)
 {
 	/* Nothing to do */
 }

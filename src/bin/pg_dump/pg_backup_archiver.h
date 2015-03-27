@@ -21,11 +21,9 @@
  *
  *-------------------------------------------------------------------------
  */
-
 #ifndef __PG_BACKUP_ARCHIVE__
 #define __PG_BACKUP_ARCHIVE__
 
-#include "postgres_fe.h"
 
 #include <time.h>
 
@@ -45,10 +43,12 @@
 #define GZCLOSE(fh) gzclose(fh)
 #define GZWRITE(p, s, n, fh) gzwrite(fh, p, (n) * (s))
 #define GZREAD(p, s, n, fh) gzread(fh, p, (n) * (s))
+#define GZEOF(fh)	gzeof(fh)
 #else
 #define GZCLOSE(fh) fclose(fh)
 #define GZWRITE(p, s, n, fh) (fwrite(p, s, n, fh) * (s))
 #define GZREAD(p, s, n, fh) fread(p, s, n, fh)
+#define GZEOF(fh)	feof(fh)
 /* this is just the redefinition of a libz constant */
 #define Z_DEFAULT_COMPRESSION (-1)
 
@@ -100,36 +100,76 @@ typedef z_stream *z_streamp;
 #define K_OFFSET_POS_SET 2
 #define K_OFFSET_NO_DATA 3
 
-struct _archiveHandle;
-struct _tocEntry;
+/*
+ * Special exit values from worker children.  We reserve 0 for normal
+ * success; 1 and other small values should be interpreted as crashes.
+ */
+#define WORKER_OK					  0
+#define WORKER_CREATE_DONE			  10
+#define WORKER_INHIBIT_DATA			  11
+#define WORKER_IGNORED_ERRORS		  12
 
-typedef void (*ClosePtr) (struct _archiveHandle * AH);
-typedef void (*ReopenPtr) (struct _archiveHandle * AH);
-typedef void (*ArchiveEntryPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
+typedef struct _archiveHandle ArchiveHandle;
+typedef struct _tocEntry TocEntry;
+struct ParallelArgs;
+struct ParallelState;
 
-typedef void (*StartDataPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef size_t (*WriteDataPtr) (struct _archiveHandle * AH, const void *data, size_t dLen);
-typedef void (*EndDataPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
+#define READ_ERROR_EXIT(fd) \
+	do { \
+		if (feof(fd)) \
+			exit_horribly(modulename, \
+						  "could not read from input file: end of file\n"); \
+		else \
+			exit_horribly(modulename, \
+					"could not read from input file: %s\n", strerror(errno)); \
+	} while (0)
 
-typedef void (*StartBlobsPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*StartBlobPtr) (struct _archiveHandle * AH, struct _tocEntry * te, Oid oid);
-typedef void (*EndBlobPtr) (struct _archiveHandle * AH, struct _tocEntry * te, Oid oid);
-typedef void (*EndBlobsPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
+#define WRITE_ERROR_EXIT \
+	do { \
+		exit_horribly(modulename, "could not write to output file: %s\n", \
+					  strerror(errno)); \
+	} while (0)
 
-typedef int (*WriteBytePtr) (struct _archiveHandle * AH, const int i);
-typedef int (*ReadBytePtr) (struct _archiveHandle * AH);
-typedef size_t (*WriteBufPtr) (struct _archiveHandle * AH, const void *c, size_t len);
-typedef size_t (*ReadBufPtr) (struct _archiveHandle * AH, void *buf, size_t len);
-typedef void (*SaveArchivePtr) (struct _archiveHandle * AH);
-typedef void (*WriteExtraTocPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*ReadExtraTocPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*PrintExtraTocPtr) (struct _archiveHandle * AH, struct _tocEntry * te);
-typedef void (*PrintTocDataPtr) (struct _archiveHandle * AH, struct _tocEntry * te, RestoreOptions *ropt);
+typedef enum T_Action
+{
+	ACT_DUMP,
+	ACT_RESTORE
+} T_Action;
 
-typedef void (*ClonePtr) (struct _archiveHandle * AH);
-typedef void (*DeClonePtr) (struct _archiveHandle * AH);
+typedef void (*ClosePtr) (ArchiveHandle *AH, DumpOptions *dopt);
+typedef void (*ReopenPtr) (ArchiveHandle *AH);
+typedef void (*ArchiveEntryPtr) (ArchiveHandle *AH, TocEntry *te);
 
-typedef size_t (*CustomOutPtr) (struct _archiveHandle * AH, const void *buf, size_t len);
+typedef void (*StartDataPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*WriteDataPtr) (ArchiveHandle *AH, const void *data, size_t dLen);
+typedef void (*EndDataPtr) (ArchiveHandle *AH, TocEntry *te);
+
+typedef void (*StartBlobsPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*StartBlobPtr) (ArchiveHandle *AH, TocEntry *te, Oid oid);
+typedef void (*EndBlobPtr) (ArchiveHandle *AH, TocEntry *te, Oid oid);
+typedef void (*EndBlobsPtr) (ArchiveHandle *AH, TocEntry *te);
+
+typedef int (*WriteBytePtr) (ArchiveHandle *AH, const int i);
+typedef int (*ReadBytePtr) (ArchiveHandle *AH);
+typedef void (*WriteBufPtr) (ArchiveHandle *AH, const void *c, size_t len);
+typedef void (*ReadBufPtr) (ArchiveHandle *AH, void *buf, size_t len);
+typedef void (*SaveArchivePtr) (ArchiveHandle *AH);
+typedef void (*WriteExtraTocPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*ReadExtraTocPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*PrintExtraTocPtr) (ArchiveHandle *AH, TocEntry *te);
+typedef void (*PrintTocDataPtr) (ArchiveHandle *AH, TocEntry *te, RestoreOptions *ropt);
+
+typedef void (*ClonePtr) (ArchiveHandle *AH);
+typedef void (*DeClonePtr) (ArchiveHandle *AH);
+
+typedef char *(*WorkerJobRestorePtr) (ArchiveHandle *AH, TocEntry *te);
+typedef char *(*WorkerJobDumpPtr) (ArchiveHandle *AH, DumpOptions *dopt, TocEntry *te);
+typedef char *(*MasterStartParallelItemPtr) (ArchiveHandle *AH, TocEntry *te,
+														 T_Action act);
+typedef int (*MasterEndParallelItemPtr) (ArchiveHandle *AH, TocEntry *te,
+											  const char *str, T_Action act);
+
+typedef size_t (*CustomOutPtr) (ArchiveHandle *AH, const void *buf, size_t len);
 
 typedef enum
 {
@@ -162,12 +202,12 @@ typedef enum
 
 typedef enum
 {
-	REQ_SCHEMA = 1,
-	REQ_DATA = 2,
-	REQ_ALL = REQ_SCHEMA + REQ_DATA
+	REQ_SCHEMA = 0x01,			/* want schema */
+	REQ_DATA = 0x02,			/* want data */
+	REQ_SPECIAL = 0x04			/* for special TOC entries */
 } teReqs;
 
-typedef struct _archiveHandle
+struct _archiveHandle
 {
 	Archive		public;			/* Public part of archive */
 	char		vmaj;			/* Version of file */
@@ -227,6 +267,13 @@ typedef struct _archiveHandle
 	StartBlobPtr StartBlobPtr;
 	EndBlobPtr EndBlobPtr;
 
+	MasterStartParallelItemPtr MasterStartParallelItemPtr;
+	MasterEndParallelItemPtr MasterEndParallelItemPtr;
+
+	SetupWorkerPtr SetupWorkerPtr;
+	WorkerJobDumpPtr WorkerJobDumpPtr;
+	WorkerJobRestorePtr WorkerJobRestorePtr;
+
 	ClonePtr ClonePtr;			/* Clone format-specific fields */
 	DeClonePtr DeClonePtr;		/* Clean up cloned fields */
 
@@ -234,8 +281,9 @@ typedef struct _archiveHandle
 
 	/* Stuff for direct DB connection */
 	char	   *archdbname;		/* DB name *read* from archive */
-	enum trivalue promptPassword;
+	trivalue	promptPassword;
 	char	   *savedPassword;	/* password for ropt->username, if known */
+	char	   *use_role;
 	PGconn	   *connection;
 	int			connectToDB;	/* Flag to indicate if direct DB connection is
 								 * required */
@@ -251,9 +299,13 @@ typedef struct _archiveHandle
 	void	   *OF;
 	int			gzOut;			/* Output file */
 
-	struct _tocEntry *toc;		/* List of TOC entries */
+	struct _tocEntry *toc;		/* Header of circular list of TOC entries */
 	int			tocCount;		/* Number of TOC entries */
 	DumpId		maxDumpId;		/* largest DumpId among all TOC entries */
+
+	/* arrays created after the TOC list is complete: */
+	struct _tocEntry **tocsByDumpId;	/* TOCs indexed by dumpId */
+	DumpId	   *tableDataId;	/* TABLE DATA ids, indexed by table dumpId */
 
 	struct _tocEntry *currToc;	/* Used when dumping data */
 	int			compression;	/* Compression requested on open Possible
@@ -281,9 +333,9 @@ typedef struct _archiveHandle
 	ArchiverStage lastErrorStage;
 	struct _tocEntry *currentTE;
 	struct _tocEntry *lastErrorTE;
-} ArchiveHandle;
+};
 
-typedef struct _tocEntry
+struct _tocEntry
 {
 	struct _tocEntry *prev;
 	struct _tocEntry *next;
@@ -309,24 +361,24 @@ typedef struct _tocEntry
 	void	   *dataDumperArg;	/* Arg for above routine */
 	void	   *formatData;		/* TOC Entry data specific to file format */
 
-	/* in post data? not quite the same as section, might be SECTION_NONE */
-	bool        inPostData;
+	/* working state while dumping/restoring */
+	teReqs		reqs;			/* do we need schema and/or data of object */
+	bool		created;		/* set for DATA member if TABLE was created */
 
 	/* working state (needed only for parallel restore) */
 	struct _tocEntry *par_prev; /* list links for pending/ready items; */
 	struct _tocEntry *par_next; /* these are NULL if not in either list */
-	bool		created;		/* set for DATA member if TABLE was created */
 	int			depCount;		/* number of dependencies not yet restored */
 	DumpId	   *revDeps;		/* dumpIds of objects depending on this one */
 	int			nRevDeps;		/* number of such dependencies */
 	DumpId	   *lockDeps;		/* dumpIds of objects this one needs lock on */
 	int			nLockDeps;		/* number of such dependencies */
-} TocEntry;
+};
 
+extern int	parallel_restore(struct ParallelArgs *args);
+extern void on_exit_close_archive(Archive *AHX);
 
-extern void die_horribly(ArchiveHandle *AH, const char *modulename, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4), noreturn));
-extern void die_on_query_failure(ArchiveHandle *AH, const char *modulename, const char *query) __attribute__((noreturn));
-extern void warn_or_die_horribly(ArchiveHandle *AH, const char *modulename, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
+extern void warn_or_exit_horribly(ArchiveHandle *AH, const char *modulename, const char *fmt,...) pg_attribute_printf(3, 4);
 
 extern void WriteTOC(ArchiveHandle *AH);
 extern void ReadTOC(ArchiveHandle *AH);
@@ -334,9 +386,13 @@ extern void WriteHead(ArchiveHandle *AH);
 extern void ReadHead(ArchiveHandle *AH);
 extern void WriteToc(ArchiveHandle *AH);
 extern void ReadToc(ArchiveHandle *AH);
-extern void WriteDataChunks(ArchiveHandle *AH);
+extern void WriteDataChunks(ArchiveHandle *AH, DumpOptions *dopt, struct ParallelState *pstate);
+extern void WriteDataChunksForTocEntry(ArchiveHandle *AH, DumpOptions *dopt, TocEntry *te);
+extern ArchiveHandle *CloneArchive(ArchiveHandle *AH);
+extern void DeCloneArchive(ArchiveHandle *AH);
 
-extern teReqs TocIDRequired(ArchiveHandle *AH, DumpId id, RestoreOptions *ropt);
+extern teReqs TocIDRequired(ArchiveHandle *AH, DumpId id);
+TocEntry   *getTocEntryByDumpId(ArchiveHandle *AH, DumpId id);
 extern bool checkSeek(FILE *fp);
 
 #define appendStringLiteralAHX(buf,str,AH) \
@@ -363,7 +419,6 @@ extern void EndRestoreBlob(ArchiveHandle *AH, Oid oid);
 extern void EndRestoreBlobs(ArchiveHandle *AH);
 
 extern void InitArchiveFmt_Custom(ArchiveHandle *AH);
-extern void InitArchiveFmt_Files(ArchiveHandle *AH);
 extern void InitArchiveFmt_Null(ArchiveHandle *AH);
 extern void InitArchiveFmt_Directory(ArchiveHandle *AH);
 extern void InitArchiveFmt_Tar(ArchiveHandle *AH);
@@ -373,9 +428,9 @@ extern bool isValidTarHeader(char *header);
 extern int	ReconnectToServer(ArchiveHandle *AH, const char *dbname, const char *newUser);
 extern void DropBlobIfExists(ArchiveHandle *AH, Oid oid);
 
-int			ahwrite(const void *ptr, size_t size, size_t nmemb, ArchiveHandle *AH);
-int			ahprintf(ArchiveHandle *AH, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
+void		ahwrite(const void *ptr, size_t size, size_t nmemb, ArchiveHandle *AH);
+int			ahprintf(ArchiveHandle *AH, const char *fmt,...) pg_attribute_printf(2, 3);
 
-void		ahlog(ArchiveHandle *AH, int level, const char *fmt,...) __attribute__((format(PG_PRINTF_ATTRIBUTE, 3, 4)));
+void		ahlog(ArchiveHandle *AH, int level, const char *fmt,...) pg_attribute_printf(3, 4);
 
 #endif

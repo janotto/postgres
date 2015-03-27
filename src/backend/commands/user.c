@@ -3,7 +3,7 @@
  * user.c
  *	  Commands for manipulating roles (formerly called users).
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/commands/user.c
@@ -14,7 +14,9 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/binary_upgrade.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -46,12 +48,11 @@ extern bool Password_encryption;
 /* Hook to check passwords in CreateRole() and AlterRole() */
 check_password_hook_type check_password_hook = NULL;
 
-static List *roleNamesToIds(List *memberNames);
 static void AddRoleMems(const char *rolename, Oid roleid,
-			List *memberNames, List *memberIds,
+			List *memberSpecs, List *memberIds,
 			Oid grantorId, bool admin_opt);
 static void DelRoleMems(const char *rolename, Oid roleid,
-			List *memberNames, List *memberIds,
+			List *memberSpecs, List *memberIds,
 			bool admin_opt);
 
 
@@ -66,7 +67,7 @@ have_createrole_privilege(void)
 /*
  * CREATE ROLE
  */
-void
+Oid
 CreateRole(CreateRoleStmt *stmt)
 {
 	Relation	pg_authid_rel;
@@ -86,6 +87,7 @@ CreateRole(CreateRoleStmt *stmt)
 	bool		createdb = false;		/* Can the user create databases? */
 	bool		canlogin = false;		/* Can this user login? */
 	bool		isreplication = false;	/* Is this a replication role? */
+	bool		bypassrls = false;		/* Is this a row security enabled role? */
 	int			connlimit = -1; /* maximum connections allowed */
 	List	   *addroleto = NIL;	/* roles to make this a member of */
 	List	   *rolemembers = NIL;		/* roles to be members of this role */
@@ -105,6 +107,7 @@ CreateRole(CreateRoleStmt *stmt)
 	DefElem    *drolemembers = NULL;
 	DefElem    *dadminmembers = NULL;
 	DefElem    *dvalidUntil = NULL;
+	DefElem    *dbypassRLS = NULL;
 
 	/* The defaults can vary depending on the original statement type */
 	switch (stmt->stmt_type)
@@ -231,6 +234,14 @@ CreateRole(CreateRoleStmt *stmt)
 						 errmsg("conflicting or redundant options")));
 			dvalidUntil = defel;
 		}
+		else if (strcmp(defel->defname, "bypassrls") == 0)
+		{
+			if (dbypassRLS)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dbypassRLS = defel;
+		}
 		else
 			elog(ERROR, "option \"%s\" not recognized",
 				 defel->defname);
@@ -266,6 +277,8 @@ CreateRole(CreateRoleStmt *stmt)
 		adminmembers = (List *) dadminmembers->arg;
 	if (dvalidUntil)
 		validUntil = strVal(dvalidUntil->arg);
+	if (dbypassRLS)
+		bypassrls = intVal(dbypassRLS->arg) != 0;
 
 	/* Check some permissions first */
 	if (issuper)
@@ -281,6 +294,13 @@ CreateRole(CreateRoleStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				   errmsg("must be superuser to create replication users")));
+	}
+	else if (bypassrls)
+	{
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to change bypassrls attribute.")));
 	}
 	else
 	{
@@ -348,8 +368,6 @@ CreateRole(CreateRoleStmt *stmt)
 	new_record[Anum_pg_authid_rolinherit - 1] = BoolGetDatum(inherit);
 	new_record[Anum_pg_authid_rolcreaterole - 1] = BoolGetDatum(createrole);
 	new_record[Anum_pg_authid_rolcreatedb - 1] = BoolGetDatum(createdb);
-	/* superuser gets catupdate right by default */
-	new_record[Anum_pg_authid_rolcatupdate - 1] = BoolGetDatum(issuper);
 	new_record[Anum_pg_authid_rolcanlogin - 1] = BoolGetDatum(canlogin);
 	new_record[Anum_pg_authid_rolreplication - 1] = BoolGetDatum(isreplication);
 	new_record[Anum_pg_authid_rolconnlimit - 1] = Int32GetDatum(connlimit);
@@ -374,14 +392,21 @@ CreateRole(CreateRoleStmt *stmt)
 	new_record[Anum_pg_authid_rolvaliduntil - 1] = validUntil_datum;
 	new_record_nulls[Anum_pg_authid_rolvaliduntil - 1] = validUntil_null;
 
+	new_record[Anum_pg_authid_rolbypassrls - 1] = BoolGetDatum(bypassrls);
+
 	tuple = heap_form_tuple(pg_authid_dsc, new_record, new_record_nulls);
 
 	/*
 	 * pg_largeobject_metadata contains pg_authid.oid's, so we use the
-	 * binary-upgrade override, if specified.
+	 * binary-upgrade override.
 	 */
-	if (IsBinaryUpgrade && OidIsValid(binary_upgrade_next_pg_authid_oid))
+	if (IsBinaryUpgrade)
 	{
+		if (!OidIsValid(binary_upgrade_next_pg_authid_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("pg_authid OID value not set when in binary upgrade mode")));
+
 		HeapTupleSetOid(tuple, binary_upgrade_next_pg_authid_oid);
 		binary_upgrade_next_pg_authid_oid = InvalidOid;
 	}
@@ -404,13 +429,17 @@ CreateRole(CreateRoleStmt *stmt)
 	 */
 	foreach(item, addroleto)
 	{
-		char	   *oldrolename = strVal(lfirst(item));
-		Oid			oldroleid = get_role_oid(oldrolename, false);
+		RoleSpec   *oldrole = lfirst(item);
+		HeapTuple	oldroletup = get_rolespec_tuple((Node *) oldrole);
+		Oid			oldroleid = HeapTupleGetOid(oldroletup);
+		char	   *oldrolename = NameStr(((Form_pg_authid) GETSTRUCT(oldroletup))->rolname);
 
 		AddRoleMems(oldrolename, oldroleid,
 					list_make1(makeString(stmt->role)),
 					list_make1_oid(roleid),
 					GetUserId(), false);
+
+		ReleaseSysCache(oldroletup);
 	}
 
 	/*
@@ -418,19 +447,21 @@ CreateRole(CreateRoleStmt *stmt)
 	 * option, rolemembers don't.
 	 */
 	AddRoleMems(stmt->role, roleid,
-				adminmembers, roleNamesToIds(adminmembers),
+				adminmembers, roleSpecsToIds(adminmembers),
 				GetUserId(), true);
 	AddRoleMems(stmt->role, roleid,
-				rolemembers, roleNamesToIds(rolemembers),
+				rolemembers, roleSpecsToIds(rolemembers),
 				GetUserId(), false);
 
 	/* Post creation hook for new role */
-	InvokeObjectAccessHook(OAT_POST_CREATE, AuthIdRelationId, roleid, 0);
+	InvokeObjectPostCreateHook(AuthIdRelationId, roleid, 0);
 
 	/*
 	 * Close pg_authid, but keep lock till commit.
 	 */
 	heap_close(pg_authid_rel, NoLock);
+
+	return roleid;
 }
 
 
@@ -441,7 +472,7 @@ CreateRole(CreateRoleStmt *stmt)
  * backwards-compatible ALTER GROUP syntax.  Although it will work to say
  * "ALTER ROLE role ROLE rolenames", we don't document it.
  */
-void
+Oid
 AlterRole(AlterRoleStmt *stmt)
 {
 	Datum		new_record[Natts_pg_authid];
@@ -451,7 +482,9 @@ AlterRole(AlterRoleStmt *stmt)
 	TupleDesc	pg_authid_dsc;
 	HeapTuple	tuple,
 				new_tuple;
+	Form_pg_authid authform;
 	ListCell   *option;
+	char	   *rolename = NULL;
 	char	   *password = NULL;	/* user password */
 	bool		encrypt_password = Password_encryption; /* encrypt password? */
 	char		encrypted_password[MD5_PASSWD_LEN + 1];
@@ -466,6 +499,7 @@ AlterRole(AlterRoleStmt *stmt)
 	char	   *validUntil = NULL;		/* time the login is valid until */
 	Datum		validUntil_datum;		/* same, as timestamptz Datum */
 	bool		validUntil_null;
+	bool		bypassrls = -1;
 	DefElem    *dpassword = NULL;
 	DefElem    *dissuper = NULL;
 	DefElem    *dinherit = NULL;
@@ -476,6 +510,7 @@ AlterRole(AlterRoleStmt *stmt)
 	DefElem    *dconnlimit = NULL;
 	DefElem    *drolemembers = NULL;
 	DefElem    *dvalidUntil = NULL;
+	DefElem    *dbypassRLS = NULL;
 	Oid			roleid;
 
 	/* Extract options from the statement node tree */
@@ -570,6 +605,14 @@ AlterRole(AlterRoleStmt *stmt)
 						 errmsg("conflicting or redundant options")));
 			dvalidUntil = defel;
 		}
+		else if (strcmp(defel->defname, "bypassrls") == 0)
+		{
+			if (dbypassRLS)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dbypassRLS = defel;
+		}
 		else
 			elog(ERROR, "option \"%s\" not recognized",
 				 defel->defname);
@@ -601,6 +644,8 @@ AlterRole(AlterRoleStmt *stmt)
 		rolemembers = (List *) drolemembers->arg;
 	if (dvalidUntil)
 		validUntil = strVal(dvalidUntil->arg);
+	if (dbypassRLS)
+		bypassrls = intVal(dbypassRLS->arg);
 
 	/*
 	 * Scan the pg_authid relation to be certain the user exists.
@@ -608,31 +653,35 @@ AlterRole(AlterRoleStmt *stmt)
 	pg_authid_rel = heap_open(AuthIdRelationId, RowExclusiveLock);
 	pg_authid_dsc = RelationGetDescr(pg_authid_rel);
 
-	tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(stmt->role));
-	if (!HeapTupleIsValid(tuple))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("role \"%s\" does not exist", stmt->role)));
-
+	tuple = get_rolespec_tuple(stmt->role);
+	authform = (Form_pg_authid) GETSTRUCT(tuple);
+	rolename = pstrdup(NameStr(authform->rolname));
 	roleid = HeapTupleGetOid(tuple);
 
 	/*
 	 * To mess with a superuser you gotta be superuser; else you need
 	 * createrole, or just want to change your own password
 	 */
-	if (((Form_pg_authid) GETSTRUCT(tuple))->rolsuper || issuper >= 0)
+	if (authform->rolsuper || issuper >= 0)
 	{
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to alter superusers")));
 	}
-	else if (((Form_pg_authid) GETSTRUCT(tuple))->rolreplication || isreplication >= 0)
+	else if (authform->rolreplication || isreplication >= 0)
 	{
 		if (!superuser())
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to alter replication users")));
+	}
+	else if (authform->rolbypassrls || bypassrls >= 0)
+	{
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to change bypassrls attribute")));
 	}
 	else if (!have_createrole_privilege())
 	{
@@ -672,11 +721,11 @@ AlterRole(AlterRoleStmt *stmt)
 	 * Call the password checking hook if there is one defined
 	 */
 	if (check_password_hook && password)
-		(*check_password_hook) (stmt->role,
-								password,
-			   isMD5(password) ? PASSWORD_TYPE_MD5 : PASSWORD_TYPE_PLAINTEXT,
-								validUntil_datum,
-								validUntil_null);
+		(*check_password_hook)(rolename ,
+							   password,
+			 isMD5(password) ? PASSWORD_TYPE_MD5 : PASSWORD_TYPE_PLAINTEXT,
+							   validUntil_datum,
+							   validUntil_null);
 
 	/*
 	 * Build an updated tuple, perusing the information just obtained
@@ -686,20 +735,12 @@ AlterRole(AlterRoleStmt *stmt)
 	MemSet(new_record_repl, false, sizeof(new_record_repl));
 
 	/*
-	 * issuper/createrole/catupdate/etc
-	 *
-	 * XXX It's rather unclear how to handle catupdate.  It's probably best to
-	 * keep it equal to the superuser status, otherwise you could end up with
-	 * a situation where no existing superuser can alter the catalogs,
-	 * including pg_authid!
+	 * issuper/createrole/etc
 	 */
 	if (issuper >= 0)
 	{
 		new_record[Anum_pg_authid_rolsuper - 1] = BoolGetDatum(issuper > 0);
 		new_record_repl[Anum_pg_authid_rolsuper - 1] = true;
-
-		new_record[Anum_pg_authid_rolcatupdate - 1] = BoolGetDatum(issuper > 0);
-		new_record_repl[Anum_pg_authid_rolcatupdate - 1] = true;
 	}
 
 	if (inherit >= 0)
@@ -746,7 +787,7 @@ AlterRole(AlterRoleStmt *stmt)
 				CStringGetTextDatum(password);
 		else
 		{
-			if (!pg_md5_encrypt(password, stmt->role, strlen(stmt->role),
+			if (!pg_md5_encrypt(password, rolename, strlen(rolename),
 								encrypted_password))
 				elog(ERROR, "password encryption failed");
 			new_record[Anum_pg_authid_rolpassword - 1] =
@@ -767,12 +808,20 @@ AlterRole(AlterRoleStmt *stmt)
 	new_record_nulls[Anum_pg_authid_rolvaliduntil - 1] = validUntil_null;
 	new_record_repl[Anum_pg_authid_rolvaliduntil - 1] = true;
 
+	if (bypassrls >= 0)
+	{
+		new_record[Anum_pg_authid_rolbypassrls - 1] = BoolGetDatum(bypassrls > 0);
+		new_record_repl[Anum_pg_authid_rolbypassrls - 1] = true;
+	}
+
 	new_tuple = heap_modify_tuple(tuple, pg_authid_dsc, new_record,
 								  new_record_nulls, new_record_repl);
 	simple_heap_update(pg_authid_rel, &tuple->t_self, new_tuple);
 
 	/* Update indexes */
 	CatalogUpdateIndexes(pg_authid_rel, new_tuple);
+
+	InvokeObjectPostAlterHook(AuthIdRelationId, roleid, 0);
 
 	ReleaseSysCache(tuple);
 	heap_freetuple(new_tuple);
@@ -785,61 +834,65 @@ AlterRole(AlterRoleStmt *stmt)
 		CommandCounterIncrement();
 
 	if (stmt->action == +1)		/* add members to role */
-		AddRoleMems(stmt->role, roleid,
-					rolemembers, roleNamesToIds(rolemembers),
+		AddRoleMems(rolename, roleid,
+					rolemembers, roleSpecsToIds(rolemembers),
 					GetUserId(), false);
 	else if (stmt->action == -1)	/* drop members from role */
-		DelRoleMems(stmt->role, roleid,
-					rolemembers, roleNamesToIds(rolemembers),
+		DelRoleMems(rolename, roleid,
+					rolemembers, roleSpecsToIds(rolemembers),
 					false);
 
 	/*
 	 * Close pg_authid, but keep lock till commit.
 	 */
 	heap_close(pg_authid_rel, NoLock);
+
+	return roleid;
 }
 
 
 /*
  * ALTER ROLE ... SET
  */
-void
+Oid
 AlterRoleSet(AlterRoleSetStmt *stmt)
 {
 	HeapTuple	roletuple;
 	Oid			databaseid = InvalidOid;
+	Oid			roleid = InvalidOid;
 
-	roletuple = SearchSysCache1(AUTHNAME, PointerGetDatum(stmt->role));
-
-	if (!HeapTupleIsValid(roletuple))
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("role \"%s\" does not exist", stmt->role)));
-
-	/*
-	 * Obtain a lock on the role and make sure it didn't go away in the
-	 * meantime.
-	 */
-	shdepLockAndCheckObject(AuthIdRelationId, HeapTupleGetOid(roletuple));
-
-	/*
-	 * To mess with a superuser you gotta be superuser; else you need
-	 * createrole, or just want to change your own settings
-	 */
-	if (((Form_pg_authid) GETSTRUCT(roletuple))->rolsuper)
+	if (stmt->role)
 	{
-		if (!superuser())
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to alter superusers")));
-	}
-	else
-	{
-		if (!have_createrole_privilege() &&
-			HeapTupleGetOid(roletuple) != GetUserId())
-			ereport(ERROR,
-					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("permission denied")));
+		roletuple = get_rolespec_tuple(stmt->role);
+		roleid = HeapTupleGetOid(roletuple);
+
+		/*
+		 * Obtain a lock on the role and make sure it didn't go away in the
+		 * meantime.
+		 */
+		shdepLockAndCheckObject(AuthIdRelationId, HeapTupleGetOid(roletuple));
+
+		/*
+		 * To mess with a superuser you gotta be superuser; else you need
+		 * createrole, or just want to change your own settings
+		 */
+		if (((Form_pg_authid) GETSTRUCT(roletuple))->rolsuper)
+		{
+			if (!superuser())
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("must be superuser to alter superusers")));
+		}
+		else
+		{
+			if (!have_createrole_privilege() &&
+				HeapTupleGetOid(roletuple) != GetUserId())
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission denied")));
+		}
+
+		ReleaseSysCache(roletuple);
 	}
 
 	/* look up and lock the database, if specified */
@@ -847,10 +900,31 @@ AlterRoleSet(AlterRoleSetStmt *stmt)
 	{
 		databaseid = get_database_oid(stmt->database, false);
 		shdepLockAndCheckObject(DatabaseRelationId, databaseid);
+
+		if (!stmt->role)
+		{
+			/*
+			 * If no role is specified, then this is effectively the same as
+			 * ALTER DATABASE ... SET, so use the same permission check.
+			 */
+			if (!pg_database_ownercheck(databaseid, GetUserId()))
+				aclcheck_error(ACLCHECK_NOT_OWNER, ACL_KIND_DATABASE,
+							   stmt->database);
+		}
 	}
 
-	AlterSetting(databaseid, HeapTupleGetOid(roletuple), stmt->setstmt);
-	ReleaseSysCache(roletuple);
+	if (!stmt->role && !stmt->database)
+	{
+		/* Must be superuser to alter settings globally. */
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to alter settings globally")));
+	}
+
+	AlterSetting(databaseid, roleid, stmt->setstmt);
+
+	return roleid;
 }
 
 
@@ -878,7 +952,8 @@ DropRole(DropRoleStmt *stmt)
 
 	foreach(item, stmt->roles)
 	{
-		const char *role = strVal(lfirst(item));
+		RoleSpec   *rolspec = lfirst(item);
+		char	   *role;
 		HeapTuple	tuple,
 					tmp_tuple;
 		ScanKeyData scankey;
@@ -886,6 +961,12 @@ DropRole(DropRoleStmt *stmt)
 		char	   *detail_log;
 		SysScanDesc sscan;
 		Oid			roleid;
+
+		if (rolspec->roletype != ROLESPEC_CSTRING)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cannot use special role specifier in \"%s\"", "DROP ROLE")));
+		role = rolspec->rolename;
 
 		tuple = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
 		if (!HeapTupleIsValid(tuple))
@@ -932,6 +1013,9 @@ DropRole(DropRoleStmt *stmt)
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to drop superusers")));
 
+		/* DROP hook for the role being removed */
+		InvokeObjectDropHook(AuthIdRelationId, roleid, 0);
+
 		/*
 		 * Lock the role, so nobody can add dependencies to her while we drop
 		 * her.  We keep the lock until the end of transaction.
@@ -956,7 +1040,7 @@ DropRole(DropRoleStmt *stmt)
 		ReleaseSysCache(tuple);
 
 		/*
-		 * Remove role from the pg_auth_members table.	We have to remove all
+		 * Remove role from the pg_auth_members table.  We have to remove all
 		 * tuples that show it as either a role or a member.
 		 *
 		 * XXX what about grantor entries?	Maybe we should do one heap scan.
@@ -967,7 +1051,7 @@ DropRole(DropRoleStmt *stmt)
 					ObjectIdGetDatum(roleid));
 
 		sscan = systable_beginscan(pg_auth_members_rel, AuthMemRoleMemIndexId,
-								   true, SnapshotNow, 1, &scankey);
+								   true, NULL, 1, &scankey);
 
 		while (HeapTupleIsValid(tmp_tuple = systable_getnext(sscan)))
 		{
@@ -982,7 +1066,7 @@ DropRole(DropRoleStmt *stmt)
 					ObjectIdGetDatum(roleid));
 
 		sscan = systable_beginscan(pg_auth_members_rel, AuthMemMemRoleIndexId,
-								   true, SnapshotNow, 1, &scankey);
+								   true, NULL, 1, &scankey);
 
 		while (HeapTupleIsValid(tmp_tuple = systable_getnext(sscan)))
 		{
@@ -1024,7 +1108,7 @@ DropRole(DropRoleStmt *stmt)
 /*
  * Rename role
  */
-void
+ObjectAddress
 RenameRole(const char *oldname, const char *newname)
 {
 	HeapTuple	oldtuple,
@@ -1038,6 +1122,7 @@ RenameRole(const char *oldname, const char *newname)
 	bool		repl_repl[Natts_pg_authid];
 	int			i;
 	Oid			roleid;
+	ObjectAddress address;
 
 	rel = heap_open(AuthIdRelationId, RowExclusiveLock);
 	dsc = RelationGetDescr(rel);
@@ -1052,7 +1137,7 @@ RenameRole(const char *oldname, const char *newname)
 	 * XXX Client applications probably store the session user somewhere, so
 	 * renaming it could cause confusion.  On the other hand, there may not be
 	 * an actual problem besides a little confusion, so think about this and
-	 * decide.	Same for SET ROLE ... we don't restrict renaming the current
+	 * decide.  Same for SET ROLE ... we don't restrict renaming the current
 	 * effective userid, though.
 	 */
 
@@ -1124,12 +1209,18 @@ RenameRole(const char *oldname, const char *newname)
 
 	CatalogUpdateIndexes(rel, newtuple);
 
+	InvokeObjectPostAlterHook(AuthIdRelationId, roleid, 0);
+
+	ObjectAddressSet(address, AuthIdRelationId, roleid);
+
 	ReleaseSysCache(oldtuple);
 
 	/*
 	 * Close pg_authid, but keep lock till commit.
 	 */
 	heap_close(rel, NoLock);
+
+	return address;
 }
 
 /*
@@ -1146,11 +1237,11 @@ GrantRole(GrantRoleStmt *stmt)
 	ListCell   *item;
 
 	if (stmt->grantor)
-		grantor = get_role_oid(stmt->grantor, false);
+		grantor = get_rolespec_oid(stmt->grantor, false);
 	else
 		grantor = GetUserId();
 
-	grantee_ids = roleNamesToIds(stmt->grantee_roles);
+	grantee_ids = roleSpecsToIds(stmt->grantee_roles);
 
 	/* AccessShareLock is enough since we aren't modifying pg_authid */
 	pg_authid_rel = heap_open(AuthIdRelationId, AccessShareLock);
@@ -1199,7 +1290,7 @@ GrantRole(GrantRoleStmt *stmt)
 void
 DropOwnedObjects(DropOwnedStmt *stmt)
 {
-	List	   *role_ids = roleNamesToIds(stmt->roles);
+	List	   *role_ids = roleSpecsToIds(stmt->roles);
 	ListCell   *cell;
 
 	/* Check privileges */
@@ -1225,7 +1316,7 @@ DropOwnedObjects(DropOwnedStmt *stmt)
 void
 ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 {
-	List	   *role_ids = roleNamesToIds(stmt->roles);
+	List	   *role_ids = roleSpecsToIds(stmt->roles);
 	ListCell   *cell;
 	Oid			newrole;
 
@@ -1241,7 +1332,7 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 	}
 
 	/* Must have privileges on the receiving side too */
-	newrole = get_role_oid(stmt->newrole, false);
+	newrole = get_rolespec_oid(stmt->newrole, false);
 
 	if (!has_privs_of_role(GetUserId(), newrole))
 		ereport(ERROR,
@@ -1253,22 +1344,24 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 }
 
 /*
- * roleNamesToIds
+ * roleSpecsToIds
  *
- * Given a list of role names (as String nodes), generate a list of role OIDs
- * in the same order.
+ * Given a list of RoleSpecs, generate a list of role OIDs in the same order.
+ *
+ * ROLESPEC_PUBLIC is not allowed.
  */
-static List *
-roleNamesToIds(List *memberNames)
+List *
+roleSpecsToIds(List *memberNames)
 {
 	List	   *result = NIL;
 	ListCell   *l;
 
 	foreach(l, memberNames)
 	{
-		char	   *rolename = strVal(lfirst(l));
-		Oid			roleid = get_role_oid(rolename, false);
+		Node   *rolespec = (Node *) lfirst(l);
+		Oid		roleid;
 
+		roleid = get_rolespec_oid(rolespec, false);
 		result = lappend_oid(result, roleid);
 	}
 	return result;
@@ -1279,7 +1372,7 @@ roleNamesToIds(List *memberNames)
  *
  * rolename: name of role to add to (used only for error messages)
  * roleid: OID of role to add to
- * memberNames: list of names of roles to add (used only for error messages)
+ * memberSpecs: list of RoleSpec of roles to add (used only for error messages)
  * memberIds: OIDs of roles to add
  * grantorId: who is granting the membership
  * admin_opt: granting admin option?
@@ -1288,15 +1381,15 @@ roleNamesToIds(List *memberNames)
  */
 static void
 AddRoleMems(const char *rolename, Oid roleid,
-			List *memberNames, List *memberIds,
+			List *memberSpecs, List *memberIds,
 			Oid grantorId, bool admin_opt)
 {
 	Relation	pg_authmem_rel;
 	TupleDesc	pg_authmem_dsc;
-	ListCell   *nameitem;
+	ListCell   *specitem;
 	ListCell   *iditem;
 
-	Assert(list_length(memberNames) == list_length(memberIds));
+	Assert(list_length(memberSpecs) == list_length(memberIds));
 
 	/* Skip permission check if nothing to do */
 	if (!memberIds)
@@ -1304,7 +1397,7 @@ AddRoleMems(const char *rolename, Oid roleid,
 
 	/*
 	 * Check permissions: must have createrole or admin option on the role to
-	 * be changed.	To mess with a superuser role, you gotta be superuser.
+	 * be changed.  To mess with a superuser role, you gotta be superuser.
 	 */
 	if (superuser_arg(roleid))
 	{
@@ -1323,7 +1416,16 @@ AddRoleMems(const char *rolename, Oid roleid,
 							rolename)));
 	}
 
-	/* XXX not sure about this check */
+	/*
+	 * The role membership grantor of record has little significance at
+	 * present.  Nonetheless, inasmuch as users might look to it for a crude
+	 * audit trail, let only superusers impute the grant to a third party.
+	 *
+	 * Before lifting this restriction, give the member == role case of
+	 * is_admin_of_role() a fresh look.  Ensure that the current role cannot
+	 * use an explicit grantor specification to take advantage of the session
+	 * user's self-admin right.
+	 */
 	if (grantorId != GetUserId() && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -1332,9 +1434,9 @@ AddRoleMems(const char *rolename, Oid roleid,
 	pg_authmem_rel = heap_open(AuthMemRelationId, RowExclusiveLock);
 	pg_authmem_dsc = RelationGetDescr(pg_authmem_rel);
 
-	forboth(nameitem, memberNames, iditem, memberIds)
+	forboth(specitem, memberSpecs, iditem, memberIds)
 	{
-		const char *membername = strVal(lfirst(nameitem));
+		RoleSpec   *memberRole = lfirst(specitem);
 		Oid			memberid = lfirst_oid(iditem);
 		HeapTuple	authmem_tuple;
 		HeapTuple	tuple;
@@ -1353,7 +1455,7 @@ AddRoleMems(const char *rolename, Oid roleid,
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_GRANT_OPERATION),
 					 (errmsg("role \"%s\" is a member of role \"%s\"",
-							 rolename, membername))));
+							 rolename, get_rolespec_name((Node *) memberRole)))));
 
 		/*
 		 * Check if entry for this role/member already exists; if so, give
@@ -1368,7 +1470,7 @@ AddRoleMems(const char *rolename, Oid roleid,
 		{
 			ereport(NOTICE,
 					(errmsg("role \"%s\" is already a member of role \"%s\"",
-							membername, rolename)));
+							get_rolespec_name((Node *) memberRole), rolename)));
 			ReleaseSysCache(authmem_tuple);
 			continue;
 		}
@@ -1417,7 +1519,7 @@ AddRoleMems(const char *rolename, Oid roleid,
  *
  * rolename: name of role to del from (used only for error messages)
  * roleid: OID of role to del from
- * memberNames: list of names of roles to del (used only for error messages)
+ * memberSpecs: list of RoleSpec of roles to del (used only for error messages)
  * memberIds: OIDs of roles to del
  * admin_opt: remove admin option only?
  *
@@ -1425,15 +1527,15 @@ AddRoleMems(const char *rolename, Oid roleid,
  */
 static void
 DelRoleMems(const char *rolename, Oid roleid,
-			List *memberNames, List *memberIds,
+			List *memberSpecs, List *memberIds,
 			bool admin_opt)
 {
 	Relation	pg_authmem_rel;
 	TupleDesc	pg_authmem_dsc;
-	ListCell   *nameitem;
+	ListCell   *specitem;
 	ListCell   *iditem;
 
-	Assert(list_length(memberNames) == list_length(memberIds));
+	Assert(list_length(memberSpecs) == list_length(memberIds));
 
 	/* Skip permission check if nothing to do */
 	if (!memberIds)
@@ -1441,7 +1543,7 @@ DelRoleMems(const char *rolename, Oid roleid,
 
 	/*
 	 * Check permissions: must have createrole or admin option on the role to
-	 * be changed.	To mess with a superuser role, you gotta be superuser.
+	 * be changed.  To mess with a superuser role, you gotta be superuser.
 	 */
 	if (superuser_arg(roleid))
 	{
@@ -1463,9 +1565,9 @@ DelRoleMems(const char *rolename, Oid roleid,
 	pg_authmem_rel = heap_open(AuthMemRelationId, RowExclusiveLock);
 	pg_authmem_dsc = RelationGetDescr(pg_authmem_rel);
 
-	forboth(nameitem, memberNames, iditem, memberIds)
+	forboth(specitem, memberSpecs, iditem, memberIds)
 	{
-		const char *membername = strVal(lfirst(nameitem));
+		RoleSpec   *memberRole = lfirst(specitem);
 		Oid			memberid = lfirst_oid(iditem);
 		HeapTuple	authmem_tuple;
 
@@ -1479,7 +1581,7 @@ DelRoleMems(const char *rolename, Oid roleid,
 		{
 			ereport(WARNING,
 					(errmsg("role \"%s\" is not a member of role \"%s\"",
-							membername, rolename)));
+							get_rolespec_name((Node *) memberRole), rolename)));
 			continue;
 		}
 

@@ -4,7 +4,7 @@
  *	  Definition of (and support for) access control list data structures.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/acl.h
@@ -24,6 +24,7 @@
 #ifndef ACL_H
 #define ACL_H
 
+#include "access/htup.h"
 #include "nodes/parsenodes.h"
 #include "utils/array.h"
 #include "utils/snapshot.h"
@@ -81,11 +82,11 @@ typedef struct AclItem
 /*
  * Definitions for convenient access to Acl (array of AclItem).
  * These are standard PostgreSQL arrays, but are restricted to have one
- * dimension and no nulls.	We also ignore the lower bound when reading,
+ * dimension and no nulls.  We also ignore the lower bound when reading,
  * and set it to one when writing.
  *
  * CAUTION: as of PostgreSQL 7.1, these arrays are toastable (just like all
- * other array types).	Therefore, be careful to detoast them with the
+ * other array types).  Therefore, be careful to detoast them with the
  * macros provided, unless you know for certain that a particular array
  * can't have been toasted.
  */
@@ -195,6 +196,7 @@ typedef enum AclObjectKind
 	ACL_KIND_TSCONFIGURATION,	/* pg_ts_config */
 	ACL_KIND_FDW,				/* pg_foreign_data_wrapper */
 	ACL_KIND_FOREIGN_SERVER,	/* pg_foreign_server */
+	ACL_KIND_EVENT_TRIGGER,		/* pg_event_trigger */
 	ACL_KIND_EXTENSION,			/* pg_extension */
 	MAX_ACL_KIND				/* MUST BE LAST */
 } AclObjectKind;
@@ -226,7 +228,11 @@ extern bool is_member_of_role(Oid member, Oid role);
 extern bool is_member_of_role_nosuper(Oid member, Oid role);
 extern bool is_admin_of_role(Oid member, Oid role);
 extern void check_is_member_of_role(Oid member, Oid role);
-extern Oid	get_role_oid(const char *rolname, bool missing_ok);
+extern Oid	get_role_oid(const char *rolename, bool missing_ok);
+extern Oid	get_role_oid_or_public(const char *rolename);
+extern Oid  get_rolespec_oid(const Node *node, bool missing_ok);
+extern HeapTuple get_rolespec_tuple(const Node *node);
+extern char *get_rolespec_name(const Node *node);
 
 extern void select_best_grantor(Oid roleId, AclMode privileges,
 					const Acl *acl, Oid ownerId,
@@ -278,7 +284,7 @@ extern AclMode pg_foreign_data_wrapper_aclmask(Oid fdw_oid, Oid roleid,
 extern AclMode pg_foreign_server_aclmask(Oid srv_oid, Oid roleid,
 						  AclMode mask, AclMaskHow how);
 extern AclMode pg_type_aclmask(Oid type_oid, Oid roleid,
-						  AclMode mask, AclMaskHow how);
+				AclMode mask, AclMaskHow how);
 
 extern AclResult pg_attribute_aclcheck(Oid table_oid, AttrNumber attnum,
 					  Oid roleid, AclMode mode);
@@ -302,6 +308,8 @@ extern void aclcheck_error(AclResult aclerr, AclObjectKind objectkind,
 extern void aclcheck_error_col(AclResult aclerr, AclObjectKind objectkind,
 				   const char *objectname, const char *colname);
 
+extern void aclcheck_error_type(AclResult aclerr, Oid typeOid);
+
 /* ownercheck routines just return true (owner) or false (not) */
 extern bool pg_class_ownercheck(Oid class_oid, Oid roleid);
 extern bool pg_type_ownercheck(Oid type_oid, Oid roleid);
@@ -320,7 +328,9 @@ extern bool pg_ts_dict_ownercheck(Oid dict_oid, Oid roleid);
 extern bool pg_ts_config_ownercheck(Oid cfg_oid, Oid roleid);
 extern bool pg_foreign_data_wrapper_ownercheck(Oid srv_oid, Oid roleid);
 extern bool pg_foreign_server_ownercheck(Oid srv_oid, Oid roleid);
+extern bool pg_event_trigger_ownercheck(Oid et_oid, Oid roleid);
 extern bool pg_extension_ownercheck(Oid ext_oid, Oid roleid);
 extern bool has_createrole_privilege(Oid roleid);
+extern bool has_bypassrls_privilege(Oid roleid);
 
 #endif   /* ACL_H */

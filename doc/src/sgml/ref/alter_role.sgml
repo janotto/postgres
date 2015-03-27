@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERROLE">
+ <indexterm zone="sql-alterrole">
+  <primary>ALTER ROLE</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ALTER ROLE</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,13 +19,9 @@ PostgreSQL documentation
   <refpurpose>change a database role</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alterrole">
-  <primary>ALTER ROLE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ [ WITH ] <replaceable class="PARAMETER">option</replaceable> [ ... ] ]
+ALTER ROLE <replaceable class="PARAMETER">role_specification</replaceable> [ WITH ] <replaceable class="PARAMETER">option</replaceable> [ ... ]
 
 <phrase>where <replaceable class="PARAMETER">option</replaceable> can be:</phrase>
 
@@ -32,16 +32,23 @@ ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ [ WITH ] <replace
     | INHERIT | NOINHERIT
     | LOGIN | NOLOGIN
     | REPLICATION | NOREPLICATION
+    | BYPASSRLS | NOBYPASSRLS
     | CONNECTION LIMIT <replaceable class="PARAMETER">connlimit</replaceable>
     | [ ENCRYPTED | UNENCRYPTED ] PASSWORD '<replaceable class="PARAMETER">password</replaceable>'
     | VALID UNTIL '<replaceable class="PARAMETER">timestamp</replaceable>'
 
 ALTER ROLE <replaceable class="PARAMETER">name</replaceable> RENAME TO <replaceable>new_name</replaceable>
 
-ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] SET <replaceable>configuration_parameter</replaceable> { TO | = } { <replaceable>value</replaceable> | DEFAULT }
-ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] SET <replaceable>configuration_parameter</replaceable> FROM CURRENT
-ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] RESET <replaceable>configuration_parameter</replaceable>
-ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] RESET ALL
+ALTER ROLE { <replaceable class="PARAMETER">role_specification</replaceable> | ALL } [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] SET <replaceable>configuration_parameter</replaceable> { TO | = } { <replaceable>value</replaceable> | DEFAULT }
+ALTER ROLE { <replaceable class="PARAMETER">role_specification</replaceable> | ALL } [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] SET <replaceable>configuration_parameter</replaceable> FROM CURRENT
+ALTER ROLE { <replaceable class="PARAMETER">role_specification</replaceable> | ALL } [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] RESET <replaceable>configuration_parameter</replaceable>
+ALTER ROLE { <replaceable class="PARAMETER">role_specification</replaceable> | ALL } [ IN DATABASE <replaceable class="PARAMETER">database_name</replaceable> ] RESET ALL
+
+<phrase>where <replaceable class="PARAMETER">role_specification</replaceable> can be:</phrase>
+
+    [ GROUP ] <replaceable class="PARAMETER">role_name</replaceable>
+  | CURRENT_USER
+  | SESSION_USER
 </synopsis>
  </refsynopsisdiv>
 
@@ -83,8 +90,15 @@ ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <repl
   <para>
    The remaining variants change a role's session default for a configuration
    variable, either for all databases or, when the <literal>IN
-   DATABASE</literal> clause is specified, only for sessions in
-   the named database. Whenever the role subsequently
+   DATABASE</literal> clause is specified, only for sessions in the named
+   database.  If <literal>ALL</literal> is specified instead of a role name,
+   this changes the setting for all roles.  Using <literal>ALL</literal>
+   with <literal>IN DATABASE</literal> is effectively the same as using the
+   command <literal>ALTER DATABASE ... SET ...</literal>.
+  </para>
+
+  <para>
+   Whenever the role subsequently
    starts a new session, the specified value becomes the session
    default, overriding whatever setting is present in
    <filename>postgresql.conf</> or has been received from the <command>postgres</command>
@@ -93,12 +107,17 @@ ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <repl
    <xref linkend="sql-set-session-authorization"> does not cause new
    configuration values to be set.
    Settings set for all databases are overridden by database-specific settings
-   attached to a role.
+   attached to a role.  Settings for specific databases or specific roles override
+   settings for all roles.
+  </para>
+
+  <para>
    Superusers can change anyone's session defaults. Roles having
    <literal>CREATEROLE</> privilege can change defaults for non-superuser
    roles. Ordinary roles can only set defaults for themselves.
    Certain configuration variables cannot be set this way, or can only be
-   set if a superuser issues the command.
+   set if a superuser issues the command.  Only superusers can change a setting
+   for all roles in all databases.
   </para>
  </refsect1>
 
@@ -111,6 +130,25 @@ ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <repl
       <listitem>
        <para>
         The name of the role whose attributes are to be altered.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term>CURRENT_USER</term>
+      <listitem>
+       <para>
+        Alter the current user instead of an explicitely identified role.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term>SESSION_USER</term>
+      <listitem>
+       <para>
+        Alter the current session user instead of an explicitely identified
+        role.
        </para>
       </listitem>
      </varlistentry>
@@ -130,6 +168,8 @@ ALTER ROLE <replaceable class="PARAMETER">name</replaceable> [ IN DATABASE <repl
       <term><literal>NOLOGIN</literal></term>
       <term><literal>REPLICATION</literal></term>
       <term><literal>NOREPLICATION</literal></term>
+      <term><literal>BYPASSRLS</literal></term>
+      <term><literal>NOBYPASSRLS</literal></term>
       <term><literal>CONNECTION LIMIT</literal> <replaceable class="parameter">connlimit</replaceable></term>
       <term><literal>PASSWORD</> <replaceable class="parameter">password</replaceable></term>
       <term><literal>ENCRYPTED</></term>
@@ -307,6 +347,7 @@ ALTER ROLE fred IN DATABASE devel SET client_min_messages = DEBUG;
   <simplelist type="inline">
    <member><xref linkend="sql-createrole"></member>
    <member><xref linkend="sql-droprole"></member>
+   <member><xref linkend="sql-alterdatabase"></member>
    <member><xref linkend="sql-set"></member>
   </simplelist>
  </refsect1>

@@ -4,7 +4,7 @@
  *	  interface routines for the postgres GiST index access method.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 
 #include "access/genam.h"
 #include "access/gist_private.h"
+#include "access/xloginsert.h"
 #include "catalog/index.h"
 #include "catalog/pg_collation.h"
 #include "miscadmin.h"
@@ -26,12 +27,15 @@
 
 /* non-export function prototypes */
 static void gistfixsplit(GISTInsertState *state, GISTSTATE *giststate);
+static bool gistinserttuple(GISTInsertState *state, GISTInsertStack *stack,
+			 GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum);
 static bool gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
 				 GISTSTATE *giststate,
 				 IndexTuple *tuples, int ntup, OffsetNumber oldoffnum,
-				 Buffer leftchild);
+				 Buffer leftchild, Buffer rightchild,
+				 bool unlockbuf, bool unlockleftchild);
 static void gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
-				GISTSTATE *giststate, List *splitinfo);
+				GISTSTATE *giststate, List *splitinfo, bool releasebuf);
 
 
 #define ROTATEDIST(d) do { \
@@ -68,9 +72,22 @@ createTempGistContext(void)
 Datum
 gistbuildempty(PG_FUNCTION_ARGS)
 {
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("unlogged GiST indexes are not supported")));
+	Relation	index = (Relation) PG_GETARG_POINTER(0);
+	Buffer		buffer;
+
+	/* Initialize the root page */
+	buffer = ReadBufferExtended(index, INIT_FORKNUM, P_NEW, RBM_NORMAL, NULL);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+	/* Initialize and xlog buffer */
+	START_CRIT_SECTION();
+	GISTInitBuffer(buffer, F_LEAF);
+	MarkBufferDirty(buffer);
+	log_newpage_buffer(buffer, true);
+	END_CRIT_SECTION();
+
+	/* Unlock and release the buffer */
+	UnlockReleaseBuffer(buffer);
 
 	PG_RETURN_VOID();
 }
@@ -145,16 +162,22 @@ gistinsert(PG_FUNCTION_ARGS)
  * pages are released; note that new tuple(s) are *not* on the root page
  * but in one of the new child pages.
  *
+ * If 'newblkno' is not NULL, returns the block number of page the first
+ * new/updated tuple was inserted to. Usually it's the given page, but could
+ * be its right sibling if the page was split.
+ *
  * Returns 'true' if the page was split, 'false' otherwise.
  */
 bool
 gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 				Buffer buffer,
 				IndexTuple *itup, int ntup, OffsetNumber oldoffnum,
+				BlockNumber *newblkno,
 				Buffer leftchildbuf,
 				List **splitinfo,
 				bool markfollowright)
 {
+	BlockNumber blkno = BufferGetBlockNumber(buffer);
 	Page		page = BufferGetPage(buffer);
 	bool		is_leaf = (GistPageIsLeaf(page)) ? true : false;
 	XLogRecPtr	recptr;
@@ -194,10 +217,10 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		SplitedPageLayout *dist = NULL,
 				   *ptr;
 		BlockNumber oldrlink = InvalidBlockNumber;
-		GistNSN		oldnsn = {0, 0};
+		GistNSN		oldnsn = 0;
 		SplitedPageLayout rootpg;
-		BlockNumber blkno = BufferGetBlockNumber(buffer);
 		bool		is_rootsplit;
+		int			npage;
 
 		is_rootsplit = (blkno == GIST_ROOT_BLKNO);
 
@@ -219,6 +242,19 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		dist = gistSplit(rel, page, itvec, tlen, giststate);
 
 		/*
+		 * Check that split didn't produce too many pages.
+		 */
+		npage = 0;
+		for (ptr = dist; ptr; ptr = ptr->next)
+			npage++;
+		/* in a root split, we'll add one more page to the list below */
+		if (is_rootsplit)
+			npage++;
+		if (npage > GIST_MAX_SPLIT_PAGES)
+			elog(ERROR, "GiST page split into too many halves (%d, maximum %d)",
+				 npage, GIST_MAX_SPLIT_PAGES);
+
+		/*
 		 * Set up pages to work with. Allocate new buffers for all but the
 		 * leftmost page. The original page becomes the new leftmost page, and
 		 * is just replaced with the new contents.
@@ -232,7 +268,7 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 		{
 			/* save old rightlink and NSN */
 			oldrlink = GistPageGetOpaque(page)->rightlink;
-			oldnsn = GistPageGetOpaque(page)->nsn;
+			oldnsn = GistPageGetNSN(page);
 
 			dist->buffer = buffer;
 			dist->block.blkno = BufferGetBlockNumber(buffer);
@@ -316,9 +352,19 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 
 			for (i = 0; i < ptr->block.num; i++)
 			{
-				if (PageAddItem(ptr->page, (Item) data, IndexTupleSize((IndexTuple) data), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
+				IndexTuple	thistup = (IndexTuple) data;
+
+				if (PageAddItem(ptr->page, (Item) data, IndexTupleSize(thistup), i + FirstOffsetNumber, false, false) == InvalidOffsetNumber)
 					elog(ERROR, "failed to add item to index page in \"%s\"", RelationGetRelationName(rel));
-				data += IndexTupleSize((IndexTuple) data);
+
+				/*
+				 * If this is the first inserted/updated tuple, let the caller
+				 * know which page it landed on.
+				 */
+				if (newblkno && ItemPointerEquals(&thistup->t_tid, &(*itup)->t_tid))
+					*newblkno = ptr->block.blkno;
+
+				data += IndexTupleSize(thistup);
 			}
 
 			/* Set up rightlinks */
@@ -346,8 +392,16 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 			 * F_FOLLOW_RIGHT flags ensure that scans will follow the
 			 * rightlinks until the downlinks are inserted.
 			 */
-			GistPageGetOpaque(ptr->page)->nsn = oldnsn;
+			GistPageSetNSN(ptr->page, oldnsn);
 		}
+
+		/*
+		 * gistXLogSplit() needs to WAL log a lot of pages, prepare WAL
+		 * insertion for that. NB: The number of pages and data segments
+		 * specified here must match the calculations in gistXLogSplit()!
+		 */
+		if (RelationNeedsWAL(rel))
+			XLogEnsureRecordSpace(npage, 1 + npage * 2);
 
 		START_CRIT_SECTION();
 
@@ -373,12 +427,11 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 								   dist, oldrlink, oldnsn, leftchildbuf,
 								   markfollowright);
 		else
-			recptr = GetXLogRecPtrForTemp();
+			recptr = gistGetFakeLSN(rel);
 
 		for (ptr = dist; ptr; ptr = ptr->next)
 		{
 			PageSetLSN(ptr->page, recptr);
-			PageSetTLI(ptr->page, ThisTimeLineID);
 		}
 
 		/*
@@ -426,13 +479,15 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 									leftchildbuf);
 
 			PageSetLSN(page, recptr);
-			PageSetTLI(page, ThisTimeLineID);
 		}
 		else
 		{
-			recptr = GetXLogRecPtrForTemp();
+			recptr = gistGetFakeLSN(rel);
 			PageSetLSN(page, recptr);
 		}
+
+		if (newblkno)
+			*newblkno = blkno;
 	}
 
 	/*
@@ -452,11 +507,10 @@ gistplacetopage(Relation rel, Size freespace, GISTSTATE *giststate,
 	{
 		Page		leftpg = BufferGetPage(leftchildbuf);
 
-		GistPageGetOpaque(leftpg)->nsn = recptr;
+		GistPageSetNSN(leftpg, recptr);
 		GistClearFollowRight(leftpg);
 
 		PageSetLSN(leftpg, recptr);
-		PageSetTLI(leftpg, ThisTimeLineID);
 	}
 
 	END_CRIT_SECTION();
@@ -485,7 +539,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 
 	/* Start from the root */
 	firststack.blkno = GIST_ROOT_BLKNO;
-	firststack.lsn.xrecoff = 0;
+	firststack.lsn = 0;
 	firststack.parent = NULL;
 	firststack.downlinkoffnum = InvalidOffsetNumber;
 	state.stack = stack = &firststack;
@@ -540,8 +594,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 		}
 
 		if (stack->blkno != GIST_ROOT_BLKNO &&
-			XLByteLT(stack->parent->lsn,
-					 GistPageGetOpaque(stack->page)->nsn))
+			stack->parent->lsn < GistPageGetNSN(stack->page))
 		{
 			/*
 			 * Concurrent split detected. There's no guarantee that the
@@ -599,7 +652,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 					xlocked = true;
 					stack->page = (Page) BufferGetPage(stack->buffer);
 
-					if (!XLByteEQ(PageGetLSN(stack->page), stack->lsn))
+					if (PageGetLSN(stack->page) != stack->lsn)
 					{
 						/* the page was changed while we unlocked it, retry */
 						continue;
@@ -609,15 +662,15 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 				/*
 				 * Update the tuple.
 				 *
-				 * We still hold the lock after gistinserttuples(), but it
+				 * We still hold the lock after gistinserttuple(), but it
 				 * might have to split the page to make the updated tuple fit.
 				 * In that case the updated tuple might migrate to the other
 				 * half of the split, so we have to go back to the parent and
 				 * descend back to the half that's a better fit for the new
 				 * tuple.
 				 */
-				if (gistinserttuples(&state, stack, giststate, &newtup, 1,
-									 downlinkoffnum, InvalidBuffer))
+				if (gistinserttuple(&state, stack, giststate, newtup,
+									downlinkoffnum))
 				{
 					/*
 					 * If this was a root split, the root page continues to be
@@ -687,8 +740,7 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 					 */
 				}
 				else if (GistFollowRight(stack->page) ||
-						 XLByteLT(stack->parent->lsn,
-								  GistPageGetOpaque(stack->page)->nsn))
+						 stack->parent->lsn < GistPageGetNSN(stack->page))
 				{
 					/*
 					 * The page was split while we momentarily unlocked the
@@ -703,8 +755,8 @@ gistdoinsert(Relation r, IndexTuple itup, Size freespace, GISTSTATE *giststate)
 
 			/* now state.stack->(page, buffer and blkno) points to leaf page */
 
-			gistinserttuples(&state, stack, giststate, &itup, 1,
-							 InvalidOffsetNumber, InvalidBuffer);
+			gistinserttuple(&state, stack, giststate, itup,
+							InvalidOffsetNumber);
 			LockBuffer(stack->buffer, GIST_UNLOCK);
 
 			/* Release any pins we might still hold before exiting */
@@ -773,13 +825,13 @@ gistFindPath(Relation r, BlockNumber child, OffsetNumber *downlinkoffnum)
 		if (GistFollowRight(page))
 			elog(ERROR, "concurrent GiST page split was incomplete");
 
-		if (top->parent && XLByteLT(top->parent->lsn, GistPageGetOpaque(page)->nsn) &&
+		if (top->parent && top->parent->lsn < GistPageGetNSN(page) &&
 			GistPageGetOpaque(page)->rightlink != InvalidBlockNumber /* sanity check */ )
 		{
 			/*
 			 * Page was split while we looked elsewhere. We didn't see the
-			 * downlink to the right page when we scanned the parent, so
-			 * add it to the queue now.
+			 * downlink to the right page when we scanned the parent, so add
+			 * it to the queue now.
 			 *
 			 * Put the right page ahead of the queue, so that we visit it
 			 * next. That's important, because if this is the lowest internal
@@ -826,7 +878,7 @@ gistFindPath(Relation r, BlockNumber child, OffsetNumber *downlinkoffnum)
 
 	elog(ERROR, "failed to re-find parent of a page in index \"%s\", block %u",
 		 RelationGetRelationName(r), child);
-	return NULL; /* keep compiler quiet */
+	return NULL;				/* keep compiler quiet */
 }
 
 /*
@@ -843,7 +895,8 @@ gistFindCorrectParent(Relation r, GISTInsertStack *child)
 	parent->page = (Page) BufferGetPage(parent->buffer);
 
 	/* here we don't need to distinguish between split and page update */
-	if (child->downlinkoffnum == InvalidOffsetNumber || !XLByteEQ(parent->lsn, PageGetLSN(parent->page)))
+	if (child->downlinkoffnum == InvalidOffsetNumber ||
+		parent->lsn != PageGetLSN(parent->page))
 	{
 		/* parent is changed, look child in right links until found */
 		OffsetNumber i,
@@ -1028,51 +1081,108 @@ gistfixsplit(GISTInsertState *state, GISTSTATE *giststate)
 	}
 
 	/* Insert the downlinks */
-	gistfinishsplit(state, stack, giststate, splitinfo);
+	gistfinishsplit(state, stack, giststate, splitinfo, false);
 }
 
 /*
- * Insert tuples to stack->buffer. If 'oldoffnum' is valid, the new tuples
- * replace an old tuple at oldoffnum. The caller must hold an exclusive lock
- * on the page.
+ * Insert or replace a tuple in stack->buffer. If 'oldoffnum' is valid, the
+ * tuple at 'oldoffnum' is replaced, otherwise the tuple is inserted as new.
+ * 'stack' represents the path from the root to the page being updated.
  *
- * If leftchild is valid, we're inserting/updating the downlink for the
- * page to the right of leftchild. We clear the F_FOLLOW_RIGHT flag and
- * update NSN on leftchild, atomically with the insertion of the downlink.
+ * The caller must hold an exclusive lock on stack->buffer.  The lock is still
+ * held on return, but the page might not contain the inserted tuple if the
+ * page was split. The function returns true if the page was split, false
+ * otherwise.
+ */
+static bool
+gistinserttuple(GISTInsertState *state, GISTInsertStack *stack,
+			  GISTSTATE *giststate, IndexTuple tuple, OffsetNumber oldoffnum)
+{
+	return gistinserttuples(state, stack, giststate, &tuple, 1, oldoffnum,
+							InvalidBuffer, InvalidBuffer, false, false);
+}
+
+/* ----------------
+ * An extended workhorse version of gistinserttuple(). This version allows
+ * inserting multiple tuples, or replacing a single tuple with multiple tuples.
+ * This is used to recursively update the downlinks in the parent when a page
+ * is split.
  *
- * Returns 'true' if the page had to be split. On return, we will continue
- * to hold an exclusive lock on state->stack->buffer, but if we had to split
- * the page, it might not contain the tuple we just inserted/updated.
+ * If leftchild and rightchild are valid, we're inserting/replacing the
+ * downlink for rightchild, and leftchild is its left sibling. We clear the
+ * F_FOLLOW_RIGHT flag and update NSN on leftchild, atomically with the
+ * insertion of the downlink.
+ *
+ * To avoid holding locks for longer than necessary, when recursing up the
+ * tree to update the parents, the locking is a bit peculiar here. On entry,
+ * the caller must hold an exclusive lock on stack->buffer, as well as
+ * leftchild and rightchild if given. On return:
+ *
+ *	- Lock on stack->buffer is released, if 'unlockbuf' is true. The page is
+ *	  always kept pinned, however.
+ *	- Lock on 'leftchild' is released, if 'unlockleftchild' is true. The page
+ *	  is kept pinned.
+ *	- Lock and pin on 'rightchild' are always released.
+ *
+ * Returns 'true' if the page had to be split. Note that if the page was
+ * split, the inserted/updated tuples might've been inserted to a right
+ * sibling of stack->buffer instead of stack->buffer itself.
  */
 static bool
 gistinserttuples(GISTInsertState *state, GISTInsertStack *stack,
 				 GISTSTATE *giststate,
 				 IndexTuple *tuples, int ntup, OffsetNumber oldoffnum,
-				 Buffer leftchild)
+				 Buffer leftchild, Buffer rightchild,
+				 bool unlockbuf, bool unlockleftchild)
 {
 	List	   *splitinfo;
 	bool		is_split;
 
+	/* Insert the tuple(s) to the page, splitting the page if necessary */
 	is_split = gistplacetopage(state->r, state->freespace, giststate,
 							   stack->buffer,
-							   tuples, ntup, oldoffnum,
+							   tuples, ntup,
+							   oldoffnum, NULL,
 							   leftchild,
 							   &splitinfo,
 							   true);
+
+	/*
+	 * Before recursing up in case the page was split, release locks on the
+	 * child pages. We don't need to keep them locked when updating the
+	 * parent.
+	 */
+	if (BufferIsValid(rightchild))
+		UnlockReleaseBuffer(rightchild);
+	if (BufferIsValid(leftchild) && unlockleftchild)
+		LockBuffer(leftchild, GIST_UNLOCK);
+
+	/*
+	 * If we had to split, insert/update the downlinks in the parent. If the
+	 * caller requested us to release the lock on stack->buffer, tell
+	 * gistfinishsplit() to do that as soon as it's safe to do so. If we
+	 * didn't have to split, release it ourselves.
+	 */
 	if (splitinfo)
-		gistfinishsplit(state, stack, giststate, splitinfo);
+		gistfinishsplit(state, stack, giststate, splitinfo, unlockbuf);
+	else if (unlockbuf)
+		LockBuffer(stack->buffer, GIST_UNLOCK);
 
 	return is_split;
 }
 
 /*
- * Finish an incomplete split by inserting/updating the downlinks in
- * parent page. 'splitinfo' contains all the child pages, exclusively-locked,
- * involved in the split, from left-to-right.
+ * Finish an incomplete split by inserting/updating the downlinks in parent
+ * page. 'splitinfo' contains all the child pages involved in the split,
+ * from left-to-right.
+ *
+ * On entry, the caller must hold a lock on stack->buffer and all the child
+ * pages in 'splitinfo'. If 'unlockbuf' is true, the lock on stack->buffer is
+ * released on return. The child pages are always unlocked and unpinned.
  */
 static void
 gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
-				GISTSTATE *giststate, List *splitinfo)
+				GISTSTATE *giststate, List *splitinfo, bool unlockbuf)
 {
 	ListCell   *lc;
 	List	   *reversed;
@@ -1101,6 +1211,10 @@ gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
 	LockBuffer(stack->parent->buffer, GIST_EXCLUSIVE);
 	gistFindCorrectParent(state->r, stack);
 
+	/*
+	 * insert downlinks for the siblings from right to left, until there are
+	 * only two siblings left.
+	 */
 	while (list_length(reversed) > 2)
 	{
 		right = (GISTPageSplitInfo *) linitial(reversed);
@@ -1109,7 +1223,7 @@ gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
 		if (gistinserttuples(state, stack->parent, giststate,
 							 &right->downlink, 1,
 							 InvalidOffsetNumber,
-							 left->buf))
+							 left->buf, right->buf, false, false))
 		{
 			/*
 			 * If the parent page was split, need to relocate the original
@@ -1117,7 +1231,7 @@ gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
 			 */
 			gistFindCorrectParent(state->r, stack);
 		}
-		UnlockReleaseBuffer(right->buf);
+		/* gistinserttuples() released the lock on right->buf. */
 		reversed = list_delete_first(reversed);
 	}
 
@@ -1134,9 +1248,10 @@ gistfinishsplit(GISTInsertState *state, GISTInsertStack *stack,
 	gistinserttuples(state, stack->parent, giststate,
 					 tuples, 2,
 					 stack->downlinkoffnum,
-					 left->buf);
-	LockBuffer(stack->parent->buffer, GIST_UNLOCK);
-	UnlockReleaseBuffer(right->buf);
+					 left->buf, right->buf,
+					 true,		/* Unlock parent */
+					 unlockbuf	/* Unlock stack->buffer if caller wants that */
+		);
 	Assert(left->buf == stack->buffer);
 }
 
@@ -1155,18 +1270,29 @@ gistSplit(Relation r,
 	IndexTuple *lvectup,
 			   *rvectup;
 	GistSplitVector v;
-	GistEntryVector *entryvec;
 	int			i;
 	SplitedPageLayout *res = NULL;
 
-	/* generate the item array */
-	entryvec = palloc(GEVHDRSZ + (len + 1) * sizeof(GISTENTRY));
-	entryvec->n = len + 1;
+	/* this should never recurse very deeply, but better safe than sorry */
+	check_stack_depth();
+
+	/* there's no point in splitting an empty page */
+	Assert(len > 0);
+
+	/*
+	 * If a single tuple doesn't fit on a page, no amount of splitting will
+	 * help.
+	 */
+	if (len == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+			errmsg("index row size %zu exceeds maximum %zu for index \"%s\"",
+				   IndexTupleSize(itup[0]), GiSTPageSize,
+				   RelationGetRelationName(r))));
 
 	memset(v.spl_lisnull, TRUE, sizeof(bool) * giststate->tupdesc->natts);
 	memset(v.spl_risnull, TRUE, sizeof(bool) * giststate->tupdesc->natts);
-	gistSplitByKey(r, page, itup, len, giststate,
-				   &v, entryvec, 0);
+	gistSplitByKey(r, page, itup, len, giststate, &v, 0);
 
 	/* form left and right vector */
 	lvectup = (IndexTuple *) palloc(sizeof(IndexTuple) * (len + 1));
@@ -1244,7 +1370,7 @@ initGISTstate(Relation index)
 	giststate = (GISTSTATE *) palloc(sizeof(GISTSTATE));
 
 	giststate->scanCxt = scanCxt;
-	giststate->tempCxt = scanCxt;	/* caller must change this if needed */
+	giststate->tempCxt = scanCxt;		/* caller must change this if needed */
 	giststate->tupdesc = index->rd_att;
 
 	for (i = 0; i < index->rd_att->natts; i++)
@@ -1278,10 +1404,18 @@ initGISTstate(Relation index)
 		else
 			giststate->distanceFn[i].fn_oid = InvalidOid;
 
+		/* opclasses are not required to provide a Fetch method */
+		if (OidIsValid(index_getprocid(index, i + 1, GIST_FETCH_PROC)))
+			fmgr_info_copy(&(giststate->fetchFn[i]),
+						 index_getprocinfo(index, i + 1, GIST_FETCH_PROC),
+						   scanCxt);
+		else
+			giststate->fetchFn[i].fn_oid = InvalidOid;
+
 		/*
 		 * If the index column has a specified collation, we should honor that
 		 * while doing comparisons.  However, we may have a collatable storage
-		 * type for a noncollatable indexed data type.	If there's no index
+		 * type for a noncollatable indexed data type.  If there's no index
 		 * collation then specify default collation in case the support
 		 * functions need collation.  This is harmless if the support
 		 * functions don't care about collation, so we just do it

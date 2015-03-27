@@ -3,7 +3,7 @@
  * pg_conversion.c
  *	  routines to support manipulation of the pg_conversion relation
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -25,6 +26,7 @@
 #include "catalog/pg_proc.h"
 #include "mb/pg_wchar.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
@@ -35,7 +37,7 @@
  *
  * Add a new tuple to pg_conversion.
  */
-Oid
+ObjectAddress
 ConversionCreate(const char *conname, Oid connamespace,
 				 Oid conowner,
 				 int32 conforencoding, int32 contoencoding,
@@ -48,7 +50,6 @@ ConversionCreate(const char *conname, Oid connamespace,
 	bool		nulls[Natts_pg_conversion];
 	Datum		values[Natts_pg_conversion];
 	NameData	cname;
-	Oid			oid;
 	ObjectAddress myself,
 				referenced;
 
@@ -104,8 +105,7 @@ ConversionCreate(const char *conname, Oid connamespace,
 	tup = heap_form_tuple(tupDesc, values, nulls);
 
 	/* insert a new tuple */
-	oid = simple_heap_insert(rel, tup);
-	Assert(OidIsValid(oid));
+	simple_heap_insert(rel, tup);
 
 	/* update the index if any */
 	CatalogUpdateIndexes(rel, tup);
@@ -134,13 +134,12 @@ ConversionCreate(const char *conname, Oid connamespace,
 	recordDependencyOnCurrentExtension(&myself, false);
 
 	/* Post creation hook for new conversion */
-	InvokeObjectAccessHook(OAT_POST_CREATE,
-						   ConversionRelationId, HeapTupleGetOid(tup), 0);
+	InvokeObjectPostCreateHook(ConversionRelationId, HeapTupleGetOid(tup), 0);
 
 	heap_freetuple(tup);
 	heap_close(rel, RowExclusiveLock);
 
-	return oid;
+	return myself;
 }
 
 /*
@@ -165,8 +164,7 @@ RemoveConversionById(Oid conversionOid)
 	/* open pg_conversion */
 	rel = heap_open(ConversionRelationId, RowExclusiveLock);
 
-	scan = heap_beginscan(rel, SnapshotNow,
-						  1, &scanKeyData);
+	scan = heap_beginscan_catalog(rel, 1, &scanKeyData);
 
 	/* search for the target tuple */
 	if (HeapTupleIsValid(tuple = heap_getnext(scan, ForwardScanDirection)))

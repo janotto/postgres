@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2015, PostgreSQL Global Development Group
  *
  * src/bin/psql/print.h
  */
@@ -19,6 +19,7 @@ enum printFormat
 	PRINT_WRAPPED,
 	PRINT_HTML,
 	PRINT_LATEX,
+	PRINT_LATEX_LONGTABLE,
 	PRINT_TROFF_MS
 	/* add your favourite output format here ... */
 };
@@ -67,6 +68,12 @@ typedef struct printTextFormat
 										 * marks when border=0? */
 } printTextFormat;
 
+typedef enum unicode_linestyle
+{
+	UNICODE_LINESTYLE_SINGLE = 0,
+	UNICODE_LINESTYLE_DOUBLE
+} unicode_linestyle;
+
 struct separator
 {
 	char	   *separator;
@@ -85,16 +92,20 @@ typedef struct printTableOpt
 	bool		tuples_only;	/* don't output headers, row counts, etc. */
 	bool		start_table;	/* print start decoration, eg <table> */
 	bool		stop_table;		/* print stop decoration, eg </table> */
+	bool		default_footer; /* allow "(xx rows)" default footer */
 	unsigned long prior_records;	/* start offset for record counters */
 	const printTextFormat *line_style;	/* line style (NULL for default) */
 	struct separator fieldSep;	/* field separator for unaligned text mode */
-	struct separator recordSep;	/* record separator for unaligned text mode */
+	struct separator recordSep; /* record separator for unaligned text mode */
 	bool		numericLocale;	/* locale-aware numeric units separator and
 								 * decimal marker */
 	char	   *tableAttr;		/* attributes for HTML <table ...> */
 	int			encoding;		/* character encoding */
 	int			env_columns;	/* $COLUMNS on psql start, 0 is unset */
 	int			columns;		/* target width for wrapped format */
+	unicode_linestyle	unicode_border_linestyle;
+	unicode_linestyle	unicode_column_linestyle;
+	unicode_linestyle	unicode_header_linestyle;
 } printTableOpt;
 
 /*
@@ -141,10 +152,10 @@ typedef struct printQueryOpt
 	bool		quote;			/* quote all values as much as possible */
 	char	   *title;			/* override title */
 	char	  **footers;		/* override footer (default is "(xx rows)") */
-	bool		default_footer; /* print default footer if footers==NULL */
 	bool		translate_header;		/* do gettext on column headers */
 	const bool *translate_columns;		/* translate_columns[i-1] => do
 										 * gettext on col i */
+	int			n_translate_columns;	/* length of translate_columns[] */
 } printQueryOpt;
 
 
@@ -162,9 +173,9 @@ extern void printTableInit(printTableContent *const content,
 			   const printTableOpt *opt, const char *title,
 			   const int ncolumns, const int nrows);
 extern void printTableAddHeader(printTableContent *const content,
-				 const char *header, const bool translate, const char align);
+					char *header, const bool translate, const char align);
 extern void printTableAddCell(printTableContent *const content,
-				const char *cell, const bool translate, const bool mustfree);
+				  char *cell, const bool translate, const bool mustfree);
 extern void printTableAddFooter(printTableContent *const content,
 					const char *footer);
 extern void printTableSetFooter(printTableContent *const content,
@@ -176,6 +187,7 @@ extern void printQuery(const PGresult *result, const printQueryOpt *opt,
 
 extern void setDecimalLocale(void);
 extern const printTextFormat *get_line_style(const printTableOpt *opt);
+extern void refresh_utf8format(const printTableOpt *opt);
 
 #ifndef __CYGWIN__
 #define DEFAULT_PAGER "more"

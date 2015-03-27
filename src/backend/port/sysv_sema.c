@@ -4,7 +4,7 @@
  *	  Implement PGSemaphores using SysV semaphore facilities
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -22,9 +22,6 @@
 #endif
 #ifdef HAVE_SYS_SEM_H
 #include <sys/sem.h>
-#endif
-#ifdef HAVE_KERNEL_OS_H
-#include <kernel/OS.h>
 #endif
 
 #include "miscadmin.h"
@@ -94,15 +91,17 @@ InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems)
 
 	if (semId < 0)
 	{
+		int			saved_errno = errno;
+
 		/*
 		 * Fail quietly if error indicates a collision with existing set. One
 		 * would expect EEXIST, given that we said IPC_EXCL, but perhaps we
 		 * could get a permission violation instead?  Also, EIDRM might occur
 		 * if an old set is slated for destruction but not gone yet.
 		 */
-		if (errno == EEXIST || errno == EACCES
+		if (saved_errno == EEXIST || saved_errno == EACCES
 #ifdef EIDRM
-			|| errno == EIDRM
+			|| saved_errno == EIDRM
 #endif
 			)
 			return -1;
@@ -115,7 +114,7 @@ InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems)
 				 errdetail("Failed system call was semget(%lu, %d, 0%o).",
 						   (unsigned long) semKey, numSems,
 						   IPC_CREAT | IPC_EXCL | IPCProtection),
-				 (errno == ENOSPC) ?
+				 (saved_errno == ENOSPC) ?
 				 errhint("This error does *not* mean that you have run out of disk space.  "
 		  "It occurs when either the system limit for the maximum number of "
 			 "semaphore sets (SEMMNI), or the system wide maximum number of "
@@ -139,13 +138,17 @@ IpcSemaphoreInitialize(IpcSemaphoreId semId, int semNum, int value)
 
 	semun.val = value;
 	if (semctl(semId, semNum, SETVAL, semun) < 0)
+	{
+		int			saved_errno = errno;
+
 		ereport(FATAL,
 				(errmsg_internal("semctl(%d, %d, SETVAL, %d) failed: %m",
 								 semId, semNum, value),
-				 (errno == ERANGE) ?
+				 (saved_errno == ERANGE) ?
 				 errhint("You possibly need to raise your kernel's SEMVMX value to be at least "
 				  "%d.  Look into the PostgreSQL documentation for details.",
 						 value) : 0));
+	}
 }
 
 /*
@@ -250,7 +253,7 @@ IpcSemaphoreCreate(int numSems)
 
 		/*
 		 * Can only get here if some other process managed to create the same
-		 * sema key before we did.	Let him have that one, loop around to try
+		 * sema key before we did.  Let him have that one, loop around to try
 		 * next key.
 		 */
 	}
@@ -275,12 +278,12 @@ IpcSemaphoreCreate(int numSems)
  *
  * This is called during postmaster start or shared memory reinitialization.
  * It should do whatever is needed to be able to support up to maxSemas
- * subsequent PGSemaphoreCreate calls.	Also, if any system resources
+ * subsequent PGSemaphoreCreate calls.  Also, if any system resources
  * are acquired here or in PGSemaphoreCreate, register an on_shmem_exit
  * callback to release them.
  *
  * The port number is passed for possible use as a key (for SysV, we use
- * it to generate the starting semaphore key).	In a standalone backend,
+ * it to generate the starting semaphore key).  In a standalone backend,
  * zero will be passed.
  *
  * In the SysV implementation, we acquire semaphore sets on-demand; the
@@ -361,7 +364,7 @@ PGSemaphoreReset(PGSemaphore sema)
  * Lock a semaphore (decrement count), blocking if count would be < 0
  */
 void
-PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
+PGSemaphoreLock(PGSemaphore sema)
 {
 	int			errStatus;
 	struct sembuf sops;
@@ -375,48 +378,13 @@ PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
 	 * from the operation prematurely because we were sent a signal.  So we
 	 * try and lock the semaphore again.
 	 *
-	 * Each time around the loop, we check for a cancel/die interrupt.	On
-	 * some platforms, if such an interrupt comes in while we are waiting, it
-	 * will cause the semop() call to exit with errno == EINTR, allowing us to
-	 * service the interrupt (if not in a critical section already) during the
-	 * next loop iteration.
-	 *
-	 * Once we acquire the lock, we do NOT check for an interrupt before
-	 * returning.  The caller needs to be able to record ownership of the lock
-	 * before any interrupt can be accepted.
-	 *
-	 * There is a window of a few instructions between CHECK_FOR_INTERRUPTS
-	 * and entering the semop() call.  If a cancel/die interrupt occurs in
-	 * that window, we would fail to notice it until after we acquire the lock
-	 * (or get another interrupt to escape the semop()).  We can avoid this
-	 * problem by temporarily setting ImmediateInterruptOK to true before we
-	 * do CHECK_FOR_INTERRUPTS; then, a die() interrupt in this interval will
-	 * execute directly.  However, there is a huge pitfall: there is another
-	 * window of a few instructions after the semop() before we are able to
-	 * reset ImmediateInterruptOK.	If an interrupt occurs then, we'll lose
-	 * control, which means that the lock has been acquired but our caller did
-	 * not get a chance to record the fact. Therefore, we only set
-	 * ImmediateInterruptOK if the caller tells us it's OK to do so, ie, the
-	 * caller does not need to record acquiring the lock.  (This is currently
-	 * true for lockmanager locks, since the process that granted us the lock
-	 * did all the necessary state updates. It's not true for SysV semaphores
-	 * used to implement LW locks or emulate spinlocks --- but the wait time
-	 * for such locks should not be very long, anyway.)
-	 *
-	 * On some platforms, signals marked SA_RESTART (which is most, for us)
-	 * will not interrupt the semop(); it will just keep waiting.  Therefore
-	 * it's necessary for cancel/die interrupts to be serviced directly by the
-	 * signal handler.	On these platforms the behavior is really the same
-	 * whether the signal arrives just before the semop() begins, or while it
-	 * is waiting.	The loop on EINTR is thus important only for other types
-	 * of interrupts.
+	 * We used to check interrupts here, but that required servicing
+	 * interrupts directly from signal handlers. Which is hard to do safely
+	 * and portably.
 	 */
 	do
 	{
-		ImmediateInterruptOK = interruptOK;
-		CHECK_FOR_INTERRUPTS();
 		errStatus = semop(sema->semId, &sops, 1);
-		ImmediateInterruptOK = false;
 	} while (errStatus < 0 && errno == EINTR);
 
 	if (errStatus < 0)

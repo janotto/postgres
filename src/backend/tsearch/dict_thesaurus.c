@@ -3,7 +3,7 @@
  * dict_thesaurus.c
  *		Thesaurus dictionary: phrase to phrase substitution
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -28,7 +28,7 @@
 
 typedef struct LexemeInfo
 {
-	uint16		idsubst;		/* entry's number in DictThesaurus->subst */
+	uint32		idsubst;		/* entry's number in DictThesaurus->subst */
 	uint16		posinsubst;		/* pos info in entry */
 	uint16		tnvariant;		/* total num lexemes in one variant */
 	struct LexemeInfo *nextentry;
@@ -68,7 +68,7 @@ typedef struct
 
 
 static void
-newLexeme(DictThesaurus *d, char *b, char *e, uint16 idsubst, uint16 posinsubst)
+newLexeme(DictThesaurus *d, char *b, char *e, uint32 idsubst, uint16 posinsubst)
 {
 	TheLexeme  *ptr;
 
@@ -102,7 +102,7 @@ newLexeme(DictThesaurus *d, char *b, char *e, uint16 idsubst, uint16 posinsubst)
 }
 
 static void
-addWrd(DictThesaurus *d, char *b, char *e, uint16 idsubst, uint16 nwrd, uint16 posinsubst, bool useasis)
+addWrd(DictThesaurus *d, char *b, char *e, uint32 idsubst, uint16 nwrd, uint16 posinsubst, bool useasis)
 {
 	static int	nres = 0;
 	static int	ntres = 0;
@@ -143,7 +143,6 @@ addWrd(DictThesaurus *d, char *b, char *e, uint16 idsubst, uint16 nwrd, uint16 p
 			ntres *= 2;
 			ptr->res = (TSLexeme *) repalloc(ptr->res, sizeof(TSLexeme) * ntres);
 		}
-
 	}
 
 	ptr->res[nres].lexeme = palloc(e - b + 1);
@@ -168,7 +167,7 @@ static void
 thesaurusRead(char *filename, DictThesaurus *d)
 {
 	tsearch_readline_state trst;
-	uint16		idsubst = 0;
+	uint32		idsubst = 0;
 	bool		useasis = false;
 	char	   *line;
 
@@ -184,8 +183,8 @@ thesaurusRead(char *filename, DictThesaurus *d)
 		char	   *ptr;
 		int			state = TR_WAITLEX;
 		char	   *beginwrd = NULL;
-		uint16		posinsubst = 0;
-		uint16		nwrd = 0;
+		uint32		posinsubst = 0;
+		uint32		nwrd = 0;
 
 		ptr = line;
 
@@ -286,6 +285,16 @@ thesaurusRead(char *filename, DictThesaurus *d)
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("unexpected end of line")));
 
+		/*
+		 * Note: currently, tsearch_readline can't return lines exceeding 4KB,
+		 * so overflow of the word counts is impossible.  But that may not
+		 * always be true, so let's check.
+		 */
+		if (nwrd != (uint16) nwrd || posinsubst != (uint16) posinsubst)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONFIG_FILE_ERROR),
+					 errmsg("too many lexemes in thesaurus entry")));
+
 		pfree(line);
 	}
 
@@ -372,8 +381,8 @@ cmpLexemeQ(const void *a, const void *b)
 static int
 cmpTheLexeme(const void *a, const void *b)
 {
-	const TheLexeme  *la = (const TheLexeme *) a;
-	const TheLexeme  *lb = (const TheLexeme *) b;
+	const TheLexeme *la = (const TheLexeme *) a;
+	const TheLexeme *lb = (const TheLexeme *) b;
 	int			res;
 
 	if ((res = cmpLexeme(la, lb)) != 0)
@@ -670,7 +679,7 @@ findTheLexeme(DictThesaurus *d, char *lexeme)
 }
 
 static bool
-matchIdSubst(LexemeInfo *stored, uint16 idsubst)
+matchIdSubst(LexemeInfo *stored, uint32 idsubst)
 {
 	bool		res = true;
 
@@ -744,8 +753,6 @@ findVariant(LexemeInfo *in, LexemeInfo *stored, uint16 curpos, LexemeInfo **newi
 		for (i = 0; i < newn; i++)
 			newin[i] = newin[i]->nextentry;
 	}
-
-	return NULL;
 }
 
 static TSLexeme *

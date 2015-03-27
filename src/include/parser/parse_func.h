@@ -4,7 +4,7 @@
  *
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/parser/parse_func.h
@@ -18,18 +18,6 @@
 #include "parser/parse_node.h"
 
 
-/*
- *	This structure is used to explore the inheritance hierarchy above
- *	nodes in the type tree in order to disambiguate among polymorphic
- *	functions.
- */
-typedef struct _InhPaths
-{
-	int			nsupers;		/* number of superclasses */
-	Oid			self;			/* this class */
-	Oid		   *supervec;		/* vector of superclasses */
-}	InhPaths;
-
 /* Result codes for func_get_detail */
 typedef enum
 {
@@ -42,19 +30,16 @@ typedef enum
 } FuncDetailCode;
 
 
-extern Node *ParseFuncOrColumn(ParseState *pstate,
-				  List *funcname, List *fargs,
-				  List *agg_order, bool agg_star, bool agg_distinct,
-				  bool func_variadic,
-				  WindowDef *over, bool is_column, int location);
+extern Node *ParseFuncOrColumn(ParseState *pstate, List *funcname, List *fargs,
+				  FuncCall *fn, int location);
 
 extern FuncDetailCode func_get_detail(List *funcname,
 				List *fargs, List *fargnames,
 				int nargs, Oid *argtypes,
 				bool expand_variadic, bool expand_defaults,
 				Oid *funcid, Oid *rettype,
-				bool *retset, int *nvargs, Oid **true_typeids,
-				List **argdefaults);
+				bool *retset, int *nvargs, Oid *vatype,
+				Oid **true_typeids, List **argdefaults);
 
 extern int func_match_argtypes(int nargs,
 					Oid *input_typeids,

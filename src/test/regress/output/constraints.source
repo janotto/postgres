@@ -116,10 +116,10 @@ CREATE SEQUENCE INSERT_SEQ;
 CREATE TABLE INSERT_TBL (x INT DEFAULT nextval('insert_seq'),
 	y TEXT DEFAULT '-NULL-',
 	z INT DEFAULT -1 * currval('insert_seq'),
-	CONSTRAINT INSERT_CON CHECK (x >= 3 AND y <> 'check failed' AND x < 8),
+	CONSTRAINT INSERT_TBL_CON CHECK (x >= 3 AND y <> 'check failed' AND x < 8),
 	CHECK (x + z = 0));
 INSERT INTO INSERT_TBL(x,z) VALUES (2, -2);
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (2, -NULL-, -2).
 SELECT '' AS zero, * FROM INSERT_TBL;
  zero | x | y | z 
@@ -133,7 +133,7 @@ SELECT 'one' AS one, nextval('insert_seq');
 (1 row)
 
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (2, Y, -2).
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
 INSERT INTO INSERT_TBL(x,z) VALUES (1, -2);
@@ -141,7 +141,7 @@ ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_
 DETAIL:  Failing row contains (1, -NULL-, -2).
 INSERT INTO INSERT_TBL(z,x) VALUES (-7,  7);
 INSERT INTO INSERT_TBL VALUES (5, 'check failed', -5);
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (5, check failed, -5).
 INSERT INTO INSERT_TBL VALUES (7, '!check failed', -7);
 INSERT INTO INSERT_TBL(y) VALUES ('-!NULL-');
@@ -158,7 +158,7 @@ INSERT INTO INSERT_TBL(y,z) VALUES ('check failed', 4);
 ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_check"
 DETAIL:  Failing row contains (5, check failed, 4).
 INSERT INTO INSERT_TBL(x,y) VALUES (5, 'check failed');
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (5, check failed, -5).
 INSERT INTO INSERT_TBL(x,y) VALUES (5, '!check failed');
 INSERT INTO INSERT_TBL(y) VALUES ('-!NULL-');
@@ -180,7 +180,7 @@ SELECT 'seven' AS one, nextval('insert_seq');
 (1 row)
 
 INSERT INTO INSERT_TBL(y) VALUES ('Y');
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (8, Y, -8).
 SELECT 'eight' AS one, currval('insert_seq');
   one  | currval 
@@ -188,7 +188,7 @@ SELECT 'eight' AS one, currval('insert_seq');
  eight |       8
 (1 row)
 
--- According to SQL92, it is OK to insert a record that gives rise to NULL
+-- According to SQL, it is OK to insert a record that gives rise to NULL
 -- constraint-condition results.  Postgres used to reject this, but it
 -- was wrong:
 INSERT INTO INSERT_TBL VALUES (null, null, null);
@@ -205,6 +205,30 @@ SELECT '' AS nine, * FROM INSERT_TBL;
 (7 rows)
 
 --
+-- Check constraints on system columns
+--
+CREATE TABLE SYS_COL_CHECK_TBL (city text, state text, is_capital bool,
+                  altitude int,
+                  CHECK (NOT (is_capital AND tableoid::regclass::text = 'sys_col_check_tbl')));
+INSERT INTO SYS_COL_CHECK_TBL VALUES ('Seattle', 'Washington', false, 100);
+INSERT INTO SYS_COL_CHECK_TBL VALUES ('Olympia', 'Washington', true, 100);
+ERROR:  new row for relation "sys_col_check_tbl" violates check constraint "sys_col_check_tbl_check"
+DETAIL:  Failing row contains (Olympia, Washington, t, 100).
+SELECT *, tableoid::regclass::text FROM SYS_COL_CHECK_TBL;
+  city   |   state    | is_capital | altitude |     tableoid      
+---------+------------+------------+----------+-------------------
+ Seattle | Washington | f          |      100 | sys_col_check_tbl
+(1 row)
+
+DROP TABLE SYS_COL_CHECK_TBL;
+--
+-- Check constraints on system columns other then TableOid should return error
+--
+CREATE TABLE SYS_COL_CHECK_TBL (city text, state text, is_capital bool,
+                  altitude int,
+				  CHECK (NOT (is_capital AND ctid::text = 'sys_col_check_tbl')));
+ERROR:  system column "ctid" reference in check constraint is invalid
+--
 -- Check inheritance of defaults and constraints
 --
 CREATE TABLE INSERT_CHILD (cx INT default 42,
@@ -218,7 +242,7 @@ INSERT INTO INSERT_CHILD(x,z,cy) VALUES (6,-7,7);
 ERROR:  new row for relation "insert_child" violates check constraint "insert_tbl_check"
 DETAIL:  Failing row contains (6, -NULL-, -7, 42, 7).
 INSERT INTO INSERT_CHILD(x,y,z,cy) VALUES (6,'check failed',-6,7);
-ERROR:  new row for relation "insert_child" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_child" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (6, check failed, -6, 42, 7).
 SELECT * FROM INSERT_CHILD;
  x |   y    | z  | cx | cy 
@@ -227,6 +251,39 @@ SELECT * FROM INSERT_CHILD;
 (1 row)
 
 DROP TABLE INSERT_CHILD;
+--
+-- Check NO INHERIT type of constraints and inheritance
+--
+CREATE TABLE ATACC1 (TEST INT
+	CHECK (TEST > 0) NO INHERIT);
+CREATE TABLE ATACC2 (TEST2 INT) INHERITS (ATACC1);
+-- check constraint is not there on child
+INSERT INTO ATACC2 (TEST) VALUES (-3);
+-- check constraint is there on parent
+INSERT INTO ATACC1 (TEST) VALUES (-3);
+ERROR:  new row for relation "atacc1" violates check constraint "atacc1_test_check"
+DETAIL:  Failing row contains (-3).
+DROP TABLE ATACC1 CASCADE;
+NOTICE:  drop cascades to table atacc2
+CREATE TABLE ATACC1 (TEST INT, TEST2 INT
+	CHECK (TEST > 0), CHECK (TEST2 > 10) NO INHERIT);
+CREATE TABLE ATACC2 () INHERITS (ATACC1);
+-- check constraint is there on child
+INSERT INTO ATACC2 (TEST) VALUES (-3);
+ERROR:  new row for relation "atacc2" violates check constraint "atacc1_test_check"
+DETAIL:  Failing row contains (-3, null).
+-- check constraint is there on parent
+INSERT INTO ATACC1 (TEST) VALUES (-3);
+ERROR:  new row for relation "atacc1" violates check constraint "atacc1_test_check"
+DETAIL:  Failing row contains (-3, null).
+-- check constraint is not there on child
+INSERT INTO ATACC2 (TEST2) VALUES (3);
+-- check constraint is there on parent
+INSERT INTO ATACC1 (TEST2) VALUES (3);
+ERROR:  new row for relation "atacc1" violates check constraint "atacc1_test2_check"
+DETAIL:  Failing row contains (null, 3).
+DROP TABLE ATACC1 CASCADE;
+NOTICE:  drop cascades to table atacc2
 --
 -- Check constraints on INSERT INTO
 --
@@ -248,7 +305,7 @@ SELECT '' AS three, * FROM INSERT_TBL;
 INSERT INTO INSERT_TBL SELECT * FROM tmp WHERE yd = 'try again';
 INSERT INTO INSERT_TBL(y,z) SELECT yd, -7 FROM tmp WHERE yd = 'try again';
 INSERT INTO INSERT_TBL(y,z) SELECT yd, -8 FROM tmp WHERE yd = 'try again';
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (8, try again, -8).
 SELECT '' AS four, * FROM INSERT_TBL;
  four | x |       y       | z  
@@ -268,7 +325,7 @@ UPDATE INSERT_TBL SET x = NULL WHERE x = 5;
 UPDATE INSERT_TBL SET x = 6 WHERE x = 6;
 UPDATE INSERT_TBL SET x = -z, z = -x;
 UPDATE INSERT_TBL SET x = z, z = x;
-ERROR:  new row for relation "insert_tbl" violates check constraint "insert_con"
+ERROR:  new row for relation "insert_tbl" violates check constraint "insert_tbl_con"
 DETAIL:  Failing row contains (-4, Y, 4).
 SELECT * FROM INSERT_TBL;
  x |       y       | z  
@@ -310,7 +367,6 @@ SELECT * FROM COPY_TBL;
 -- Primary keys
 --
 CREATE TABLE PRIMARY_TBL (i int PRIMARY KEY, t text);
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "primary_tbl_pkey" for table "primary_tbl"
 INSERT INTO PRIMARY_TBL VALUES (1, 'one');
 INSERT INTO PRIMARY_TBL VALUES (2, 'two');
 INSERT INTO PRIMARY_TBL VALUES (1, 'three');
@@ -333,7 +389,6 @@ SELECT '' AS four, * FROM PRIMARY_TBL;
 DROP TABLE PRIMARY_TBL;
 CREATE TABLE PRIMARY_TBL (i int, t text,
 	PRIMARY KEY(i,t));
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "primary_tbl_pkey" for table "primary_tbl"
 INSERT INTO PRIMARY_TBL VALUES (1, 'one');
 INSERT INTO PRIMARY_TBL VALUES (2, 'two');
 INSERT INTO PRIMARY_TBL VALUES (1, 'three');
@@ -357,7 +412,6 @@ DROP TABLE PRIMARY_TBL;
 -- Unique keys
 --
 CREATE TABLE UNIQUE_TBL (i int UNIQUE, t text);
-NOTICE:  CREATE TABLE / UNIQUE will create implicit index "unique_tbl_i_key" for table "unique_tbl"
 INSERT INTO UNIQUE_TBL VALUES (1, 'one');
 INSERT INTO UNIQUE_TBL VALUES (2, 'two');
 INSERT INTO UNIQUE_TBL VALUES (1, 'three');
@@ -381,7 +435,6 @@ SELECT '' AS five, * FROM UNIQUE_TBL;
 DROP TABLE UNIQUE_TBL;
 CREATE TABLE UNIQUE_TBL (i int, t text,
 	UNIQUE(i,t));
-NOTICE:  CREATE TABLE / UNIQUE will create implicit index "unique_tbl_i_t_key" for table "unique_tbl"
 INSERT INTO UNIQUE_TBL VALUES (1, 'one');
 INSERT INTO UNIQUE_TBL VALUES (2, 'two');
 INSERT INTO UNIQUE_TBL VALUES (1, 'three');
@@ -405,7 +458,6 @@ DROP TABLE UNIQUE_TBL;
 -- Deferrable unique constraints
 --
 CREATE TABLE unique_tbl (i int UNIQUE DEFERRABLE, t text);
-NOTICE:  CREATE TABLE / UNIQUE will create implicit index "unique_tbl_i_key" for table "unique_tbl"
 INSERT INTO unique_tbl VALUES (0, 'one');
 INSERT INTO unique_tbl VALUES (1, 'two');
 INSERT INTO unique_tbl VALUES (2, 'tree');
@@ -449,7 +501,6 @@ SELECT * FROM unique_tbl;
 ALTER TABLE unique_tbl DROP CONSTRAINT unique_tbl_i_key;
 ALTER TABLE unique_tbl ADD CONSTRAINT unique_tbl_i_key
 	UNIQUE (i) DEFERRABLE INITIALLY DEFERRED;
-NOTICE:  ALTER TABLE / ADD UNIQUE will create implicit index "unique_tbl_i_key" for table "unique_tbl"
 BEGIN;
 INSERT INTO unique_tbl VALUES (1, 'five');
 INSERT INTO unique_tbl VALUES (5, 'one');
@@ -545,7 +596,6 @@ CREATE TABLE circles (
     (c1 WITH &&, (c2::circle) WITH &&)
     WHERE (circle_center(c1) <> '(0,0)')
 );
-NOTICE:  CREATE TABLE / EXCLUDE will create implicit index "circles_c1_c2_excl" for table "circles"
 -- these should succeed because they don't match the index predicate
 INSERT INTO circles VALUES('<(0,0), 5>', '<(0,0), 5>');
 INSERT INTO circles VALUES('<(0,0), 5>', '<(0,0), 4>');
@@ -562,7 +612,6 @@ INSERT INTO circles VALUES('<(20,20), 10>', '<(10,10), 5>');
 -- should fail on existing data without the WHERE clause
 ALTER TABLE circles ADD EXCLUDE USING gist
   (c1 WITH &&, (c2::circle) WITH &&);
-NOTICE:  ALTER TABLE / ADD EXCLUDE will create implicit index "circles_c1_c2_excl1" for table "circles"
 ERROR:  could not create exclusion constraint "circles_c1_c2_excl1"
 DETAIL:  Key (c1, (c2::circle))=(<(0,0),5>, <(0,0),5>) conflicts with key (c1, (c2::circle))=(<(0,0),5>, <(0,0),4>).
 -- try reindexing an existing constraint
@@ -573,7 +622,6 @@ CREATE TABLE deferred_excl (
   f1 int,
   CONSTRAINT deferred_excl_con EXCLUDE (f1 WITH =) INITIALLY DEFERRED
 );
-NOTICE:  CREATE TABLE / EXCLUDE will create implicit index "deferred_excl_con" for table "deferred_excl"
 INSERT INTO deferred_excl VALUES(1);
 INSERT INTO deferred_excl VALUES(2);
 INSERT INTO deferred_excl VALUES(1); -- fail
@@ -594,7 +642,25 @@ ALTER TABLE deferred_excl DROP CONSTRAINT deferred_excl_con;
 -- This should fail, but worth testing because of HOT updates
 UPDATE deferred_excl SET f1 = 3;
 ALTER TABLE deferred_excl ADD EXCLUDE (f1 WITH =);
-NOTICE:  ALTER TABLE / ADD EXCLUDE will create implicit index "deferred_excl_f1_excl" for table "deferred_excl"
 ERROR:  could not create exclusion constraint "deferred_excl_f1_excl"
 DETAIL:  Key (f1)=(3) conflicts with key (f1)=(3).
 DROP TABLE deferred_excl;
+-- Comments
+CREATE TABLE constraint_comments_tbl (a int CONSTRAINT the_constraint CHECK (a > 0));
+CREATE DOMAIN constraint_comments_dom AS int CONSTRAINT the_constraint CHECK (value > 0);
+COMMENT ON CONSTRAINT the_constraint ON constraint_comments_tbl IS 'yes, the comment';
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN constraint_comments_dom IS 'yes, another comment';
+-- no such constraint
+COMMENT ON CONSTRAINT no_constraint ON constraint_comments_tbl IS 'yes, the comment';
+ERROR:  constraint "no_constraint" for table "constraint_comments_tbl" does not exist
+COMMENT ON CONSTRAINT no_constraint ON DOMAIN constraint_comments_dom IS 'yes, another comment';
+ERROR:  constraint "no_constraint" for domain "constraint_comments_dom" does not exist
+-- no such table/domain
+COMMENT ON CONSTRAINT the_constraint ON no_comments_tbl IS 'bad comment';
+ERROR:  relation "no_comments_tbl" does not exist
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN no_comments_dom IS 'another bad comment';
+ERROR:  type "no_comments_dom" does not exist
+COMMENT ON CONSTRAINT the_constraint ON constraint_comments_tbl IS NULL;
+COMMENT ON CONSTRAINT the_constraint ON DOMAIN constraint_comments_dom IS NULL;
+DROP TABLE constraint_comments_tbl;
+DROP DOMAIN constraint_comments_dom;

@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERLANGUAGE">
+ <indexterm zone="sql-alterlanguage">
+  <primary>ALTER LANGUAGE</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ALTER LANGUAGE</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,14 +19,10 @@ PostgreSQL documentation
   <refpurpose>change the definition of a procedural language</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alterlanguage">
-  <primary>ALTER LANGUAGE</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 ALTER [ PROCEDURAL ] LANGUAGE <replaceable>name</replaceable> RENAME TO <replaceable>new_name</replaceable>
-ALTER [ PROCEDURAL ] LANGUAGE <replaceable>name</replaceable> OWNER TO <replaceable>new_owner</replaceable>
+ALTER [ PROCEDURAL ] LANGUAGE <replaceable>name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
 </synopsis>
  </refsynopsisdiv>
 

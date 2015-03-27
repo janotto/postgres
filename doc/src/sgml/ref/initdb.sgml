@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="APP-INITDB">
+ <indexterm zone="app-initdb">
+  <primary>initdb</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>initdb</refentrytitle>
   <manvolnum>1</manvolnum>
@@ -15,18 +19,16 @@ PostgreSQL documentation
   <refpurpose>create a new <productname>PostgreSQL</productname> database cluster</refpurpose>
  </refnamediv>
 
- <indexterm zone="app-initdb">
-  <primary>initdb</primary>
- </indexterm>
-
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>initdb</command>
    <arg rep="repeat"><replaceable>option</replaceable></arg>
    <group choice="plain">
-    <arg>--pgdata</arg>
-    <arg>-D </arg>
-    <replaceable>directory</replaceable>
+    <group choice="opt">
+     <arg choice="plain"><option>--pgdata</option></arg>
+     <arg choice="plain"><option>-D</option></arg>
+    </group>
+    <replaceable> directory</replaceable>
    </group>
   </cmdsynopsis>
  </refsynopsisdiv>
@@ -180,6 +182,20 @@ PostgreSQL documentation
       </listitem>
      </varlistentry>
 
+     <varlistentry id="app-initdb-data-checksums" xreflabel="data checksums">
+      <term><option>-k</option></term>
+      <term><option>--data-checksums</option></term>
+      <listitem>
+       <para>
+        Use checksums on data pages to help detect corruption by the
+        I/O system that would otherwise be silent. Enabling checksums
+        may incur a noticeable performance penalty. This option can only
+        be set during initialization, and cannot be changed later. If
+        set, checksums are calculated for all objects, in all databases.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry>
       <term><option>--locale=<replaceable>locale</replaceable></option></term>
       <listitem>
@@ -209,6 +225,30 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--no-locale</option></term>
+      <listitem>
+       <para>
+        Equivalent to <option>--locale=C</option>.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-N</option></term>
+      <term><option>--nosync</option></term>
+      <listitem>
+       <para>
+        By default, <command>initdb</command> will wait for all files to be
+        written safely to disk.  This option causes <command>initdb</command>
+        to return without waiting, which is faster, but means that a
+        subsequent operating system crash can leave the data directory
+        corrupt.  Generally, this option is useful for testing, but should not
+        be used when creating a production installation.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--pwfile=<replaceable>filename</></option></term>
       <listitem>
        <para>
@@ -217,6 +257,29 @@ PostgreSQL documentation
        </para>
       </listitem>
      </varlistentry>
+
+     <varlistentry>
+      <term><option>-S</option></term>
+      <term><option>--sync-only</option></term>
+      <listitem>
+       <para>
+        Safely write all database files to disk and exit.  This does not
+        perform any of the normal <application>initdb</> operations.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-T <replaceable>CFG</></option></term>
+      <term><option>--text-search-config=<replaceable>CFG</></option></term>
+      <listitem>
+       <para>
+        Sets the default text search configuration.
+        See <xref linkend="guc-default-text-search-config"> for further information.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry>
       <term><option>-U <replaceable class="parameter">username</replaceable></option></term>
       <term><option>--username=<replaceable class="parameter">username</replaceable></option></term>
@@ -261,7 +324,7 @@ PostgreSQL documentation
    </para>
 
    <para>
-    Other, less commonly used, parameters are also available:
+    Other, less commonly used, options are also available:
 
     <variablelist>
      <varlistentry>
@@ -303,7 +366,13 @@ PostgreSQL documentation
        </para>
       </listitem>
      </varlistentry>
+    </variablelist>
+   </para>
 
+   <para>
+    Other options:
+
+    <variablelist>
      <varlistentry>
        <term><option>-V</></term>
        <term><option>--version</></term>
@@ -341,6 +410,18 @@ PostgreSQL documentation
      <para>
       Specifies the directory where the database cluster is to be
       stored; can be overridden using the <option>-D</option> option.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><envar>TZ</envar></term>
+
+    <listitem>
+     <para>
+      Specifies the default time zone of the created database cluster.  The
+      value should be a full time zone name
+      (see <xref linkend="datatype-timezones">).
      </para>
     </listitem>
    </varlistentry>

@@ -128,6 +128,12 @@ SELECT min(b), max(b) FROM collate_test2;
 SELECT array_agg(b ORDER BY b) FROM collate_test1;
 SELECT array_agg(b ORDER BY b) FROM collate_test2;
 
+-- In aggregates, ORDER BY expressions don't affect aggregate's collation
+SELECT string_agg(x COLLATE "C", y COLLATE "POSIX") FROM collate_test10;  -- fail
+SELECT array_agg(x COLLATE "C" ORDER BY y COLLATE "POSIX") FROM collate_test10;
+SELECT array_agg(a ORDER BY x COLLATE "C", y COLLATE "POSIX") FROM collate_test10;
+SELECT array_agg(a ORDER BY x||y) FROM collate_test10;  -- fail
+
 SELECT a, b FROM collate_test1 UNION ALL SELECT a, b FROM collate_test1 ORDER BY 2;
 SELECT a, b FROM collate_test2 UNION SELECT a, b FROM collate_test2 ORDER BY 2;
 SELECT a, b FROM collate_test2 WHERE a < 4 INTERSECT SELECT a, b FROM collate_test2 WHERE a > 1 ORDER BY 2;
@@ -213,6 +219,15 @@ ALTER TABLE collate_test22 ADD FOREIGN KEY (f2) REFERENCES collate_test20;
 RESET enable_seqscan;
 RESET enable_hashjoin;
 RESET enable_nestloop;
+
+
+-- EXPLAIN
+
+EXPLAIN (COSTS OFF)
+  SELECT * FROM collate_test10 ORDER BY x, y;
+EXPLAIN (COSTS OFF)
+  SELECT * FROM collate_test10 ORDER BY x DESC, y COLLATE "C" ASC NULLS FIRST;
+
 
 -- 9.1 bug with useless COLLATE in an expression subject to length coercion
 

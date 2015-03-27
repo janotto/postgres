@@ -4,7 +4,7 @@
  *	  routines for signaling the postmaster from its child processes
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -26,9 +26,9 @@
 
 /*
  * The postmaster is signaled by its children by sending SIGUSR1.  The
- * specific reason is communicated via flags in shared memory.	We keep
+ * specific reason is communicated via flags in shared memory.  We keep
  * a boolean flag for each possible "reason", so that different reasons
- * can be signaled by different backends at the same time.	(However,
+ * can be signaled by different backends at the same time.  (However,
  * if the same reason is signaled more than once simultaneously, the
  * postmaster will observe it only once.)
  *
@@ -42,7 +42,7 @@
  * have three possible states: UNUSED, ASSIGNED, ACTIVE.  An UNUSED slot is
  * available for assignment.  An ASSIGNED slot is associated with a postmaster
  * child process, but either the process has not touched shared memory yet,
- * or it has successfully cleaned up after itself.	A ACTIVE slot means the
+ * or it has successfully cleaned up after itself.  A ACTIVE slot means the
  * process is actively using shared memory.  The slots are assigned to
  * child processes at random, and postmaster.c is responsible for tracking
  * which one goes with which PID.
@@ -66,7 +66,7 @@ struct PMSignalData
 	/* per-child-process flags */
 	int			num_child_flags;	/* # of entries in PMChildFlags[] */
 	int			next_child_flag;	/* next slot to try to assign */
-	sig_atomic_t PMChildFlags[1];		/* VARIABLE LENGTH ARRAY */
+	sig_atomic_t PMChildFlags[FLEXIBLE_ARRAY_MEMBER];
 };
 
 NON_EXEC_STATIC volatile PMSignalData *PMSignalState = NULL;
@@ -272,8 +272,8 @@ bool
 PostmasterIsAlive(void)
 {
 #ifndef WIN32
-	char c;
-	ssize_t rc;
+	char		c;
+	ssize_t		rc;
 
 	rc = read(postmaster_alive_fds[POSTMASTER_FD_WATCH], &c, 1);
 	if (rc < 0)
@@ -287,7 +287,6 @@ PostmasterIsAlive(void)
 		elog(FATAL, "unexpected data in postmaster death monitoring pipe");
 
 	return false;
-
 #else							/* WIN32 */
 	return (WaitForSingleObject(PostmasterHandle, 0) == WAIT_TIMEOUT);
 #endif   /* WIN32 */

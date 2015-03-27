@@ -1,459 +1,546 @@
 # Swedish message translation file for resetxlog.
-# Dennis Bjˆrklund <db@zigo.dhs.org>, 2002, 2003, 2004, 2005, 2006.
+# Dennis Bj√∂rklund <db@zigo.dhs.org>, 2002, 2003, 2004, 2005, 2006.
 # Peter Eisentraut <peter_e@gmx.net>, 2010.
+# Mats Erik Andersson <bsd@gisladisker.se>, 2014.
 #
 msgid ""
 msgstr ""
-"Project-Id-Version: PostgreSQL 9.0\n"
+"Project-Id-Version: PostgreSQL 9.4\n"
 "Report-Msgid-Bugs-To: pgsql-bugs@postgresql.org\n"
-"POT-Creation-Date: 2010-07-02 05:22+0000\n"
-"PO-Revision-Date: 2010-07-02 20:32-0400\n"
-"Last-Translator: Peter Eisentraut <peter_e@gmx.net>\n"
+"POT-Creation-Date: 2014-11-25 16:12+0000\n"
+"PO-Revision-Date: 2014-11-29 18:32+0100\n"
+"Last-Translator: Mats Erik Andersson <bsd@gisladisker.se>\n"
 "Language-Team: Swedish <sv@li.org>\n"
+"Language: sv\n"
 "MIME-Version: 1.0\n"
-"Content-Type: text/plain; charset=ISO-8859-1\n"
+"Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 
-#: pg_resetxlog.c:135
+#: pg_resetxlog.c:130
 #, c-format
 msgid "%s: invalid argument for option -e\n"
-msgstr "%s: felaktigt argument till flagga -e\n"
+msgstr "%s: Ogiltigt argument f√∂r v√§xel -e.\n"
 
-#: pg_resetxlog.c:136 pg_resetxlog.c:151 pg_resetxlog.c:166 pg_resetxlog.c:181
-#: pg_resetxlog.c:196 pg_resetxlog.c:211 pg_resetxlog.c:218 pg_resetxlog.c:225
-#: pg_resetxlog.c:231 pg_resetxlog.c:239
+#: pg_resetxlog.c:131 pg_resetxlog.c:146 pg_resetxlog.c:161 pg_resetxlog.c:176
+#: pg_resetxlog.c:184 pg_resetxlog.c:210 pg_resetxlog.c:224 pg_resetxlog.c:231
+#: pg_resetxlog.c:239
 #, c-format
 msgid "Try \"%s --help\" for more information.\n"
-msgstr "Fˆrsˆk med \"%s --help\" fˆr mer information.\n"
+msgstr "F√∂rs√∂k med \"%s --help\" f√∂r mer information.\n"
 
-#: pg_resetxlog.c:141
+#: pg_resetxlog.c:136
 #, c-format
 msgid "%s: transaction ID epoch (-e) must not be -1\n"
-msgstr "%s: transaktions-ID epoch (-e) fÂr inte vara -1\n"
+msgstr "%s: Epok (-e) f√∂r transaktions-ID f√•r inte vara -1.\n"
 
-#: pg_resetxlog.c:150
+#: pg_resetxlog.c:145
 #, c-format
 msgid "%s: invalid argument for option -x\n"
-msgstr "%s: ogiltigt argument till flaggan -x\n"
+msgstr "%s: Ogiltigt argument f√∂r v√§xel -x.\n"
 
-#: pg_resetxlog.c:156
+#: pg_resetxlog.c:151
 #, c-format
 msgid "%s: transaction ID (-x) must not be 0\n"
-msgstr "%s: transaktions-ID (-x) fÂr inte vara 0\n"
+msgstr "%s: Transaktions-ID (-x) f√•r inte vara 0.\n"
 
-#: pg_resetxlog.c:165
+#: pg_resetxlog.c:160
 #, c-format
 msgid "%s: invalid argument for option -o\n"
-msgstr "%s: ogiltigt argument till flaggan -o\n"
+msgstr "%s: Ogiltigt argument f√∂r v√§xel -o.\n"
 
-#: pg_resetxlog.c:171
+#: pg_resetxlog.c:166
 #, c-format
 msgid "%s: OID (-o) must not be 0\n"
-msgstr "%s: OID (-o) fÂr inte vara 0\n"
+msgstr "%s: OID (-o) f√•r inte vara 0.\n"
 
-#: pg_resetxlog.c:180
+#: pg_resetxlog.c:175 pg_resetxlog.c:183
 #, c-format
 msgid "%s: invalid argument for option -m\n"
-msgstr "%s: ogiltigt argument till flaggan -m\n"
+msgstr "%s: Ogiltigt argument f√∂r v√§xel -m.\n"
 
-#: pg_resetxlog.c:186
+#: pg_resetxlog.c:189
 #, c-format
 msgid "%s: multitransaction ID (-m) must not be 0\n"
-msgstr "%s: multitransaktions-ID (-m) fÂr inte vara 0\n"
+msgstr "%s: Multitransaktions-ID (-m) f√•r inte vara 0.\n"
 
-#: pg_resetxlog.c:195
+#: pg_resetxlog.c:199
+#, c-format
+msgid "%s: oldest multitransaction ID (-m) must not be 0\n"
+msgstr "%s: √Ñldsta multitransaktions-ID (-m) f√•r inte vara 0.\n"
+
+#: pg_resetxlog.c:209
 #, c-format
 msgid "%s: invalid argument for option -O\n"
-msgstr "%s: ogiltigt argument till flaggan -O\n"
+msgstr "%s: Ogiltigt argument f√∂r v√§xel -O.\n"
 
-#: pg_resetxlog.c:201
+#: pg_resetxlog.c:215
 #, c-format
 msgid "%s: multitransaction offset (-O) must not be -1\n"
-msgstr "%s: multitransaktionsoffset (-O) fÂr inte vara -1\n"
+msgstr "%s: Multitransaktionsoffset (-O) f√•r inte vara -1.\n"
 
-#: pg_resetxlog.c:210 pg_resetxlog.c:217 pg_resetxlog.c:224
+#: pg_resetxlog.c:223
 #, c-format
 msgid "%s: invalid argument for option -l\n"
-msgstr "%s: ogiltigt argument till flaggan -l\n"
+msgstr "%s: Ogiltigt argument f√∂r v√§xel -l.\n"
 
 #: pg_resetxlog.c:238
 #, c-format
 msgid "%s: no data directory specified\n"
-msgstr "%s: ingen datakatalog angiven\n"
+msgstr "%s: Ingen datakatalog angiven.\n"
 
 #: pg_resetxlog.c:252
 #, c-format
 msgid "%s: cannot be executed by \"root\"\n"
-msgstr "%s: kan inte exekveras av \"root\"\n"
+msgstr "%s: F√•r inte utf√∂ras av \"root\".\n"
 
 #: pg_resetxlog.c:254
 #, c-format
 msgid "You must run %s as the PostgreSQL superuser.\n"
-msgstr "Du mÂste kˆra %s som PostgreSQLs superanv‰ndare.\n"
+msgstr "Du m√•ste k√∂ra %s som PostgreSQL:s superanv√§ndare.\n"
 
 #: pg_resetxlog.c:264
 #, c-format
 msgid "%s: could not change directory to \"%s\": %s\n"
-msgstr "%s: kunde byta katalog till \"%s\": %s\n"
+msgstr "%s: Kunde inte g√• till katalog \"%s\": %s\n"
 
-#: pg_resetxlog.c:279 pg_resetxlog.c:407
+#: pg_resetxlog.c:277 pg_resetxlog.c:418
 #, c-format
 msgid "%s: could not open file \"%s\" for reading: %s\n"
-msgstr "%s: kunde inte ˆppna fil \"%s\" fˆr l‰sning: %s\n"
+msgstr "%s: Kunde inte √∂ppna filen \"%s\" f√∂r l√§sning: %s\n"
 
-#: pg_resetxlog.c:285
+#: pg_resetxlog.c:284
 #, c-format
 msgid ""
 "%s: lock file \"%s\" exists\n"
 "Is a server running?  If not, delete the lock file and try again.\n"
 msgstr ""
-"%s: lÂsfil \"%s\" existerar\n"
-"Kˆr servern redan? Om inte, radera lÂsfilen och fˆrsˆk igen.\n"
+"%s: En l√•sfil \"%s\" finns p√• plats.\n"
+"K√∂r servern redan? Om inte, radera l√•sfilen och f√∂rs√∂k igen.\n"
 
-#: pg_resetxlog.c:355
+#: pg_resetxlog.c:366
 #, c-format
 msgid ""
 "\n"
 "If these values seem acceptable, use -f to force reset.\n"
 msgstr ""
 "\n"
-"Om dessa v‰rden verkar acceptable, anv‰nd -f fˆr\n"
-"att forcera Âterst‰llande.\n"
+"Om dessa v√§rden verkar godtagbara, anv√§nd d√• -f f√∂r att\n"
+"framtvinga √•terst√§llning.\n"
 
-#: pg_resetxlog.c:367
+#: pg_resetxlog.c:378
 #, c-format
 msgid ""
 "The database server was not shut down cleanly.\n"
 "Resetting the transaction log might cause data to be lost.\n"
 "If you want to proceed anyway, use -f to force reset.\n"
 msgstr ""
-"Databasservern st‰ngdes inte ner korrekt. Att Âterst‰lla\n"
-"transaktionsloggen kan medfˆra att data fˆrloras.\n"
-"Om du vill forts‰tta ‰ndÂ, anv‰nd -f fˆr att forcera\n"
-"Âterst‰llande.\n"
+"Databasservern st√§ngdes inte av ordentligt. Att √•terst√§lla\n"
+"transaktionsloggen kan medf√∂ra att data f√∂rloras. Om du √§nd√•\n"
+"vill forts√§tta, anv√§nd -f f√∂r att framtvinga √•terst√§llning.\n"
 
-#: pg_resetxlog.c:381
+#: pg_resetxlog.c:392
 #, c-format
 msgid "Transaction log reset\n"
-msgstr "≈terst‰llande frÂn transaktionslogg\n"
+msgstr "√Öterst√§llning av transaktionslogg.\n"
 
-#: pg_resetxlog.c:410
+#: pg_resetxlog.c:421
 #, c-format
 msgid ""
 "If you are sure the data directory path is correct, execute\n"
 "  touch %s\n"
 "and try again.\n"
 msgstr ""
-"Om du ‰r s‰ker pÂ att datakatalogsˆkv‰gen ‰r korrekt sÂ gˆr\n"
-"  touch %s\n"
-"och fˆrsˆk igen.\n"
+"Om du √§r s√§ker p√• att s√∂kv√§gen till datakatalogen √§r riktig,\n"
+"utf√∂r d√• \"touch %s\" och f√∂rs√∂k sedan igen.\n"
 
-#: pg_resetxlog.c:423
+#: pg_resetxlog.c:434
 #, c-format
 msgid "%s: could not read file \"%s\": %s\n"
-msgstr "%s: kunde inte l‰sa fil \"%s\": %s\n"
+msgstr "%s: Kunde inte l√§sa fil \"%s\": %s\n"
 
-#: pg_resetxlog.c:446
+#: pg_resetxlog.c:457
 #, c-format
 msgid "%s: pg_control exists but has invalid CRC; proceed with caution\n"
-msgstr ""
-"%s: pg_control existerar men har ogiltig CRC; forts‰tt med fˆrsiktighet\n"
+msgstr "%s: pg_control existerar men har ogiltig CRC. Forts√§tt med varsamhet.\n"
 
-#: pg_resetxlog.c:455
+#: pg_resetxlog.c:466
 #, c-format
 msgid "%s: pg_control exists but is broken or unknown version; ignoring it\n"
-msgstr ""
-"%s: pg_control existerar men ‰r trasig eller har ok‰nd version; ignorerar "
-"den\n"
+msgstr "%s: pg_control existerar men √§r trasig eller har ok√§nd version. Den ignoreras.\n"
 
-#: pg_resetxlog.c:549
+#: pg_resetxlog.c:568
 #, c-format
 msgid ""
 "Guessed pg_control values:\n"
 "\n"
 msgstr ""
-"Gissade pg_control-v‰rden:\n"
+"Gissade v√§rden f√∂r pg_control:\n"
 "\n"
-
-#: pg_resetxlog.c:551
-#, c-format
-msgid ""
-"pg_control values:\n"
-"\n"
-msgstr ""
-"pg_control-v‰rden:\n"
-"\n"
-
-#: pg_resetxlog.c:560
-#, c-format
-msgid "First log file ID after reset:        %u\n"
-msgstr "Fˆrsta loggfil efter nollst‰llning:   %u\n"
-
-#: pg_resetxlog.c:562
-#, c-format
-msgid "First log file segment after reset:   %u\n"
-msgstr "Fˆrsta loggfilsegment efter nollst.:  %u\n"
-
-#: pg_resetxlog.c:564
-#, c-format
-msgid "pg_control version number:            %u\n"
-msgstr "pg_control versionsnummer:            %u\n"
-
-#: pg_resetxlog.c:566
-#, c-format
-msgid "Catalog version number:               %u\n"
-msgstr "Katalogversionsnummer:                %u\n"
-
-#: pg_resetxlog.c:568
-#, c-format
-msgid "Database system identifier:           %s\n"
-msgstr "Databasens systemidentifierare:       %s\n"
 
 #: pg_resetxlog.c:570
 #, c-format
-msgid "Latest checkpoint's TimeLineID:       %u\n"
-msgstr "Senaste kontrollpunktens TimeLineID:  %u\n"
+msgid ""
+"Current pg_control values:\n"
+"\n"
+msgstr ""
+"Nuvarande v√§rden f√∂r pg_control:\n"
+"\n"
 
-#: pg_resetxlog.c:572
-#, c-format
-msgid "Latest checkpoint's NextXID:          %u/%u\n"
-msgstr "Senaste kontrollpunktens NextXID:     %u/%u\n"
-
-#: pg_resetxlog.c:575
-#, c-format
-msgid "Latest checkpoint's NextOID:          %u\n"
-msgstr "Senaste kontrollpunktens NextOID:     %u\n"
-
-# FIXME: too wide
-#: pg_resetxlog.c:577
-#, c-format
-msgid "Latest checkpoint's NextMultiXactId:  %u\n"
-msgstr "Senaste kontrollpunktens NextMultiXactId: %u\n"
-
+# November 26th, 2014: Insert six additional space characters
+# for best alignment with Swedish translation.
+# Translations should be checked against those of pg_controldata.
 #: pg_resetxlog.c:579
 #, c-format
-msgid "Latest checkpoint's NextMultiOffset:  %u\n"
-msgstr "Senaste kontrollpunktens NextMultiOffset: %u\n"
+msgid "pg_control version number:            %u\n"
+msgstr "Versionsnummer f√∂r pg_control:              %u\n"
 
 #: pg_resetxlog.c:581
 #, c-format
-msgid "Latest checkpoint's oldestXID:        %u\n"
-msgstr "Senaste kontrollpunktens oldestXID:   %u\n"
+msgid "Catalog version number:               %u\n"
+msgstr "Katalogversion:                             %u\n"
 
-# FIXME: too wide
 #: pg_resetxlog.c:583
 #, c-format
-msgid "Latest checkpoint's oldestXID's DB:   %u\n"
-msgstr "Senaste kontrollpunktens oldestXID:s DB: %u\n"
+msgid "Database system identifier:           %s\n"
+msgstr "Databasens systemidentifierare:             %s\n"
 
-# FIXME: too wide
 #: pg_resetxlog.c:585
 #, c-format
-msgid "Latest checkpoint's oldestActiveXID:  %u\n"
-msgstr "Senaste kontrollpunktens oldestActiveXID: %u\n"
+msgid "Latest checkpoint's TimeLineID:       %u\n"
+msgstr "TimeLineID vid senaste kontrollpunkt:       %u\n"
 
 #: pg_resetxlog.c:587
 #, c-format
-msgid "Maximum data alignment:               %u\n"
-msgstr "Maximal data-alignment:               %u\n"
+msgid "Latest checkpoint's full_page_writes: %s\n"
+msgstr "Senaste kontrollpunktens full_page_writes:  %s\n"
 
-#: pg_resetxlog.c:590
+#: pg_resetxlog.c:588
+msgid "off"
+msgstr "av"
+
+#: pg_resetxlog.c:588
+msgid "on"
+msgstr "p√•"
+
+#: pg_resetxlog.c:589
 #, c-format
-msgid "Database block size:                  %u\n"
-msgstr "Databasens blockstorlek:              %u\n"
+msgid "Latest checkpoint's NextXID:          %u/%u\n"
+msgstr "NextXID vid senaste kontrollpunkt:          %u/%u\n"
 
 #: pg_resetxlog.c:592
 #, c-format
-msgid "Blocks per segment of large relation: %u\n"
-msgstr "Block per segment i stor relation:    %u\n"
+msgid "Latest checkpoint's NextOID:          %u\n"
+msgstr "NextOID vid senaste kontrollpunkt:          %u\n"
 
 #: pg_resetxlog.c:594
 #, c-format
-msgid "WAL block size:                       %u\n"
-msgstr "WAL-blockstorlek:                     %u\n"
+msgid "Latest checkpoint's NextMultiXactId:  %u\n"
+msgstr "NextMultiXactId vid senaste kontrollpunkt:  %u\n"
 
 #: pg_resetxlog.c:596
 #, c-format
-msgid "Bytes per WAL segment:                %u\n"
-msgstr "Bytes per WAL-segment:                %u\n"
+msgid "Latest checkpoint's NextMultiOffset:  %u\n"
+msgstr "NextMultiOffset vid senaste kontrollpunkt:  %u\n"
 
 #: pg_resetxlog.c:598
 #, c-format
-msgid "Maximum length of identifiers:        %u\n"
-msgstr "Maximal l‰ngd pÂ identifierare:       %u\n"
+msgid "Latest checkpoint's oldestXID:        %u\n"
+msgstr "oldestXID vid senaste kontrollpunkt:        %u\n"
 
 #: pg_resetxlog.c:600
 #, c-format
-msgid "Maximum columns in an index:          %u\n"
-msgstr "Maximalt antal kolumner i index:      %u\n"
+msgid "Latest checkpoint's oldestXID's DB:   %u\n"
+msgstr "DB f√∂r oldestXID vid senaste kontrollpunkt: %u\n"
 
+# FIXME: too wide
 #: pg_resetxlog.c:602
 #, c-format
-msgid "Maximum size of a TOAST chunk:        %u\n"
-msgstr "Maximal storlek pÂ TOAST-bit:         %u\n"
+msgid "Latest checkpoint's oldestActiveXID:  %u\n"
+msgstr "oldestActiveXID vid senaste kontrollpunkt:  %u\n"
 
 #: pg_resetxlog.c:604
 #, c-format
-msgid "Date/time type storage:               %s\n"
-msgstr "Lagringstyp fˆr datum/tid:            %s\n"
-
-#: pg_resetxlog.c:605
-msgid "64-bit integers"
-msgstr "64-bits heltal"
-
-#: pg_resetxlog.c:605
-msgid "floating-point numbers"
-msgstr "flyttalsnummer"
+msgid "Latest checkpoint's oldestMultiXid:   %u\n"
+msgstr "oldestMultiXid vid senaste kontrollpunkt:   %u\n"
 
 #: pg_resetxlog.c:606
-#, fuzzy, c-format
-msgid "Float4 argument passing:              %s\n"
-msgstr "Maximal data-alignment:               %u\n"
-
-#: pg_resetxlog.c:607 pg_resetxlog.c:609
-msgid "by value"
-msgstr ""
-
-#: pg_resetxlog.c:607 pg_resetxlog.c:609
-msgid "by reference"
-msgstr ""
+#, c-format
+msgid "Latest checkpoint's oldestMulti's DB: %u\n"
+msgstr "DB f√∂r oldestMulti vid senaste kontrollpkt: %u\n"
 
 #: pg_resetxlog.c:608
-#, fuzzy, c-format
-msgid "Float8 argument passing:              %s\n"
-msgstr "Maximal data-alignment:               %u\n"
+#, c-format
+msgid "Maximum data alignment:               %u\n"
+msgstr "Maximal j√§mkning av data (alignment):       %u\n"
 
-#: pg_resetxlog.c:671
+#: pg_resetxlog.c:611
+#, c-format
+msgid "Database block size:                  %u\n"
+msgstr "Databasens blockstorlek:                    %u\n"
+
+#: pg_resetxlog.c:613
+#, c-format
+msgid "Blocks per segment of large relation: %u\n"
+msgstr "Block per segment i en stor relation:       %u\n"
+
+#: pg_resetxlog.c:615
+#, c-format
+msgid "WAL block size:                       %u\n"
+msgstr "Blockstorlek i transaktionsloggen:          %u\n"
+
+#: pg_resetxlog.c:617
+#, c-format
+msgid "Bytes per WAL segment:                %u\n"
+msgstr "Segmentstorlek i transaktionsloggen:        %u\n"
+
+#: pg_resetxlog.c:619
+#, c-format
+msgid "Maximum length of identifiers:        %u\n"
+msgstr "Maximal l√§ngd f√∂r identifierare:            %u\n"
+
+#: pg_resetxlog.c:621
+#, c-format
+msgid "Maximum columns in an index:          %u\n"
+msgstr "Maximalt antal kolonner i ett index:        %u\n"
+
+#: pg_resetxlog.c:623
+#, c-format
+msgid "Maximum size of a TOAST chunk:        %u\n"
+msgstr "Maximal storlek f√∂r en TOAST-enhet:         %u\n"
+
+#: pg_resetxlog.c:625
+#, c-format
+msgid "Size of a large-object chunk:         %u\n"
+msgstr "Storlek f√∂r large-object-enheter:           %u\n"
+
+#: pg_resetxlog.c:627
+#, c-format
+msgid "Date/time type storage:               %s\n"
+msgstr "Representation av dag och tid:              %s\n"
+
+#: pg_resetxlog.c:628
+msgid "64-bit integers"
+msgstr "64-bitars heltal"
+
+#: pg_resetxlog.c:628
+msgid "floating-point numbers"
+msgstr "flyttal"
+
+#: pg_resetxlog.c:629
+#, c-format
+msgid "Float4 argument passing:              %s\n"
+msgstr "√Ötkomst till float4-argument:               %s\n"
+
+#: pg_resetxlog.c:630 pg_resetxlog.c:632
+msgid "by reference"
+msgstr "referens"
+
+#: pg_resetxlog.c:630 pg_resetxlog.c:632
+msgid "by value"
+msgstr "v√§rde√•tkomst"
+
+#: pg_resetxlog.c:631
+#, c-format
+msgid "Float8 argument passing:              %s\n"
+msgstr "√Ötkomst till float8-argument:               %s\n"
+
+#: pg_resetxlog.c:633
+#, c-format
+msgid "Data page checksum version:           %u\n"
+msgstr "Checksummaversion f√∂r datasidor:            %u\n"
+
+#: pg_resetxlog.c:647
 #, c-format
 msgid ""
-"%s: internal error -- sizeof(ControlFileData) is too large ... fix "
-"PG_CONTROL_SIZE\n"
+"\n"
+"\n"
+"Values to be changed:\n"
+"\n"
 msgstr ""
-"%s: internt fel -- sizeof(ControlFileData) ‰r fˆr stor ... r‰tt till "
-"PG_CONTROL_SIZE\n"
+"\n"
+"\n"
+"V√§rden att f√∂r√§ndra:\n"
+"\n"
+
+# November 26th, 2014: Insert additional spacing to fit
+# with the first translated text, which uses most characters.
+#: pg_resetxlog.c:650
+#, c-format
+msgid "First log segment after reset:        %s\n"
+msgstr "F√∂rsta loggsegment efter √•terst√§llning: %s\n"
+
+#: pg_resetxlog.c:654
+#, c-format
+msgid "NextMultiXactId:                      %u\n"
+msgstr "NextMultiXactId:                        %u\n"
+
+#: pg_resetxlog.c:656
+#, c-format
+msgid "OldestMultiXid:                       %u\n"
+msgstr "OldestMultiXid:                         %u\n"
+
+#: pg_resetxlog.c:658
+#, c-format
+msgid "OldestMulti's DB:                     %u\n"
+msgstr "DB f√∂r OldestMulti:                     %u\n"
+
+#: pg_resetxlog.c:664
+#, c-format
+msgid "NextMultiOffset:                      %u\n"
+msgstr "NextMultiOffset:                        %u\n"
+
+#: pg_resetxlog.c:670
+#, c-format
+msgid "NextOID:                              %u\n"
+msgstr "NextOID:                                %u\n"
+
+#: pg_resetxlog.c:676
+#, c-format
+msgid "NextXID:                              %u\n"
+msgstr "NextXID:                                %u\n"
+
+#: pg_resetxlog.c:678
+#, c-format
+msgid "OldestXID:                            %u\n"
+msgstr "OldestXID:                              %u\n"
+
+#: pg_resetxlog.c:680
+#, c-format
+msgid "OldestXID's DB:                       %u\n"
+msgstr "DB f√∂r OldestXID:                       %u\n"
 
 #: pg_resetxlog.c:686
 #, c-format
-msgid "%s: could not create pg_control file: %s\n"
-msgstr "%s: kunde inte skapa pg_control-fil: %s\n"
+msgid "NextXID epoch:                        %u\n"
+msgstr "Epok f√∂r NextXID:                       %u\n"
 
-#: pg_resetxlog.c:697
+
+#: pg_resetxlog.c:751
+#, c-format
+msgid "%s: internal error -- sizeof(ControlFileData) is too large ... fix PG_CONTROL_SIZE\n"
+msgstr "%s: Internt fel: sizeof(ControlFileData) √§r alltf√∂r stor. R√§tta till PG_CONTROL_SIZE.\n"
+
+#: pg_resetxlog.c:766
+#, c-format
+msgid "%s: could not create pg_control file: %s\n"
+msgstr "%s: Kunde inte skapa fil f√∂r pg_control: %s\n"
+
+#: pg_resetxlog.c:777
 #, c-format
 msgid "%s: could not write pg_control file: %s\n"
-msgstr "%s: kunde inte skriva pg_control-fil: %s\n"
+msgstr "%s: Kunde inte skriva fil f√∂r pg_control: %s\n"
 
-#: pg_resetxlog.c:704 pg_resetxlog.c:1011
+#: pg_resetxlog.c:784 pg_resetxlog.c:1068
 #, c-format
 msgid "%s: fsync error: %s\n"
-msgstr "%s: fsync fel: %s\n"
+msgstr "%s: Misslyckad fsync: %s\n"
 
-#: pg_resetxlog.c:742 pg_resetxlog.c:817 pg_resetxlog.c:873
+#: pg_resetxlog.c:824 pg_resetxlog.c:890 pg_resetxlog.c:941
 #, c-format
 msgid "%s: could not open directory \"%s\": %s\n"
-msgstr "%s: kunde inte ˆppna katalog \"%s\": %s\n"
+msgstr "%s: Kunde inte √∂ppna filkatalog \"%s\": %s\n"
 
-#: pg_resetxlog.c:786 pg_resetxlog.c:850 pg_resetxlog.c:907
+#: pg_resetxlog.c:855 pg_resetxlog.c:912 pg_resetxlog.c:964
 #, c-format
-msgid "%s: could not read from directory \"%s\": %s\n"
-msgstr "%s: kunde inte l‰sa frÂn katalog \"%s\": %s\n"
+msgid "%s: could not read directory \"%s\": %s\n"
+msgstr "%s: Kunde inte l√§sa filkatalog \"%s\": %s\n"
 
-#: pg_resetxlog.c:831 pg_resetxlog.c:888
+#: pg_resetxlog.c:862 pg_resetxlog.c:919 pg_resetxlog.c:971
+#, c-format
+msgid "%s: could not close directory \"%s\": %s\n"
+msgstr "%s: Kunde inte st√§nga filkatalog \"%s\": %s\n"
+
+#: pg_resetxlog.c:903 pg_resetxlog.c:955
 #, c-format
 msgid "%s: could not delete file \"%s\": %s\n"
-msgstr "%s: kunde inte radera filen \"%s\": %s\n"
+msgstr "%s: Kunde inte radera fil \"%s\": %s\n"
 
-#: pg_resetxlog.c:978
+#: pg_resetxlog.c:1035
 #, c-format
 msgid "%s: could not open file \"%s\": %s\n"
-msgstr "%s: kunde inte ˆppna fil \"%s\": %s\n"
+msgstr "%s: Kunde inte √∂ppna fil \"%s\": %s\n"
 
-#: pg_resetxlog.c:989 pg_resetxlog.c:1003
+#: pg_resetxlog.c:1046 pg_resetxlog.c:1060
 #, c-format
 msgid "%s: could not write file \"%s\": %s\n"
-msgstr "%s: kunde inte skriva fil \"%s\": %s\n"
+msgstr "%s: Kunde inte skriva fil \"%s\": %s\n"
 
-#: pg_resetxlog.c:1022
+#: pg_resetxlog.c:1079
 #, c-format
 msgid ""
 "%s resets the PostgreSQL transaction log.\n"
 "\n"
 msgstr ""
-"%s Âterst‰ller PostgreSQL transaktionslogg.\n"
+"%s √•terst√§ller transaktionslogg f√∂r PostgreSQL.\n"
 "\n"
 
-#: pg_resetxlog.c:1023
+#: pg_resetxlog.c:1080
 #, c-format
 msgid ""
 "Usage:\n"
 "  %s [OPTION]... DATADIR\n"
 "\n"
 msgstr ""
-"Anv‰ndning:\n"
+"Anv√§ndning:\n"
 "  %s [FLAGGA]... DATAKATALOG\n"
 "\n"
 
-#: pg_resetxlog.c:1024
+#: pg_resetxlog.c:1081
 #, c-format
 msgid "Options:\n"
-msgstr "Flaggor:\n"
+msgstr "Programv√§xlar:\n"
 
-#: pg_resetxlog.c:1025
+#: pg_resetxlog.c:1082
 #, c-format
-msgid "  -e XIDEPOCH     set next transaction ID epoch\n"
-msgstr "  -x XIDEPOCH     s‰tt n‰sta transaktions-ID-epoch\n"
+msgid "  -e XIDEPOCH      set next transaction ID epoch\n"
+msgstr "  -e XIDEPOCH      s√§tter epok f√∂r n√§sta transaktions-ID\n"
 
-#: pg_resetxlog.c:1026
+#: pg_resetxlog.c:1083
 #, c-format
-msgid "  -f              force update to be done\n"
-msgstr "  -f              forcera Âterst‰llande\n"
+msgid "  -f               force update to be done\n"
+msgstr "  -f               framtvinga √•terst√§llning\n"
 
-#: pg_resetxlog.c:1027
+#: pg_resetxlog.c:1084
 #, c-format
-msgid ""
-"  -l TLI,FILE,SEG force minimum WAL starting location for new transaction "
-"log\n"
-msgstr ""
-"  -l TLI,FILID,SEG    ange minsta WAL-startposition fˆr ny transaktion\n"
+msgid "  -l XLOGFILE      force minimum WAL starting location for new transaction log\n"
+msgstr "  -l XLOGFIL       ny transaktionslogg m√•ste vara detta namn eller ett senare\n"
 
-#: pg_resetxlog.c:1028
+#: pg_resetxlog.c:1085
 #, c-format
-msgid "  -m XID          set next multitransaction ID\n"
-msgstr "  -m XID          s‰tt n‰sta multitransaktions-ID\n"
+msgid "  -m MXID,MXID     set next and oldest multitransaction ID\n"
+msgstr "  -m MXID,MXID     s√§tt n√§sta och √§ldsta multitransaktions-ID\n"
 
-#: pg_resetxlog.c:1029
+#: pg_resetxlog.c:1086
 #, c-format
-msgid ""
-"  -n              no update, just show extracted control values (for "
-"testing)\n"
-msgstr ""
-"  -n              ingen updatering, visa bara kontrollv‰rden (fˆr testning)\n"
+msgid "  -n               no update, just show what would be done (for testing)\n"
+msgstr "  -n               ingen updatering; visa planerade √•tg√§rder (f√∂r testning)\n"
 
-#: pg_resetxlog.c:1030
+#: pg_resetxlog.c:1087
 #, c-format
-msgid "  -o OID          set next OID\n"
-msgstr "  -o OID          s‰tt n‰sta OID\n"
+msgid "  -o OID           set next OID\n"
+msgstr "  -o OID           s√§tt n√§sta OID\n"
 
-#: pg_resetxlog.c:1031
+#: pg_resetxlog.c:1088
 #, c-format
-msgid "  -O OFFSET       set next multitransaction offset\n"
-msgstr "  -O OFFSET       s‰tt n‰sta multitransaktionsoffset\n"
+msgid "  -O OFFSET        set next multitransaction offset\n"
+msgstr "  -O OFFSET        s√§tt n√§sta multitransaktionsoffset\n"
 
-#: pg_resetxlog.c:1032
+#: pg_resetxlog.c:1089
 #, c-format
-msgid "  -x XID          set next transaction ID\n"
-msgstr "  -x XID          s‰tt n‰sta transaktions-ID\n"
+msgid "  -V, --version    output version information, then exit\n"
+msgstr "  -V, --version    visa versionsinformation, avsluta sedan\n"
 
-#: pg_resetxlog.c:1033
+#: pg_resetxlog.c:1090
 #, c-format
-msgid "  --help          show this help, then exit\n"
-msgstr "  --help          visa denna hj‰lp, avsluta sedan\n"
+msgid "  -x XID           set next transaction ID\n"
+msgstr "  -x XID           s√§tt n√§sta transaktions-ID\n"
 
-#: pg_resetxlog.c:1034
+#: pg_resetxlog.c:1091
 #, c-format
-msgid "  --version       output version information, then exit\n"
-msgstr "  --version       visa versionsinformation, avsluta sedan\n"
+msgid "  -?, --help       show this help, then exit\n"
+msgstr "  -?, --help       visa denna hj√§lp, avsluta sedan\n"
 
-#: pg_resetxlog.c:1035
+#: pg_resetxlog.c:1092
 #, c-format
 msgid ""
 "\n"

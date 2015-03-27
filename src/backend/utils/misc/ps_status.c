@@ -7,7 +7,7 @@
  *
  * src/backend/utils/misc/ps_status.c
  *
- * Copyright (c) 2000-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2015, PostgreSQL Global Development Group
  * various details abducted from various places
  *--------------------------------------------------------------------
  */
@@ -29,6 +29,7 @@
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "utils/ps_status.h"
+#include "utils/guc.h"
 
 extern char **environ;
 bool		update_process_title = true;
@@ -64,9 +65,9 @@ bool		update_process_title = true;
 #define PS_USE_PSTAT
 #elif defined(HAVE_PS_STRINGS)
 #define PS_USE_PS_STRINGS
-#elif (defined(BSD) || defined(__bsdi__) || defined(__hurd__)) && !defined(__darwin__)
+#elif (defined(BSD) || defined(__hurd__)) && !defined(__darwin__)
 #define PS_USE_CHANGE_ARGV
-#elif defined(__linux__) || defined(_AIX) || defined(__sgi) || (defined(sun) && !defined(BSD)) || defined(ultrix) || defined(__ksr__) || defined(__osf__) || defined(__svr4__) || defined(__svr5__) || defined(__darwin__)
+#elif defined(__linux__) || defined(_AIX) || defined(__sgi) || (defined(sun) && !defined(BSD)) || defined(__svr5__) || defined(__darwin__)
 #define PS_USE_CLOBBER_ARGV
 #elif defined(WIN32)
 #define PS_USE_WIN32
@@ -76,7 +77,7 @@ bool		update_process_title = true;
 
 
 /* Different systems want the buffer padded differently */
-#if defined(_AIX) || defined(__linux__) || defined(__svr4__) || defined(__darwin__)
+#if defined(_AIX) || defined(__linux__) || defined(__darwin__)
 #define PS_PADDING '\0'
 #else
 #define PS_PADDING ' '
@@ -109,7 +110,7 @@ static char **save_argv;
  * from being clobbered by subsequent ps_display actions.
  *
  * (The original argv[] will not be overwritten by this routine, but may be
- * overwritten during init_ps_display.	Also, the physical location of the
+ * overwritten during init_ps_display.  Also, the physical location of the
  * environment strings may be moved, so this should be called before any code
  * that might try to hang onto a getenv() result.)
  */
@@ -210,7 +211,7 @@ save_ps_display_args(int argc, char **argv)
 
 /*
  * Call this once during subprocess startup to set the identification
- * values.	At this point, the original argv[] array may be overwritten.
+ * values.  At this point, the original argv[] array may be overwritten.
  */
 void
 init_ps_display(const char *username, const char *dbname,
@@ -264,14 +265,23 @@ init_ps_display(const char *username, const char *dbname,
 	 * apparently setproctitle() already adds a `progname:' prefix to the ps
 	 * line
 	 */
-	snprintf(ps_buffer, ps_buffer_size,
-			 "%s %s %s ",
-			 username, dbname, host_info);
+#define PROGRAM_NAME_PREFIX ""
 #else
-	snprintf(ps_buffer, ps_buffer_size,
-			 "postgres: %s %s %s ",
-			 username, dbname, host_info);
+#define PROGRAM_NAME_PREFIX "postgres: "
 #endif
+
+	if (*cluster_name == '\0')
+	{
+		snprintf(ps_buffer, ps_buffer_size,
+				 PROGRAM_NAME_PREFIX "%s %s %s ",
+				 username, dbname, host_info);
+	}
+	else
+	{
+		snprintf(ps_buffer, ps_buffer_size,
+				 PROGRAM_NAME_PREFIX "%s: %s %s %s ",
+				 cluster_name, username, dbname, host_info);
+	}
 
 	ps_buffer_cur_len = ps_buffer_fixed_size = strlen(ps_buffer);
 
@@ -360,7 +370,7 @@ set_ps_display(const char *activity, bool force)
 
 /*
  * Returns what's currently in the ps display, in case someone needs
- * it.	Note that only the activity part is returned.  On some platforms
+ * it.  Note that only the activity part is returned.  On some platforms
  * the string will not be null-terminated, so return the effective
  * length into *displen.
  */

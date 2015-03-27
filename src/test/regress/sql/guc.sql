@@ -183,6 +183,18 @@ SELECT current_user = 'temp_reset_user';
 DROP ROLE temp_reset_user;
 
 --
+-- search_path should react to changes in pg_namespace
+--
+
+set search_path = foo, public, not_there_initially;
+select current_schemas(false);
+create schema not_there_initially;
+select current_schemas(false);
+drop schema not_there_initially;
+select current_schemas(false);
+reset search_path;
+
+--
 -- Tests for function-local GUC settings
 --
 
@@ -194,13 +206,7 @@ set work_mem = '1MB';
 
 select report_guc('work_mem'), current_setting('work_mem');
 
--- this should draw only a warning
-alter function report_guc(text) set search_path = no_such_schema;
-
--- with error occurring here
-select report_guc('work_mem'), current_setting('work_mem');
-
-alter function report_guc(text) reset search_path set work_mem = '2MB';
+alter function report_guc(text) set work_mem = '2MB';
 
 select report_guc('work_mem'), current_setting('work_mem');
 
@@ -251,3 +257,21 @@ set work_mem = '1MB';
 select myfunc(0);
 select current_setting('work_mem');
 select myfunc(1), current_setting('work_mem');
+
+-- Normally, CREATE FUNCTION should complain about invalid values in
+-- function SET options; but not if check_function_bodies is off,
+-- because that creates ordering hazards for pg_dump
+
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+
+set check_function_bodies = off;
+
+create function func_with_bad_set() returns int as $$ select 1 $$
+language sql
+set default_text_search_config = no_such_config;
+
+select func_with_bad_set();
+
+reset check_function_bodies;

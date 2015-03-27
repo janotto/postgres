@@ -18,9 +18,6 @@
 #include "pgtypes_date.h"
 
 
-int PGTYPEStimestamp_defmt_scan(char **, const char *, timestamp *, int *, int *, int *,
-							int *, int *, int *, int *);
-
 #ifdef HAVE_INT64_TIMESTAMP
 static int64
 time2t(const int hour, const int min, const int sec, const fsec_t fsec)
@@ -76,8 +73,9 @@ tm2timestamp(struct tm * tm, fsec_t fsec, int *tzp, timestamp * result)
 	if ((*result - time) / USECS_PER_DAY != dDate)
 		return -1;
 	/* check for just-barely overflow (okay except time-of-day wraps) */
-	if ((*result < 0 && dDate >= 0) ||
-		(*result >= 0 && dDate < 0))
+	/* caution: we want to allow 1999-12-31 24:00:00 */
+	if ((*result < 0 && dDate > 0) ||
+		(*result > 0 && dDate < -1))
 		return -1;
 #else
 	*result = dDate * SECS_PER_DAY + time;
@@ -119,7 +117,7 @@ SetEpochTimestamp(void)
  *	local time zone. If out of this range, leave as GMT. - tgl 97/05/27
  */
 static int
-timestamp2tm(timestamp dt, int *tzp, struct tm * tm, fsec_t *fsec, char **tzn)
+timestamp2tm(timestamp dt, int *tzp, struct tm * tm, fsec_t *fsec, const char **tzn)
 {
 #ifdef HAVE_INT64_TIMESTAMP
 	int64		dDate,
@@ -224,7 +222,7 @@ recalc_t:
 
 			*tzp = -tm->tm_gmtoff;		/* tm_gmtoff is Sun/DEC-ism */
 			if (tzn != NULL)
-				*tzn = (char *) tm->tm_zone;
+				*tzn = tm->tm_zone;
 #elif defined(HAVE_INT_TIMEZONE)
 			*tzp = (tm->tm_isdst > 0) ? TIMEZONE_GLOBAL - SECS_PER_HOUR : TIMEZONE_GLOBAL;
 			if (tzn != NULL)
@@ -253,6 +251,8 @@ recalc_t:
 		if (tzn != NULL)
 			*tzn = NULL;
 	}
+
+	tm->tm_yday = dDate - date2j(tm->tm_year, 1, 1) + 1;
 
 	return 0;
 }	/* timestamp2tm() */
@@ -294,7 +294,7 @@ PGTYPEStimestamp_from_asc(char *str, char **endptr)
 	char	   *realptr;
 	char	  **ptr = (endptr != NULL) ? endptr : &realptr;
 
-	if (strlen(str) >= sizeof(lowstr))
+	if (strlen(str) > MAXDATELEN)
 	{
 		errno = PGTYPES_TS_BAD_TIMESTAMP;
 		return (noresult);
@@ -342,7 +342,7 @@ PGTYPEStimestamp_from_asc(char *str, char **endptr)
 
 	/*
 	 * Since it's difficult to test for noresult, make sure errno is 0 if no
-	 * error occured.
+	 * error occurred.
 	 */
 	errno = 0;
 	return result;
@@ -354,7 +354,6 @@ PGTYPEStimestamp_to_asc(timestamp tstamp)
 	struct tm	tt,
 			   *tm = &tt;
 	char		buf[MAXDATELEN + 1];
-	char	   *tzn = NULL;
 	fsec_t		fsec;
 	int			DateStyle = 1;	/* this defaults to ISO_DATES, shall we make
 								 * it an option? */
@@ -362,7 +361,7 @@ PGTYPEStimestamp_to_asc(timestamp tstamp)
 	if (TIMESTAMP_NOT_FINITE(tstamp))
 		EncodeSpecialTimestamp(tstamp, buf);
 	else if (timestamp2tm(tstamp, NULL, tm, &fsec, NULL) == 0)
-		EncodeDateTime(tm, fsec, NULL, &tzn, DateStyle, buf, 0);
+		EncodeDateTime(tm, fsec, false, 0, NULL, DateStyle, buf, 0);
 	else
 	{
 		errno = PGTYPES_TS_BAD_TIMESTAMP;
@@ -420,7 +419,7 @@ dttofmtasc_replace(timestamp * ts, date dDate, int dow, struct tm * tm,
 					replace_val.str_val = months[tm->tm_mon];
 					replace_type = PGTYPES_TYPE_STRING_CONSTANT;
 					break;
-					/* the full name name of the month */
+					/* the full name of the month */
 					/* XXX should be locale aware */
 				case 'B':
 					replace_val.str_val = pgtypes_date_months[tm->tm_mon];
@@ -948,8 +947,6 @@ PGTYPEStimestamp_defmt_asc(char *str, const char *fmt, timestamp * d)
 int
 PGTYPEStimestamp_add_interval(timestamp * tin, interval * span, timestamp * tout)
 {
-
-
 	if (TIMESTAMP_NOT_FINITE(*tin))
 		*tout = *tin;
 

@@ -15,7 +15,7 @@
   <acronym>SP-GiST</acronym> is an abbreviation for space-partitioned
   <acronym>GiST</acronym>.  <acronym>SP-GiST</acronym> supports partitioned
   search trees, which facilitate development of a wide range of different
-  non-balanced data structures, such as quad-trees, k-d trees, and suffix
+  non-balanced data structures, such as quad-trees, k-d trees, and radix
   trees (tries).  The common feature of these structures is that they
   repeatedly divide the search space into partitions that need not be
   of equal size.  Searches that are well matched to the partitioning rule
@@ -53,6 +53,93 @@
 
 </sect1>
 
+<sect1 id="spgist-builtin-opclasses">
+ <title>Built-in Operator Classes</title>
+
+ <para>
+  The core <productname>PostgreSQL</> distribution
+  includes the <acronym>SP-GiST</acronym> operator classes shown in
+  <xref linkend="spgist-builtin-opclasses-table">.
+ </para>
+
+  <table id="spgist-builtin-opclasses-table">
+   <title>Built-in <acronym>SP-GiST</acronym> Operator Classes</title>
+   <tgroup cols="3">
+    <thead>
+     <row>
+      <entry>Name</entry>
+      <entry>Indexed Data Type</entry>
+      <entry>Indexable Operators</entry>
+     </row>
+    </thead>
+    <tbody>
+     <row>
+      <entry><literal>kd_point_ops</></entry>
+      <entry><type>point</></entry>
+      <entry>
+       <literal>&lt;&lt;</>
+       <literal>&lt;@</>
+       <literal>&lt;^</>
+       <literal>&gt;&gt;</>
+       <literal>&gt;^</>
+       <literal>~=</>
+      </entry>
+     </row>
+     <row>
+      <entry><literal>quad_point_ops</></entry>
+      <entry><type>point</></entry>
+      <entry>
+       <literal>&lt;&lt;</>
+       <literal>&lt;@</>
+       <literal>&lt;^</>
+       <literal>&gt;&gt;</>
+       <literal>&gt;^</>
+       <literal>~=</>
+      </entry>
+     </row>
+     <row>
+      <entry><literal>range_ops</></entry>
+      <entry>any range type</entry>
+      <entry>
+       <literal>&amp;&amp;</>
+       <literal>&amp;&lt;</>
+       <literal>&amp;&gt;</>
+       <literal>-|-</>
+       <literal>&lt;&lt;</>
+       <literal>&lt;@</>
+       <literal>=</>
+       <literal>&gt;&gt;</>
+       <literal>@&gt;</>
+      </entry>
+     </row>
+     <row>
+      <entry><literal>text_ops</></entry>
+      <entry><type>text</></entry>
+      <entry>
+       <literal>&lt;</>
+       <literal>&lt;=</>
+       <literal>=</>
+       <literal>&gt;</>
+       <literal>&gt;=</>
+       <literal>~&lt;=~</>
+       <literal>~&lt;~</>
+       <literal>~&gt;=~</>
+       <literal>~&gt;~</>
+      </entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+
+ <para>
+  Of the two operator classes for type <type>point</>,
+  <literal>quad_point_ops</> is the default.  <literal>kd_point_ops</>
+  supports the same operators but uses a different index data structure which
+  may offer better performance in some applications.
+ </para>
+
+</sect1>
+
 <sect1 id="spgist-extensibility">
  <title>Extensibility</title>
 
@@ -81,9 +168,9 @@
   A node contains a downlink that leads to either another, lower-level inner
   tuple, or a short list of leaf tuples that all lie on the same index page.
   Each node has a <firstterm>label</> that describes it; for example,
-  in a suffix tree the node label could be the next character of the string
+  in a radix tree the node label could be the next character of the string
   value.  Optionally, an inner tuple can have a <firstterm>prefix</> value
-  that describes all its members.  In a suffix tree this could be the common
+  that describes all its members.  In a radix tree this could be the common
   prefix of the represented strings.  The prefix value is not necessarily
   really a prefix, but can be any data needed by the operator class;
   for example, in a quad-tree it can store the central point that the four
@@ -99,6 +186,18 @@
   There is also support for incrementally reconstructing the represented
   value when that is needed.
  </para>
+
+ <note>
+  <para>
+   The <acronym>SP-GiST</acronym> core code takes care of null entries.
+   Although <acronym>SP-GiST</acronym> indexes do store entries for nulls
+   in indexed columns, this is hidden from the index operator class code:
+   no null index entries or search conditions will ever be passed to the
+   operator class methods.  (It is assumed that <acronym>SP-GiST</acronym>
+   operators are strict and so cannot succeed for null values.)  Null values
+   are therefore not discussed further here.
+  </para>
+ </note>
 
  <para>
   There are five user-defined methods that an index operator class for
@@ -124,7 +223,7 @@
      <listitem>
       <para>
        Returns static information about the index implementation, including
-       the datatype OIDs of the prefix and node label data types.
+       the data type OIDs of the prefix and node label data types.
       </para>
      <para>
       The <acronym>SQL</> declaration of the function must look like this:
@@ -151,7 +250,7 @@ typedef struct spgConfigOut
 </programlisting>
 
       <structfield>attType</> is passed in order to support polymorphic
-      index operator classes; for ordinary fixed-data-type opclasses, it
+      index operator classes; for ordinary fixed-data-type operator classes, it
       will always have the same value and so can be ignored.
      </para>
 
@@ -439,8 +538,8 @@ CREATE FUNCTION my_inner_consistent(internal, internal) RETURNS void ...
 <programlisting>
 typedef struct spgInnerConsistentIn
 {
-    StrategyNumber strategy;    /* operator strategy number */
-    Datum       query;          /* operator's RHS value */
+    ScanKey     scankeys;       /* array of operators and comparison values */
+    int         nkeys;          /* length of array */
 
     Datum       reconstructedValue;     /* value reconstructed at parent */
     int         level;          /* current level (counting from zero) */
@@ -463,8 +562,17 @@ typedef struct spgInnerConsistentOut
 } spgInnerConsistentOut;
 </programlisting>
 
-       <structfield>strategy</> and
-       <structfield>query</> describe the index search condition.
+       The array <structfield>scankeys</>, of length <structfield>nkeys</>,
+       describes the index search condition(s).  These conditions are
+       combined with AND &mdash; only index entries that satisfy all of
+       them are interesting.  (Note that <structfield>nkeys</> = 0 implies
+       that all index entries satisfy the query.)  Usually the consistent
+       function only cares about the <structfield>sk_strategy</> and
+       <structfield>sk_argument</> fields of each array entry, which
+       respectively give the indexable operator and comparison value.
+       In particular it is not necessary to check <structfield>sk_flags</> to
+       see if the comparison value is NULL, because the SP-GiST core code
+       will filter out such conditions.
        <structfield>reconstructedValue</> is the value reconstructed for the
        parent tuple; it is <literal>(Datum) 0</> at the root level or if the
        <function>inner_consistent</> function did not provide a value at the
@@ -527,8 +635,8 @@ CREATE FUNCTION my_leaf_consistent(internal, internal) RETURNS bool ...
 <programlisting>
 typedef struct spgLeafConsistentIn
 {
-    StrategyNumber strategy;    /* operator strategy number */
-    Datum       query;          /* operator's RHS value */
+    ScanKey     scankeys;       /* array of operators and comparison values */
+    int         nkeys;          /* length of array */
 
     Datum       reconstructedValue;     /* value reconstructed at parent */
     int         level;          /* current level (counting from zero) */
@@ -544,8 +652,17 @@ typedef struct spgLeafConsistentOut
 } spgLeafConsistentOut;
 </programlisting>
 
-       <structfield>strategy</> and
-       <structfield>query</> define the index search condition.
+       The array <structfield>scankeys</>, of length <structfield>nkeys</>,
+       describes the index search condition(s).  These conditions are
+       combined with AND &mdash; only index entries that satisfy all of
+       them satisfy the query.  (Note that <structfield>nkeys</> = 0 implies
+       that all index entries satisfy the query.)  Usually the consistent
+       function only cares about the <structfield>sk_strategy</> and
+       <structfield>sk_argument</> fields of each array entry, which
+       respectively give the indexable operator and comparison value.
+       In particular it is not necessary to check <structfield>sk_flags</> to
+       see if the comparison value is NULL, because the SP-GiST core code
+       will filter out such conditions.
        <structfield>reconstructedValue</> is the value reconstructed for the
        parent tuple; it is <literal>(Datum) 0</> at the root level or if the
        <function>inner_consistent</> function did not provide a value at the
@@ -566,8 +683,8 @@ typedef struct spgLeafConsistentOut
        <structfield>leafValue</> must be set to the value originally supplied
        to be indexed for this leaf tuple.  Also,
        <structfield>recheck</> may be set to <literal>true</> if the match
-       is uncertain and so the operator must be re-applied to the actual heap
-       tuple to verify the match.
+       is uncertain and so the operator(s) must be re-applied to the actual
+       heap tuple to verify the match.
       </para>
      </listitem>
     </varlistentry>
@@ -596,7 +713,7 @@ typedef struct spgLeafConsistentOut
 
   <para>
    This section covers implementation details and other tricks that are
-   useful for implementors of <acronym>SP-GiST</acronym> operator classes to
+   useful for implementers of <acronym>SP-GiST</acronym> operator classes to
    know.
   </para>
 
@@ -606,7 +723,7 @@ typedef struct spgLeafConsistentOut
   <para>
    Individual leaf tuples and inner tuples must fit on a single index page
    (8KB by default).  Therefore, when indexing values of variable-length
-   data types, long values can only be supported by methods such as suffix
+   data types, long values can only be supported by methods such as radix
    trees, in which each level of the tree includes a prefix that is short
    enough to fit on a page, and the final leaf level includes a suffix also
    short enough to fit on a page.  The operator class should set
@@ -710,7 +827,7 @@ typedef struct spgLeafConsistentOut
  <para>
   The <productname>PostgreSQL</productname> source distribution includes
   several examples of index operator classes for
-  <acronym>SP-GiST</acronym>.  The core system currently provides suffix
+  <acronym>SP-GiST</acronym>.  The core system currently provides radix
   trees over text columns and two types of trees over points: quad-tree and
   k-d tree.  Look into <filename>src/backend/access/spgist/</> to see the
   code.

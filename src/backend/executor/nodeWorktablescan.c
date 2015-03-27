@@ -3,7 +3,7 @@
  * nodeWorktablescan.c
  *	  routines to handle WorkTableScan nodes.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,7 +30,6 @@ static TupleTableSlot *
 WorkTableScanNext(WorkTableScanState *node)
 {
 	TupleTableSlot *slot;
-	EState	   *estate;
 	Tuplestorestate *tuplestorestate;
 
 	/*
@@ -48,8 +47,7 @@ WorkTableScanNext(WorkTableScanState *node)
 	 * worktable.  Therefore, we don't need a private read pointer for the
 	 * tuplestore, nor do we need to tell tuplestore_gettupleslot to copy.
 	 */
-	estate = node->ss.ps.state;
-	Assert(ScanDirectionIsForward(estate->es_direction));
+	Assert(ScanDirectionIsForward(node->ss.ps.state->es_direction));
 
 	tuplestorestate = node->rustate->working_table;
 
@@ -84,7 +82,7 @@ ExecWorkTableScan(WorkTableScanState *node)
 {
 	/*
 	 * On the first call, find the ancestor RecursiveUnion's state via the
-	 * Param slot reserved for it.	(We can't do this during node init because
+	 * Param slot reserved for it.  (We can't do this during node init because
 	 * there are corner cases where we'll get the init call before the
 	 * RecursiveUnion does.)
 	 */

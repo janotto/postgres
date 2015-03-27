@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTEROPERATOR">
+ <indexterm zone="sql-alteroperator">
+  <primary>ALTER OPERATOR</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ALTER OPERATOR</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,14 +19,13 @@ PostgreSQL documentation
   <refpurpose>change the definition of an operator</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alteroperator">
-  <primary>ALTER OPERATOR</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>left_type</replaceable> | NONE } , { <replaceable>right_type</replaceable> | NONE } ) OWNER TO <replaceable>new_owner</replaceable>
-ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>left_type</replaceable> | NONE } , { <replaceable>right_type</replaceable> | NONE } ) SET SCHEMA <replaceable>new_schema</replaceable>
+ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>left_type</replaceable> | NONE } , { <replaceable>right_type</replaceable> | NONE } )
+             { OWNER TO <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
+
+ALTER OPERATOR <replaceable>name</replaceable> ( { <replaceable>left_type</replaceable> | NONE } , { <replaceable>right_type</replaceable> | NONE } )
+               SET SCHEMA <replaceable>new_schema</replaceable>
 </synopsis>
  </refsynopsisdiv>
 

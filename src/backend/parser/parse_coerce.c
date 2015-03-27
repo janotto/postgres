@@ -3,7 +3,7 @@
  * parse_coerce.c
  *		handle type coercions/conversions for parser
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_cast.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_inherits_fn.h"
@@ -55,12 +56,12 @@ static bool typeIsOfTypedTable(Oid reltypeId, Oid reloftypeId);
  *		Convert an expression to a target type and typmod.
  *
  * This is the general-purpose entry point for arbitrary type coercion
- * operations.	Direct use of the component operations can_coerce_type,
+ * operations.  Direct use of the component operations can_coerce_type,
  * coerce_type, and coerce_type_typmod should be restricted to special
  * cases (eg, when the conversion is expected to succeed).
  *
  * Returns the possibly-transformed expression tree, or NULL if the type
- * conversion is not possible.	(We do this, rather than ereport'ing directly,
+ * conversion is not possible.  (We do this, rather than ereport'ing directly,
  * so that callers can generate custom error messages indicating context.)
  *
  * pstate - parse state (can be NULL, see coerce_type)
@@ -144,7 +145,7 @@ coerce_to_target_type(ParseState *pstate, Node *expr, Oid exprtype,
  * already be properly coerced to the specified typmod.
  *
  * pstate is only used in the case that we are able to resolve the type of
- * a previously UNKNOWN Param.	It is okay to pass pstate = NULL if the
+ * a previously UNKNOWN Param.  It is okay to pass pstate = NULL if the
  * caller does not want type information updated for Params.
  *
  * Note: this function must not modify the given expression tree, only add
@@ -174,7 +175,7 @@ coerce_type(ParseState *pstate, Node *node,
 		 *
 		 * Note: by returning the unmodified node here, we are saying that
 		 * it's OK to treat an UNKNOWN constant as a valid input for a
-		 * function accepting ANY, ANYELEMENT, or ANYNONARRAY.	This should be
+		 * function accepting ANY, ANYELEMENT, or ANYNONARRAY.  This should be
 		 * all right, since an UNKNOWN value is still a perfectly valid Datum.
 		 *
 		 * NB: we do NOT want a RelabelType here: the exposed type of the
@@ -249,7 +250,7 @@ coerce_type(ParseState *pstate, Node *node,
 
 		/*
 		 * If the target type is a domain, we want to call its base type's
-		 * input routine, not domain_in().	This is to avoid premature failure
+		 * input routine, not domain_in().  This is to avoid premature failure
 		 * when the domain applies a typmod: existing input routines follow
 		 * implicit-coercion semantics for length checks, which is not always
 		 * what we want here.  The needed check will be applied properly
@@ -262,7 +263,7 @@ coerce_type(ParseState *pstate, Node *node,
 		 * For most types we pass typmod -1 to the input routine, because
 		 * existing input routines follow implicit-coercion semantics for
 		 * length checks, which is not always what we want here.  Any length
-		 * constraint will be applied later by our caller.	An exception
+		 * constraint will be applied later by our caller.  An exception
 		 * however is the INTERVAL type, for which we *must* pass the typmod
 		 * or it won't be able to obey the bizarre SQL-spec input rules. (Ugly
 		 * as sin, but so is this part of the spec...)
@@ -280,13 +281,13 @@ coerce_type(ParseState *pstate, Node *node,
 		newcon->constlen = typeLen(targetType);
 		newcon->constbyval = typeByVal(targetType);
 		newcon->constisnull = con->constisnull;
-		/* Use the leftmost of the constant's and coercion's locations */
-		if (location < 0)
-			newcon->location = con->location;
-		else if (con->location >= 0 && con->location < location)
-			newcon->location = con->location;
-		else
-			newcon->location = location;
+
+		/*
+		 * We use the original literal's location regardless of the position
+		 * of the coercion.  This is a change from pre-9.2 behavior, meant to
+		 * simplify life for pg_stat_statements.
+		 */
+		newcon->location = con->location;
 
 		/*
 		 * Set up to point at the constant's text if the input routine throws
@@ -342,7 +343,7 @@ coerce_type(ParseState *pstate, Node *node,
 	{
 		/*
 		 * If we have a COLLATE clause, we have to push the coercion
-		 * underneath the COLLATE.	This is really ugly, but there is little
+		 * underneath the COLLATE.  This is really ugly, but there is little
 		 * choice because the above hacks on Consts and Params wouldn't happen
 		 * otherwise.  This kluge has consequences in coerce_to_target_type.
 		 */
@@ -365,7 +366,7 @@ coerce_type(ParseState *pstate, Node *node,
 		{
 			/*
 			 * Generate an expression tree representing run-time application
-			 * of the conversion function.	If we are dealing with a domain
+			 * of the conversion function.  If we are dealing with a domain
 			 * target type, the conversion function will yield the base type,
 			 * and we need to extract the correct typmod to use from the
 			 * domain's typtypmod.
@@ -401,7 +402,7 @@ coerce_type(ParseState *pstate, Node *node,
 			 * to have the intended type when inspected by higher-level code.
 			 *
 			 * Also, domains may have value restrictions beyond the base type
-			 * that must be accounted for.	If the destination is a domain
+			 * that must be accounted for.  If the destination is a domain
 			 * then we won't need a RelabelType node.
 			 */
 			result = coerce_to_domain(node, InvalidOid, -1, targetTypeId,
@@ -648,7 +649,7 @@ coerce_to_domain(Node *arg, Oid baseTypeId, int32 baseTypeMod, Oid typeId,
 	}
 
 	/*
-	 * Now build the domain coercion node.	This represents run-time checking
+	 * Now build the domain coercion node.  This represents run-time checking
 	 * of any constraints currently attached to the domain.  This also ensures
 	 * that the expression is properly labeled as to result type.
 	 */
@@ -721,7 +722,7 @@ coerce_type_typmod(Node *node, Oid targetTypeId, int32 targetTypMod,
  * Mark a coercion node as IMPLICIT so it will never be displayed by
  * ruleutils.c.  We use this when we generate a nest of coercion nodes
  * to implement what is logically one conversion; the inner nodes are
- * forced to IMPLICIT_CAST format.	This does not change their semantics,
+ * forced to IMPLICIT_CAST format.  This does not change their semantics,
  * only display behavior.
  *
  * It is caller error to call this on something that doesn't have a
@@ -1180,7 +1181,7 @@ select_common_type(ParseState *pstate, List *exprs, const char *context,
 	}
 
 	/*
-	 * Nope, so set up for the full algorithm.	Note that at this point, lc
+	 * Nope, so set up for the full algorithm.  Note that at this point, lc
 	 * points to the first list item with type different from pexpr's; we need
 	 * not re-examine any items the previous loop advanced over.
 	 */
@@ -1302,26 +1303,26 @@ coerce_to_common_type(ParseState *pstate, Node *node,
  *
  * 1) All arguments declared ANYELEMENT must have the same datatype.
  * 2) All arguments declared ANYARRAY must have the same datatype,
- *    which must be a varlena array type.
+ *	  which must be a varlena array type.
  * 3) All arguments declared ANYRANGE must have the same datatype,
- *    which must be a range type.
+ *	  which must be a range type.
  * 4) If there are arguments of both ANYELEMENT and ANYARRAY, make sure the
- *    actual ANYELEMENT datatype is in fact the element type for the actual
- *    ANYARRAY datatype.
+ *	  actual ANYELEMENT datatype is in fact the element type for the actual
+ *	  ANYARRAY datatype.
  * 5) Similarly, if there are arguments of both ANYELEMENT and ANYRANGE,
- *    make sure the actual ANYELEMENT datatype is in fact the subtype for
- *    the actual ANYRANGE type.
+ *	  make sure the actual ANYELEMENT datatype is in fact the subtype for
+ *	  the actual ANYRANGE type.
  * 6) ANYENUM is treated the same as ANYELEMENT except that if it is used
- *    (alone or in combination with plain ANYELEMENT), we add the extra
- *    condition that the ANYELEMENT type must be an enum.
+ *	  (alone or in combination with plain ANYELEMENT), we add the extra
+ *	  condition that the ANYELEMENT type must be an enum.
  * 7) ANYNONARRAY is treated the same as ANYELEMENT except that if it is used,
- *    we add the extra condition that the ANYELEMENT type must not be an array.
- *    (This is a no-op if used in combination with ANYARRAY or ANYENUM, but
- *    is an extra restriction if not.)
+ *	  we add the extra condition that the ANYELEMENT type must not be an array.
+ *	  (This is a no-op if used in combination with ANYARRAY or ANYENUM, but
+ *	  is an extra restriction if not.)
  *
  * Domains over arrays match ANYARRAY, and are immediately flattened to their
  * base type.  (Thus, for example, we will consider it a match if one ANYARRAY
- * argument is a domain over int4[] while another one is just int4[].)  Also
+ * argument is a domain over int4[] while another one is just int4[].)	Also
  * notice that such a domain does *not* match ANYNONARRAY.
  *
  * Similarly, domains over ranges match ANYRANGE, and are immediately
@@ -1487,35 +1488,35 @@ check_generic_type_consistency(Oid *actual_arg_types,
  * if it is declared as a polymorphic type:
  *
  * 1) If return type is ANYARRAY, and any argument is ANYARRAY, use the
- *    argument's actual type as the function's return type.
+ *	  argument's actual type as the function's return type.
  * 2) Similarly, if return type is ANYRANGE, and any argument is ANYRANGE,
- *    use the argument's actual type as the function's return type.
+ *	  use the argument's actual type as the function's return type.
  * 3) If return type is ANYARRAY, no argument is ANYARRAY, but any argument is
- *    ANYELEMENT, use the actual type of the argument to determine the
- *    function's return type, i.e. the element type's corresponding array
- *    type.  (Note: similar behavior does not exist for ANYRANGE, because it's
- *    impossible to determine the range type from the subtype alone.)
+ *	  ANYELEMENT, use the actual type of the argument to determine the
+ *	  function's return type, i.e. the element type's corresponding array
+ *	  type.  (Note: similar behavior does not exist for ANYRANGE, because it's
+ *	  impossible to determine the range type from the subtype alone.)
  * 4) If return type is ANYARRAY, but no argument is ANYARRAY or ANYELEMENT,
- *    generate an error.  Similarly, if return type is ANYRANGE, but no
- *    argument is ANYRANGE, generate an error.  (These conditions are
- *    prevented by CREATE FUNCTION and therefore are not expected here.)
+ *	  generate an error.  Similarly, if return type is ANYRANGE, but no
+ *	  argument is ANYRANGE, generate an error.  (These conditions are
+ *	  prevented by CREATE FUNCTION and therefore are not expected here.)
  * 5) If return type is ANYELEMENT, and any argument is ANYELEMENT, use the
- *    argument's actual type as the function's return type.
+ *	  argument's actual type as the function's return type.
  * 6) If return type is ANYELEMENT, no argument is ANYELEMENT, but any argument
- *    is ANYARRAY or ANYRANGE, use the actual type of the argument to determine
- *    the function's return type, i.e. the array type's corresponding element
- *    type or the range type's corresponding subtype (or both, in which case
- *    they must match).
+ *	  is ANYARRAY or ANYRANGE, use the actual type of the argument to determine
+ *	  the function's return type, i.e. the array type's corresponding element
+ *	  type or the range type's corresponding subtype (or both, in which case
+ *	  they must match).
  * 7) If return type is ANYELEMENT, no argument is ANYELEMENT, ANYARRAY, or
- *    ANYRANGE, generate an error.  (This condition is prevented by CREATE
- *    FUNCTION and therefore is not expected here.)
+ *	  ANYRANGE, generate an error.  (This condition is prevented by CREATE
+ *	  FUNCTION and therefore is not expected here.)
  * 8) ANYENUM is treated the same as ANYELEMENT except that if it is used
- *    (alone or in combination with plain ANYELEMENT), we add the extra
- *    condition that the ANYELEMENT type must be an enum.
+ *	  (alone or in combination with plain ANYELEMENT), we add the extra
+ *	  condition that the ANYELEMENT type must be an enum.
  * 9) ANYNONARRAY is treated the same as ANYELEMENT except that if it is used,
- *    we add the extra condition that the ANYELEMENT type must not be an array.
- *    (This is a no-op if used in combination with ANYARRAY or ANYENUM, but
- *    is an extra restriction if not.)
+ *	  we add the extra condition that the ANYELEMENT type must not be an array.
+ *	  (This is a no-op if used in combination with ANYARRAY or ANYENUM, but
+ *	  is an extra restriction if not.)
  *
  * Domains over arrays or ranges match ANYARRAY or ANYRANGE arguments,
  * respectively, and are immediately flattened to their base type. (In
@@ -1637,7 +1638,7 @@ enforce_generic_type_consistency(Oid *actual_arg_types,
 
 	/*
 	 * Fast Track: if none of the arguments are polymorphic, return the
-	 * unmodified rettype.	We assume it can't be polymorphic either.
+	 * unmodified rettype.  We assume it can't be polymorphic either.
 	 */
 	if (!have_generics)
 		return rettype;
@@ -1693,7 +1694,7 @@ enforce_generic_type_consistency(Oid *actual_arg_types,
 			if (!OidIsValid(range_typelem))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("argument declared \"anyrange\" is not a range but type %s",
+						 errmsg("argument declared \"anyrange\" is not a range type but type %s",
 								format_type_be(range_typeid))));
 		}
 
@@ -1914,7 +1915,7 @@ resolve_generic_type(Oid declared_type,
 			if (!OidIsValid(range_typelem))
 				ereport(ERROR,
 						(errcode(ERRCODE_DATATYPE_MISMATCH),
-						 errmsg("argument declared \"anyrange\" is not a range but type %s",
+						 errmsg("argument declared \"anyrange\" is not a range type but type %s",
 								format_type_be(context_base_type))));
 			return range_typelem;
 		}
@@ -1980,8 +1981,8 @@ IsPreferredType(TYPCATEGORY category, Oid type)
  *		Check if srctype is binary-coercible to targettype.
  *
  * This notion allows us to cheat and directly exchange values without
- * going through the trouble of calling a conversion function.	Note that
- * in general, this should only be an implementation shortcut.	Before 7.4,
+ * going through the trouble of calling a conversion function.  Note that
+ * in general, this should only be an implementation shortcut.  Before 7.4,
  * this was also used as a heuristic for resolving overloaded functions and
  * operators, but that's basically a bad idea.
  *
@@ -1994,7 +1995,7 @@ IsPreferredType(TYPCATEGORY category, Oid type)
  * types.
  *
  * This function replaces IsBinaryCompatible(), which was an inherently
- * symmetric test.	Since the pg_cast entries aren't necessarily symmetric,
+ * symmetric test.  Since the pg_cast entries aren't necessarily symmetric,
  * the order of the operands is now significant.
  */
 bool
@@ -2006,6 +2007,10 @@ IsBinaryCoercible(Oid srctype, Oid targettype)
 
 	/* Fast path if same type */
 	if (srctype == targettype)
+		return true;
+
+	/* Anything is coercible to ANY or ANYELEMENT */
+	if (targettype == ANYOID || targettype == ANYELEMENTOID)
 		return true;
 
 	/* If srctype is a domain, reduce to its base type */
@@ -2176,7 +2181,7 @@ find_coercion_pathway(Oid targetTypeId, Oid sourceTypeId,
 		 * Hack: disallow coercions to oidvector and int2vector, which
 		 * otherwise tend to capture coercions that should go to "real" array
 		 * types.  We want those types to be considered "real" arrays for many
-		 * purposes, but not this one.	(Also, ArrayCoerceExpr isn't
+		 * purposes, but not this one.  (Also, ArrayCoerceExpr isn't
 		 * guaranteed to produce an output that meets the restrictions of
 		 * these datatypes, such as being 1-dimensional.)
 		 */

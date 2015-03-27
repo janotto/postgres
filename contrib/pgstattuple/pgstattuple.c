@@ -36,14 +36,10 @@
 #include "utils/builtins.h"
 #include "utils/tqual.h"
 
-
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(pgstattuple);
 PG_FUNCTION_INFO_V1(pgstattuplebyid);
-
-extern Datum pgstattuple(PG_FUNCTION_ARGS);
-extern Datum pgstattuplebyid(PG_FUNCTION_ARGS);
 
 /*
  * struct pgstattuple_type
@@ -61,18 +57,22 @@ typedef struct pgstattuple_type
 	uint64		free_space;		/* free/reusable space in bytes */
 } pgstattuple_type;
 
-typedef void (*pgstat_page) (pgstattuple_type *, Relation, BlockNumber);
+typedef void (*pgstat_page) (pgstattuple_type *, Relation, BlockNumber,
+										 BufferAccessStrategy);
 
 static Datum build_pgstattuple_type(pgstattuple_type *stat,
 					   FunctionCallInfo fcinfo);
 static Datum pgstat_relation(Relation rel, FunctionCallInfo fcinfo);
 static Datum pgstat_heap(Relation rel, FunctionCallInfo fcinfo);
 static void pgstat_btree_page(pgstattuple_type *stat,
-				  Relation rel, BlockNumber blkno);
+				  Relation rel, BlockNumber blkno,
+				  BufferAccessStrategy bstrategy);
 static void pgstat_hash_page(pgstattuple_type *stat,
-				 Relation rel, BlockNumber blkno);
+				 Relation rel, BlockNumber blkno,
+				 BufferAccessStrategy bstrategy);
 static void pgstat_gist_page(pgstattuple_type *stat,
-				 Relation rel, BlockNumber blkno);
+				 Relation rel, BlockNumber blkno,
+				 BufferAccessStrategy bstrategy);
 static Datum pgstat_index(Relation rel, BlockNumber start,
 			 pgstat_page pagefn, FunctionCallInfo fcinfo);
 static void pgstat_index_page(pgstattuple_type *stat, Page page,
@@ -212,8 +212,8 @@ pgstat_relation(Relation rel, FunctionCallInfo fcinfo)
 	switch (rel->rd_rel->relkind)
 	{
 		case RELKIND_RELATION:
+		case RELKIND_MATVIEW:
 		case RELKIND_TOASTVALUE:
-		case RELKIND_UNCATALOGED:
 		case RELKIND_SEQUENCE:
 			return pgstat_heap(rel, fcinfo);
 		case RELKIND_INDEX:
@@ -230,6 +230,9 @@ pgstat_relation(Relation rel, FunctionCallInfo fcinfo)
 										pgstat_gist_page, fcinfo);
 				case GIN_AM_OID:
 					err = "gin index";
+					break;
+				case SPGIST_AM_OID:
+					err = "spgist index";
 					break;
 				default:
 					err = "unknown index";
@@ -270,9 +273,11 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 	BlockNumber tupblock;
 	Buffer		buffer;
 	pgstattuple_type stat = {0};
+	SnapshotData SnapshotDirty;
 
 	/* Disable syncscan because we assume we scan from block zero upwards */
 	scan = heap_beginscan_strat(rel, SnapshotAny, 0, NULL, true, false);
+	InitDirtySnapshot(SnapshotDirty);
 
 	nblocks = scan->rs_nblocks; /* # blocks to be scanned */
 
@@ -284,7 +289,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 		/* must hold a buffer lock to call HeapTupleSatisfiesVisibility */
 		LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
 
-		if (HeapTupleSatisfiesVisibility(tuple, SnapshotNow, scan->rs_cbuf))
+		if (HeapTupleSatisfiesVisibility(tuple, &SnapshotDirty, scan->rs_cbuf))
 		{
 			stat.tuple_len += tuple->t_len;
 			stat.tuple_count++;
@@ -299,7 +304,7 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 
 		/*
 		 * To avoid physically reading the table twice, try to do the
-		 * free-space scan in parallel with the heap scan.	However,
+		 * free-space scan in parallel with the heap scan.  However,
 		 * heap_getnext may find no tuples on a given page, so we cannot
 		 * simply examine the pages returned by the heap scan.
 		 */
@@ -309,26 +314,28 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
 		{
 			CHECK_FOR_INTERRUPTS();
 
-			buffer = ReadBuffer(rel, block);
+			buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
+										RBM_NORMAL, scan->rs_strategy);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
 			UnlockReleaseBuffer(buffer);
 			block++;
 		}
 	}
-	heap_endscan(scan);
 
 	while (block < nblocks)
 	{
 		CHECK_FOR_INTERRUPTS();
 
-		buffer = ReadBuffer(rel, block);
+		buffer = ReadBufferExtended(rel, MAIN_FORKNUM, block,
+									RBM_NORMAL, scan->rs_strategy);
 		LockBuffer(buffer, BUFFER_LOCK_SHARE);
 		stat.free_space += PageGetHeapFreeSpace((Page) BufferGetPage(buffer));
 		UnlockReleaseBuffer(buffer);
 		block++;
 	}
 
+	heap_endscan(scan);
 	relation_close(rel, AccessShareLock);
 
 	stat.table_len = (uint64) nblocks *BLCKSZ;
@@ -340,12 +347,13 @@ pgstat_heap(Relation rel, FunctionCallInfo fcinfo)
  * pgstat_btree_page -- check tuples in a btree page
  */
 static void
-pgstat_btree_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno)
+pgstat_btree_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
+				  BufferAccessStrategy bstrategy)
 {
 	Buffer		buf;
 	Page		page;
 
-	buf = ReadBuffer(rel, blkno);
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
 	LockBuffer(buf, BT_READ);
 	page = BufferGetPage(buf);
 
@@ -383,13 +391,14 @@ pgstat_btree_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno)
  * pgstat_hash_page -- check tuples in a hash page
  */
 static void
-pgstat_hash_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno)
+pgstat_hash_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
+				 BufferAccessStrategy bstrategy)
 {
 	Buffer		buf;
 	Page		page;
 
 	_hash_getlock(rel, blkno, HASH_SHARE);
-	buf = _hash_getbuf(rel, blkno, HASH_READ, 0);
+	buf = _hash_getbuf_with_strategy(rel, blkno, HASH_READ, 0, bstrategy);
 	page = BufferGetPage(buf);
 
 	if (PageGetSpecialSize(page) == MAXALIGN(sizeof(HashPageOpaqueData)))
@@ -426,12 +435,13 @@ pgstat_hash_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno)
  * pgstat_gist_page -- check tuples in a gist page
  */
 static void
-pgstat_gist_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno)
+pgstat_gist_page(pgstattuple_type *stat, Relation rel, BlockNumber blkno,
+				 BufferAccessStrategy bstrategy)
 {
 	Buffer		buf;
 	Page		page;
 
-	buf = ReadBuffer(rel, blkno);
+	buf = ReadBufferExtended(rel, MAIN_FORKNUM, blkno, RBM_NORMAL, bstrategy);
 	LockBuffer(buf, GIST_SHARE);
 	gistcheckpage(rel, buf);
 	page = BufferGetPage(buf);
@@ -458,7 +468,11 @@ pgstat_index(Relation rel, BlockNumber start, pgstat_page pagefn,
 {
 	BlockNumber nblocks;
 	BlockNumber blkno;
+	BufferAccessStrategy bstrategy;
 	pgstattuple_type stat = {0};
+
+	/* prepare access strategy for this index */
+	bstrategy = GetAccessStrategy(BAS_BULKREAD);
 
 	blkno = start;
 	for (;;)
@@ -480,7 +494,7 @@ pgstat_index(Relation rel, BlockNumber start, pgstat_page pagefn,
 		{
 			CHECK_FOR_INTERRUPTS();
 
-			pagefn(&stat, rel, blkno);
+			pagefn(&stat, rel, blkno, bstrategy);
 		}
 	}
 

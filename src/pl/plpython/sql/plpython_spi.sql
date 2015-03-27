@@ -93,9 +93,9 @@ SELECT join_sequences(sequences) FROM sequences
 -- plan and result objects
 --
 
-CREATE FUNCTION result_nrows_test() RETURNS int
+CREATE FUNCTION result_metadata_test(cmd text) RETURNS int
 AS $$
-plan = plpy.prepare("SELECT 1 AS foo, '11'::text AS bar UNION SELECT 2, '22'")
+plan = plpy.prepare(cmd)
 plpy.info(plan.status()) # not really documented or useful
 result = plpy.execute(plan)
 if result.status() > 0:
@@ -107,8 +107,77 @@ else:
    return None
 $$ LANGUAGE plpythonu;
 
-SELECT result_nrows_test();
+SELECT result_metadata_test($$SELECT 1 AS foo, '11'::text AS bar UNION SELECT 2, '22'$$);
+SELECT result_metadata_test($$CREATE TEMPORARY TABLE foo1 (a int, b text)$$);
 
+CREATE FUNCTION result_nrows_test(cmd text) RETURNS int
+AS $$
+result = plpy.execute(cmd)
+return result.nrows()
+$$ LANGUAGE plpythonu;
+
+SELECT result_nrows_test($$SELECT 1$$);
+SELECT result_nrows_test($$CREATE TEMPORARY TABLE foo2 (a int, b text)$$);
+SELECT result_nrows_test($$INSERT INTO foo2 VALUES (1, 'one'), (2, 'two')$$);
+SELECT result_nrows_test($$UPDATE foo2 SET b = '' WHERE a = 2$$);
+
+CREATE FUNCTION result_len_test(cmd text) RETURNS int
+AS $$
+result = plpy.execute(cmd)
+return len(result)
+$$ LANGUAGE plpythonu;
+
+SELECT result_len_test($$SELECT 1$$);
+SELECT result_len_test($$CREATE TEMPORARY TABLE foo3 (a int, b text)$$);
+SELECT result_len_test($$INSERT INTO foo3 VALUES (1, 'one'), (2, 'two')$$);
+SELECT result_len_test($$UPDATE foo3 SET b= '' WHERE a = 2$$);
+
+CREATE FUNCTION result_subscript_test() RETURNS void
+AS $$
+result = plpy.execute("SELECT 1 AS c UNION SELECT 2 "
+                      "UNION SELECT 3 UNION SELECT 4")
+
+plpy.info(result[1]['c'])
+plpy.info(result[-1]['c'])
+
+plpy.info([item['c'] for item in result[1:3]])
+plpy.info([item['c'] for item in result[::2]])
+
+result[-1] = {'c': 1000}
+result[:2] = [{'c': 10}, {'c': 100}]
+plpy.info([item['c'] for item in result[:]])
+
+# raises TypeError, but the message differs on Python 2.6, so silence it
+try:
+    plpy.info(result['foo'])
+except TypeError:
+    pass
+else:
+    assert False, "TypeError not raised"
+
+$$ LANGUAGE plpythonu;
+
+SELECT result_subscript_test();
+
+CREATE FUNCTION result_empty_test() RETURNS void
+AS $$
+result = plpy.execute("select 1 where false")
+
+plpy.info(result[:])
+
+$$ LANGUAGE plpythonu;
+
+SELECT result_empty_test();
+
+CREATE FUNCTION result_str_test(cmd text) RETURNS text
+AS $$
+plan = plpy.prepare(cmd)
+result = plpy.execute(plan)
+return str(result)
+$$ LANGUAGE plpythonu;
+
+SELECT result_str_test($$SELECT 1 AS foo UNION SELECT 2$$);
+SELECT result_str_test($$CREATE TEMPORARY TABLE foo1 (a int, b text)$$);
 
 -- cursor objects
 
@@ -215,6 +284,17 @@ plan = plpy.prepare("select fname, lname from users where fname like $1 || '%'",
 c = plpy.cursor(plan, ["a", "b"])
 $$ LANGUAGE plpythonu;
 
+CREATE TYPE test_composite_type AS (
+  a1 int,
+  a2 varchar
+);
+
+CREATE OR REPLACE FUNCTION plan_composite_args() RETURNS test_composite_type AS $$
+plan = plpy.prepare("select $1 as c1", ["test_composite_type"])
+res = plpy.execute(plan, [{"a1": 3, "a2": "label"}])
+return res[0]["c1"]
+$$ LANGUAGE plpythonu;
+
 SELECT simple_cursor_test();
 SELECT double_cursor_close();
 SELECT cursor_fetch();
@@ -224,3 +304,4 @@ SELECT next_after_close();
 SELECT cursor_fetch_next_empty();
 SELECT cursor_plan();
 SELECT cursor_plan_wrong_args();
+SELECT plan_composite_args();

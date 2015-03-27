@@ -3,7 +3,7 @@
  * explain.h
  *	  prototypes for explain.c
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  * src/include/commands/explain.h
@@ -14,6 +14,7 @@
 #define EXPLAIN_H
 
 #include "executor/executor.h"
+#include "lib/stringinfo.h"
 
 typedef enum ExplainFormat
 {
@@ -29,19 +30,23 @@ typedef struct ExplainState
 	/* options */
 	bool		verbose;		/* be verbose */
 	bool		analyze;		/* print actual times */
-	bool		costs;			/* print costs */
+	bool		costs;			/* print estimated costs */
 	bool		buffers;		/* print buffer usage */
-	bool		timing;			/* print timing */
+	bool		timing;			/* print detailed node timing */
+	bool		summary;		/* print total planning and execution timing */
 	ExplainFormat format;		/* output format */
 	/* other states */
 	PlannedStmt *pstmt;			/* top of plan */
 	List	   *rtable;			/* range table */
+	List	   *rtable_names;	/* alias names for RTEs */
 	int			indent;			/* current indentation level */
 	List	   *grouping_stack; /* format-specific grouping state */
+	List	   *deparse_cxt;	/* context list for deparsing expressions */
 } ExplainState;
 
 /* Hook for plugins to get control in ExplainOneQuery() */
 typedef void (*ExplainOneQuery_hook_type) (Query *query,
+													   IntoClause *into,
 													   ExplainState *es,
 													 const char *queryString,
 													   ParamListInfo params);
@@ -55,17 +60,20 @@ extern PGDLLIMPORT explain_get_index_name_hook_type explain_get_index_name_hook;
 extern void ExplainQuery(ExplainStmt *stmt, const char *queryString,
 			 ParamListInfo params, DestReceiver *dest);
 
-extern void ExplainInitState(ExplainState *es);
+extern ExplainState *NewExplainState(void);
 
 extern TupleDesc ExplainResultDesc(ExplainStmt *stmt);
 
-extern void ExplainOneUtility(Node *utilityStmt, ExplainState *es,
+extern void ExplainOneUtility(Node *utilityStmt, IntoClause *into,
+				  ExplainState *es,
 				  const char *queryString, ParamListInfo params);
 
-extern void ExplainOnePlan(PlannedStmt *plannedstmt, ExplainState *es,
-			   const char *queryString, ParamListInfo params);
+extern void ExplainOnePlan(PlannedStmt *plannedstmt, IntoClause *into,
+			   ExplainState *es, const char *queryString,
+			   ParamListInfo params, const instr_time *planduration);
 
 extern void ExplainPrintPlan(ExplainState *es, QueryDesc *queryDesc);
+extern void ExplainPrintTriggers(ExplainState *es, QueryDesc *queryDesc);
 
 extern void ExplainQueryText(ExplainState *es, QueryDesc *queryDesc);
 

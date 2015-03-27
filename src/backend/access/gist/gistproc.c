@@ -7,7 +7,7 @@
  * This gives R-tree behavior, with Guttman's poly-time split algorithm.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -152,6 +152,16 @@ gist_box_decompress(PG_FUNCTION_ARGS)
 }
 
 /*
+ * GiST Fetch method for boxes
+ * do not do anything --- we just return the stored box as is.
+ */
+Datum
+gist_box_fetch(PG_FUNCTION_ARGS)
+{
+	PG_RETURN_POINTER(PG_GETARG_POINTER(0));
+}
+
+/*
  * The GiST Penalty method for boxes (also used for points)
  *
  * As in the R-tree paper, we use change in area as our penalty metric
@@ -223,15 +233,8 @@ fallbackSplit(GistEntryVector *entryvec, GIST_SPLITVEC *v)
 		}
 	}
 
-	if (v->spl_ldatum_exists)
-		adjustBox(unionL, DatumGetBoxP(v->spl_ldatum));
 	v->spl_ldatum = BoxPGetDatum(unionL);
-
-	if (v->spl_rdatum_exists)
-		adjustBox(unionR, DatumGetBoxP(v->spl_rdatum));
 	v->spl_rdatum = BoxPGetDatum(unionR);
-
-	v->spl_ldatum_exists = v->spl_rdatum_exists = false;
 }
 
 /*
@@ -244,7 +247,7 @@ typedef struct
 	int			index;
 	/* Delta between penalties of entry insertion into different groups */
 	double		delta;
-}	CommonEntry;
+} CommonEntry;
 
 /*
  * Context for g_box_consider_split. Contains information about currently
@@ -267,7 +270,7 @@ typedef struct
 	int			dim;			/* axis of this split */
 	double		range;			/* width of general MBR projection to the
 								 * selected axis */
-}	ConsiderSplitContext;
+} ConsiderSplitContext;
 
 /*
  * Interval represents projection of box to axis.
@@ -276,7 +279,7 @@ typedef struct
 {
 	double		lower,
 				upper;
-}	SplitInterval;
+} SplitInterval;
 
 /*
  * Interval comparison function by lower bound of the interval;
@@ -327,7 +330,7 @@ non_negative(float val)
 /*
  * Consider replacement of currently selected split with the better one.
  */
-static void inline
+static inline void
 g_box_consider_split(ConsiderSplitContext *context, int dimNum,
 					 double rightLower, int minLeftCount,
 					 double leftUpper, int maxLeftCount)
@@ -838,7 +841,12 @@ gist_box_picksplit(PG_FUNCTION_ARGS)
 /*
  * Equality method
  *
- * This is used for both boxes and points.
+ * This is used for boxes, points, circles, and polygons, all of which store
+ * boxes as GiST index entries.
+ *
+ * Returns true only when boxes are exactly the same.  We can't use fuzzy
+ * comparisons here without breaking index consistency; therefore, this isn't
+ * equivalent to box_same().
  */
 Datum
 gist_box_same(PG_FUNCTION_ARGS)
@@ -848,11 +856,10 @@ gist_box_same(PG_FUNCTION_ARGS)
 	bool	   *result = (bool *) PG_GETARG_POINTER(2);
 
 	if (b1 && b2)
-		*result = DatumGetBool(DirectFunctionCall2(box_same,
-												   PointerGetDatum(b1),
-												   PointerGetDatum(b2)));
+		*result = (b1->low.x == b2->low.x && b1->low.y == b2->low.y &&
+				   b1->high.x == b2->high.x && b1->high.y == b2->high.y);
 	else
-		*result = (b1 == NULL && b2 == NULL) ? TRUE : FALSE;
+		*result = (b1 == NULL && b2 == NULL);
 	PG_RETURN_POINTER(result);
 }
 
@@ -929,7 +936,9 @@ gist_box_leaf_consistent(BOX *key, BOX *query, StrategyNumber strategy)
 													PointerGetDatum(query)));
 			break;
 		default:
-			retval = FALSE;
+			elog(ERROR, "unrecognized strategy number: %d", strategy);
+			retval = false;		/* keep compiler quiet */
+			break;
 	}
 	return retval;
 }
@@ -1018,7 +1027,9 @@ rtree_internal_consistent(BOX *key, BOX *query, StrategyNumber strategy)
 													PointerGetDatum(query)));
 			break;
 		default:
-			retval = FALSE;
+			elog(ERROR, "unrecognized strategy number: %d", strategy);
+			retval = false;		/* keep compiler quiet */
+			break;
 	}
 	return retval;
 }
@@ -1038,25 +1049,16 @@ gist_poly_compress(PG_FUNCTION_ARGS)
 
 	if (entry->leafkey)
 	{
-		retval = palloc(sizeof(GISTENTRY));
-		if (DatumGetPointer(entry->key) != NULL)
-		{
-			POLYGON    *in = DatumGetPolygonP(entry->key);
-			BOX		   *r;
+		POLYGON    *in = DatumGetPolygonP(entry->key);
+		BOX		   *r;
 
-			r = (BOX *) palloc(sizeof(BOX));
-			memcpy((void *) r, (void *) &(in->boundbox), sizeof(BOX));
-			gistentryinit(*retval, PointerGetDatum(r),
-						  entry->rel, entry->page,
-						  entry->offset, FALSE);
+		r = (BOX *) palloc(sizeof(BOX));
+		memcpy((void *) r, (void *) &(in->boundbox), sizeof(BOX));
 
-		}
-		else
-		{
-			gistentryinit(*retval, (Datum) 0,
-						  entry->rel, entry->page,
-						  entry->offset, FALSE);
-		}
+		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		gistentryinit(*retval, PointerGetDatum(r),
+					  entry->rel, entry->page,
+					  entry->offset, FALSE);
 	}
 	else
 		retval = entry;
@@ -1112,28 +1114,19 @@ gist_circle_compress(PG_FUNCTION_ARGS)
 
 	if (entry->leafkey)
 	{
-		retval = palloc(sizeof(GISTENTRY));
-		if (DatumGetCircleP(entry->key) != NULL)
-		{
-			CIRCLE	   *in = DatumGetCircleP(entry->key);
-			BOX		   *r;
+		CIRCLE	   *in = DatumGetCircleP(entry->key);
+		BOX		   *r;
 
-			r = (BOX *) palloc(sizeof(BOX));
-			r->high.x = in->center.x + in->radius;
-			r->low.x = in->center.x - in->radius;
-			r->high.y = in->center.y + in->radius;
-			r->low.y = in->center.y - in->radius;
-			gistentryinit(*retval, PointerGetDatum(r),
-						  entry->rel, entry->page,
-						  entry->offset, FALSE);
+		r = (BOX *) palloc(sizeof(BOX));
+		r->high.x = in->center.x + in->radius;
+		r->low.x = in->center.x - in->radius;
+		r->high.y = in->center.y + in->radius;
+		r->low.y = in->center.y - in->radius;
 
-		}
-		else
-		{
-			gistentryinit(*retval, (Datum) 0,
-						  entry->rel, entry->page,
-						  entry->offset, FALSE);
-		}
+		retval = (GISTENTRY *) palloc(sizeof(GISTENTRY));
+		gistentryinit(*retval, PointerGetDatum(r),
+					  entry->rel, entry->page,
+					  entry->offset, FALSE);
 	}
 	else
 		retval = entry;
@@ -1202,6 +1195,33 @@ gist_point_compress(PG_FUNCTION_ARGS)
 
 	PG_RETURN_POINTER(entry);
 }
+
+/*
+ * GiST Fetch method for point
+ *
+ * Get point coordinates from its bounding box coordinates and form new
+ * gistentry.
+ */
+Datum
+gist_point_fetch(PG_FUNCTION_ARGS)
+{
+	GISTENTRY  *entry = (GISTENTRY *) PG_GETARG_POINTER(0);
+	BOX		   *in = DatumGetBoxP(entry->key);
+	Point	   *r;
+	GISTENTRY  *retval;
+
+	retval = palloc(sizeof(GISTENTRY));
+
+	r = (Point *) palloc(sizeof(Point));
+	r->x = in->high.x;
+	r->y = in->high.y;
+	gistentryinit(*retval, PointerGetDatum(r),
+				  entry->rel, entry->page,
+				  entry->offset, FALSE);
+
+	PG_RETURN_POINTER(retval);
+}
+
 
 #define point_point_distance(p1,p2) \
 	DatumGetFloat8(DirectFunctionCall2(point_distance, \
@@ -1296,17 +1316,22 @@ gist_point_consistent_internal(StrategyNumber strategy,
 		case RTSameStrategyNumber:
 			if (isLeaf)
 			{
-				result = FPeq(key->low.x, query->x)
-					&& FPeq(key->low.y, query->y);
+				/* key.high must equal key.low, so we can disregard it */
+				result = (FPeq(key->low.x, query->x) &&
+						  FPeq(key->low.y, query->y));
 			}
 			else
 			{
-				result = (query->x <= key->high.x && query->x >= key->low.x &&
-						  query->y <= key->high.y && query->y >= key->low.y);
+				result = (FPle(query->x, key->high.x) &&
+						  FPge(query->x, key->low.x) &&
+						  FPle(query->y, key->high.y) &&
+						  FPge(query->y, key->low.y));
 			}
 			break;
 		default:
-			elog(ERROR, "unknown strategy number: %d", strategy);
+			elog(ERROR, "unrecognized strategy number: %d", strategy);
+			result = false;		/* keep compiler quiet */
+			break;
 	}
 
 	return result;
@@ -1337,12 +1362,31 @@ gist_point_consistent(PG_FUNCTION_ARGS)
 			*recheck = false;
 			break;
 		case BoxStrategyNumberGroup:
-			result = DatumGetBool(DirectFunctionCall5(
-													  gist_box_consistent,
-													  PointerGetDatum(entry),
-													  PG_GETARG_DATUM(1),
-									  Int16GetDatum(RTOverlapStrategyNumber),
-											   0, PointerGetDatum(recheck)));
+			{
+				/*
+				 * The only operator in this group is point <@ box (on_pb), so
+				 * we needn't examine strategy again.
+				 *
+				 * For historical reasons, on_pb uses exact rather than fuzzy
+				 * comparisons.  We could use box_overlap when at an internal
+				 * page, but that would lead to possibly visiting child pages
+				 * uselessly, because box_overlap uses fuzzy comparisons.
+				 * Instead we write a non-fuzzy overlap test.  The same code
+				 * will also serve for leaf-page tests, since leaf keys have
+				 * high == low.
+				 */
+				BOX		   *query,
+						   *key;
+
+				query = PG_GETARG_BOX_P(1);
+				key = DatumGetBoxP(entry->key);
+
+				result = (key->high.x >= query->low.x &&
+						  key->low.x <= query->high.x &&
+						  key->high.y >= query->low.y &&
+						  key->low.y <= query->high.y);
+				*recheck = false;
+			}
 			break;
 		case PolygonStrategyNumberGroup:
 			{
@@ -1403,8 +1447,9 @@ gist_point_consistent(PG_FUNCTION_ARGS)
 			}
 			break;
 		default:
-			elog(ERROR, "unknown strategy number: %d", strategy);
+			elog(ERROR, "unrecognized strategy number: %d", strategy);
 			result = false;		/* keep compiler quiet */
+			break;
 	}
 
 	PG_RETURN_BOOL(result);
@@ -1426,8 +1471,9 @@ gist_point_distance(PG_FUNCTION_ARGS)
 									   PG_GETARG_POINT_P(1));
 			break;
 		default:
-			elog(ERROR, "unknown strategy number: %d", strategy);
+			elog(ERROR, "unrecognized strategy number: %d", strategy);
 			distance = 0.0;		/* keep compiler quiet */
+			break;
 	}
 
 	PG_RETURN_FLOAT8(distance);

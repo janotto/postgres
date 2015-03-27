@@ -1,10 +1,11 @@
 # contrib/cube/Makefile
 
 MODULE_big = cube
-OBJS= cube.o cubeparse.o
+OBJS= cube.o cubeparse.o $(WIN32RES)
 
 EXTENSION = cube
 DATA = cube--1.0.sql cube--unpackaged--1.0.sql
+PGFILEDESC = "cube - multidimensional cube data type"
 
 REGRESS = cube
 
@@ -26,20 +27,6 @@ endif
 
 # cubescan is compiled as part of cubeparse
 cubeparse.o: cubescan.c
-
-cubeparse.c: cubeparse.y
-ifdef BISON
-	$(BISON) $(BISONFLAGS) -o $@ $<
-else
-	@$(missing) bison $< $@
-endif
-
-cubescan.c: cubescan.l
-ifdef FLEX
-	$(FLEX) $(FLEXFLAGS) -o'$@' $<
-else
-	@$(missing) flex $< $@
-endif
 
 distprep: cubeparse.c cubescan.c
 

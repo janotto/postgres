@@ -23,15 +23,6 @@
 
 PG_MODULE_MAGIC;
 
-extern int	seg_yyparse();
-extern void seg_yyerror(const char *message);
-extern void seg_scanner_init(const char *str);
-extern void seg_scanner_finish(void);
-
-/*
-extern int	 seg_yydebug;
-*/
-
 /*
  * Auxiliary data structure for picksplit method.
  */
@@ -51,13 +42,6 @@ PG_FUNCTION_INFO_V1(seg_size);
 PG_FUNCTION_INFO_V1(seg_lower);
 PG_FUNCTION_INFO_V1(seg_upper);
 PG_FUNCTION_INFO_V1(seg_center);
-
-Datum		seg_in(PG_FUNCTION_ARGS);
-Datum		seg_out(PG_FUNCTION_ARGS);
-Datum		seg_size(PG_FUNCTION_ARGS);
-Datum		seg_lower(PG_FUNCTION_ARGS);
-Datum		seg_upper(PG_FUNCTION_ARGS);
-Datum		seg_center(PG_FUNCTION_ARGS);
 
 /*
 ** GiST support methods
@@ -110,7 +94,6 @@ bool		seg_different(SEG *a, SEG *b);
 ** Auxiliary funxtions
 */
 static int	restore(char *s, float val, int n);
-int			significant_digits(char *s);
 
 
 /*****************************************************************************
@@ -126,7 +109,7 @@ seg_in(PG_FUNCTION_ARGS)
 	seg_scanner_init(str);
 
 	if (seg_yyparse(result) != 0)
-		seg_yyerror("bogus input");
+		seg_yyerror(result, "bogus input");
 
 	seg_scanner_finish();
 

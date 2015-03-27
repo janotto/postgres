@@ -5,112 +5,136 @@
  *
  * Author: Magnus Hagander <magnus@hagander.net>
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		  src/bin/pg_basebackup/pg_receivexlog.c
  *-------------------------------------------------------------------------
  */
 
-/*
- * We have to use postgres.h not postgres_fe.h here, because there's so much
- * backend-only stuff in the XLOG include files we need.  But we need a
- * frontend-ish environment otherwise.	Hence this ugly hack.
- */
-#define FRONTEND 1
-#include "postgres.h"
-#include "libpq-fe.h"
-#include "libpq/pqsignal.h"
-#include "access/xlog_internal.h"
-
-#include "receivelog.h"
-#include "streamutil.h"
+#include "postgres_fe.h"
 
 #include <dirent.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "libpq-fe.h"
+#include "access/xlog_internal.h"
 #include "getopt_long.h"
 
+#include "receivelog.h"
+#include "streamutil.h"
+
+
+/* Time to sleep between reconnection attempts */
+#define RECONNECT_SLEEP_TIME 5
+
 /* Global options */
-char	   *basedir = NULL;
-int			verbose = 0;
-int			standby_message_timeout = 10;		/* 10 sec = default */
-volatile bool time_to_abort = false;
+static char *basedir = NULL;
+static int	verbose = 0;
+static int	noloop = 0;
+static int	standby_message_timeout = 10 * 1000;		/* 10 sec = default */
+static volatile bool time_to_abort = false;
+static bool do_create_slot = false;
+static bool do_drop_slot = false;
+static bool synchronous = false;
 
 
 static void usage(void);
-static XLogRecPtr FindStreamingStart(XLogRecPtr currentpos, uint32 currenttimeline);
-static void StreamLog();
-static bool segment_callback(XLogRecPtr segendpos, uint32 timeline);
+static DIR* get_destination_dir(char *dest_folder);
+static void close_destination_dir(DIR *dest_dir, char *dest_folder);
+static XLogRecPtr FindStreamingStart(uint32 *tli);
+static void StreamLog(void);
+static bool stop_streaming(XLogRecPtr segendpos, uint32 timeline,
+			   bool segment_finished);
+
+#define disconnect_and_exit(code)				\
+	{											\
+	if (conn != NULL) PQfinish(conn);			\
+	exit(code);									\
+	}
+
 
 static void
 usage(void)
 {
-	printf(_("%s receives PostgreSQL streaming transaction logs\n\n"),
+	printf(_("%s receives PostgreSQL streaming transaction logs.\n\n"),
 		   progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
-	printf(_("\nOptions controlling the output:\n"));
-	printf(_("  -D, --dir=directory       receive xlog files into this directory\n"));
-	printf(_("\nGeneral options:\n"));
-	printf(_("  -v, --verbose             output verbose messages\n"));
-	printf(_("  -?, --help                show this help, then exit\n"));
-	printf(_("  -V, --version             output version information, then exit\n"));
+	printf(_("\nOptions:\n"));
+	printf(_("  -D, --directory=DIR    receive transaction log files into this directory\n"));
+	printf(_("  -n, --no-loop          do not loop on connection lost\n"));
+	printf(_("  -s, --status-interval=SECS\n"
+			 "                         time between status packets sent to server (default: %d)\n"), (standby_message_timeout / 1000));
+	printf(_("  -S, --slot=SLOTNAME    replication slot to use\n"));
+	printf(_("      --synchronous      flush transaction log immediately after writing\n"));
+	printf(_("  -v, --verbose          output verbose messages\n"));
+	printf(_("  -V, --version          output version information, then exit\n"));
+	printf(_("  -?, --help             show this help, then exit\n"));
 	printf(_("\nConnection options:\n"));
-	printf(_("  -s, --statusint=INTERVAL time between status packets sent to server (in seconds)\n"));
-	printf(_("  -h, --host=HOSTNAME      database server host or socket directory\n"));
-	printf(_("  -p, --port=PORT          database server port number\n"));
-	printf(_("  -U, --username=NAME      connect as specified database user\n"));
-	printf(_("  -w, --no-password        never prompt for password\n"));
-	printf(_("  -W, --password           force password prompt (should happen automatically)\n"));
+	printf(_("  -d, --dbname=CONNSTR   connection string\n"));
+	printf(_("  -h, --host=HOSTNAME    database server host or socket directory\n"));
+	printf(_("  -p, --port=PORT        database server port number\n"));
+	printf(_("  -U, --username=NAME    connect as specified database user\n"));
+	printf(_("  -w, --no-password      never prompt for password\n"));
+	printf(_("  -W, --password         force password prompt (should happen automatically)\n"));
+	printf(_("\nOptional actions:\n"));
+	printf(_("      --create-slot      create a new replication slot (for the slot's name see --slot)\n"));
+	printf(_("      --drop-slot        drop the replication slot (for the slot's name see --slot)\n"));
 	printf(_("\nReport bugs to <pgsql-bugs@postgresql.org>.\n"));
 }
 
 static bool
-segment_callback(XLogRecPtr segendpos, uint32 timeline)
+stop_streaming(XLogRecPtr xlogpos, uint32 timeline, bool segment_finished)
 {
-	if (verbose)
+	static uint32 prevtimeline = 0;
+	static XLogRecPtr prevpos = InvalidXLogRecPtr;
+
+	/* we assume that we get called once at the end of each segment */
+	if (verbose && segment_finished)
 		fprintf(stderr, _("%s: finished segment at %X/%X (timeline %u)\n"),
-				progname, segendpos.xlogid, segendpos.xrecoff, timeline);
+				progname, (uint32) (xlogpos >> 32), (uint32) xlogpos,
+				timeline);
 
 	/*
-	 * Never abort from this - we handle all aborting in continue_streaming()
+	 * Note that we report the previous, not current, position here. After a
+	 * timeline switch, xlogpos points to the beginning of the segment because
+	 * that's where we always begin streaming. Reporting the end of previous
+	 * timeline isn't totally accurate, because the next timeline can begin
+	 * slightly before the end of the WAL that we received on the previous
+	 * timeline, but it's close enough for reporting purposes.
 	 */
-	return false;
-}
+	if (prevtimeline != 0 && prevtimeline != timeline)
+		fprintf(stderr, _("%s: switched to timeline %u at %X/%X\n"),
+				progname, timeline,
+				(uint32) (prevpos >> 32), (uint32) prevpos);
 
-static bool
-continue_streaming(void)
-{
+	prevtimeline = timeline;
+	prevpos = xlogpos;
+
 	if (time_to_abort)
 	{
-		fprintf(stderr, _("%s: received interrupt signal, exiting.\n"),
+		fprintf(stderr, _("%s: received interrupt signal, exiting\n"),
 				progname);
 		return true;
 	}
 	return false;
 }
 
-/*
- * Determine starting location for streaming, based on:
- * 1. If there are existing xlog segments, start at the end of the last one
- *    that is complete (size matches XLogSegSize)
- * 2. If no valid xlog exists, start from the beginning of the current
- *	  WAL segment.
- */
-static XLogRecPtr
-FindStreamingStart(XLogRecPtr currentpos, uint32 currenttimeline)
-{
-	DIR		   *dir;
-	struct dirent *dirent;
-	int			i;
-	bool		b;
-	uint32		high_log = 0;
-	uint32		high_seg = 0;
 
-	dir = opendir(basedir);
+/*
+ * Get destination directory.
+ */
+static DIR*
+get_destination_dir(char *dest_folder)
+{
+	DIR *dir;
+
+	Assert(dest_folder != NULL);
+	dir = opendir(dest_folder);
 	if (dir == NULL)
 	{
 		fprintf(stderr, _("%s: could not open directory \"%s\": %s\n"),
@@ -118,95 +142,142 @@ FindStreamingStart(XLogRecPtr currentpos, uint32 currenttimeline)
 		disconnect_and_exit(1);
 	}
 
-	while ((dirent = readdir(dir)) != NULL)
+	return dir;
+}
+
+
+/*
+ * Close existing directory.
+ */
+static void
+close_destination_dir(DIR *dest_dir, char *dest_folder)
+{
+	Assert(dest_dir != NULL && dest_folder != NULL);
+	if (closedir(dest_dir))
 	{
-		char		fullpath[MAXPGPATH];
-		struct stat statbuf;
-		uint32		tli,
-					log,
-					seg;
+		fprintf(stderr, _("%s: could not close directory \"%s\": %s\n"),
+				progname, dest_folder, strerror(errno));
+		disconnect_and_exit(1);
+	}
+}
 
-		if (strcmp(dirent->d_name, ".") == 0 || strcmp(dirent->d_name, "..") == 0)
-			continue;
 
-		/* xlog files are always 24 characters */
-		if (strlen(dirent->d_name) != 24)
-			continue;
+/*
+ * Determine starting location for streaming, based on any existing xlog
+ * segments in the directory. We start at the end of the last one that is
+ * complete (size matches XLogSegSize), on the timeline with highest ID.
+ *
+ * If there are no WAL files in the directory, returns InvalidXLogRecPtr.
+ */
+static XLogRecPtr
+FindStreamingStart(uint32 *tli)
+{
+	DIR		   *dir;
+	struct dirent *dirent;
+	XLogSegNo	high_segno = 0;
+	uint32		high_tli = 0;
+	bool		high_ispartial = false;
 
-		/* Filenames are always made out of 0-9 and A-F */
-		b = false;
-		for (i = 0; i < 24; i++)
+	dir = get_destination_dir(basedir);
+
+	while (errno = 0, (dirent = readdir(dir)) != NULL)
+	{
+		uint32		tli;
+		XLogSegNo	segno;
+		bool		ispartial;
+
+		/*
+		 * Check if the filename looks like an xlog file, or a .partial file.
+		 * Xlog files are always 24 characters, and .partial files are 32
+		 * characters.
+		 */
+		if (strlen(dirent->d_name) == 24)
 		{
-			if (!(dirent->d_name[i] >= '0' && dirent->d_name[i] <= '9') &&
-				!(dirent->d_name[i] >= 'A' && dirent->d_name[i] <= 'F'))
-			{
-				b = true;
-				break;
-			}
+			if (strspn(dirent->d_name, "0123456789ABCDEF") != 24)
+				continue;
+			ispartial = false;
 		}
-		if (b)
+		else if (strlen(dirent->d_name) == 32)
+		{
+			if (strspn(dirent->d_name, "0123456789ABCDEF") != 24)
+				continue;
+			if (strcmp(&dirent->d_name[24], ".partial") != 0)
+				continue;
+			ispartial = true;
+		}
+		else
 			continue;
 
 		/*
 		 * Looks like an xlog file. Parse its position.
 		 */
-		if (sscanf(dirent->d_name, "%08X%08X%08X", &tli, &log, &seg) != 3)
-		{
-			fprintf(stderr, _("%s: could not parse xlog filename \"%s\"\n"),
-					progname, dirent->d_name);
-			disconnect_and_exit(1);
-		}
+		XLogFromFileName(dirent->d_name, &tli, &segno);
 
-		/* Ignore any files that are for another timeline */
-		if (tli != currenttimeline)
-			continue;
-
-		/* Check if this is a completed segment or not */
-		snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
-		if (stat(fullpath, &statbuf) != 0)
+		/*
+		 * Check that the segment has the right size, if it's supposed to be
+		 * completed.
+		 */
+		if (!ispartial)
 		{
-			fprintf(stderr, _("%s: could not stat file \"%s\": %s\n"),
-					progname, fullpath, strerror(errno));
-			disconnect_and_exit(1);
-		}
+			struct stat statbuf;
+			char		fullpath[MAXPGPATH];
 
-		if (statbuf.st_size == XLOG_SEG_SIZE)
-		{
-			/* Completed segment */
-			if (log > high_log ||
-				(log == high_log && seg > high_seg))
+			snprintf(fullpath, sizeof(fullpath), "%s/%s", basedir, dirent->d_name);
+			if (stat(fullpath, &statbuf) != 0)
 			{
-				high_log = log;
-				high_seg = seg;
+				fprintf(stderr, _("%s: could not stat file \"%s\": %s\n"),
+						progname, fullpath, strerror(errno));
+				disconnect_and_exit(1);
+			}
+
+			if (statbuf.st_size != XLOG_SEG_SIZE)
+			{
+				fprintf(stderr,
+						_("%s: segment file \"%s\" has incorrect size %d, skipping\n"),
+						progname, dirent->d_name, (int) statbuf.st_size);
 				continue;
 			}
 		}
-		else
+
+		/* Looks like a valid segment. Remember that we saw it. */
+		if ((segno > high_segno) ||
+			(segno == high_segno && tli > high_tli) ||
+			(segno == high_segno && tli == high_tli && high_ispartial && !ispartial))
 		{
-			fprintf(stderr, _("%s: segment file '%s' is incorrect size %d, skipping\n"),
-					progname, dirent->d_name, (int) statbuf.st_size);
-			continue;
+			high_segno = segno;
+			high_tli = tli;
+			high_ispartial = ispartial;
 		}
 	}
 
-	closedir(dir);
+	if (errno)
+	{
+		fprintf(stderr, _("%s: could not read directory \"%s\": %s\n"),
+				progname, basedir, strerror(errno));
+		disconnect_and_exit(1);
+	}
 
-	if (high_log > 0 || high_seg > 0)
+	close_destination_dir(dir, basedir);
+
+	if (high_segno > 0)
 	{
 		XLogRecPtr	high_ptr;
+
 		/*
-		 * Move the starting pointer to the start of the next segment,
-		 * since the highest one we've seen was completed.
+		 * Move the starting pointer to the start of the next segment, if the
+		 * highest one we saw was completed. Otherwise start streaming from
+		 * the beginning of the .partial segment.
 		 */
-		NextLogSeg(high_log, high_seg);
+		if (!high_ispartial)
+			high_segno++;
 
-		high_ptr.xlogid = high_log;
-		high_ptr.xrecoff = high_seg * XLOG_SEG_SIZE;
+		XLogSegNoOffsetToRecPtr(high_segno, 0, high_ptr);
 
+		*tli = high_tli;
 		return high_ptr;
 	}
 	else
-		return currentpos;
+		return InvalidXLogRecPtr;
 }
 
 /*
@@ -215,63 +286,66 @@ FindStreamingStart(XLogRecPtr currentpos, uint32 currenttimeline)
 static void
 StreamLog(void)
 {
-	PGresult   *res;
-	uint32		timeline;
-	XLogRecPtr	startpos;
+	XLogRecPtr	startpos, serverpos;
+	TimeLineID	starttli, servertli;
 
 	/*
 	 * Connect in replication mode to the server
 	 */
-	conn = GetConnection();
+	if (conn == NULL)
+		conn = GetConnection();
+	if (!conn)
+		/* Error message already written in GetConnection() */
+		return;
+
+	if (!CheckServerVersionForStreaming(conn))
+	{
+		/*
+		 * Error message already written in CheckServerVersionForStreaming().
+		 * There's no hope of recovering from a version mismatch, so don't
+		 * retry.
+		 */
+		disconnect_and_exit(1);
+	}
 
 	/*
-	 * Run IDENTIFY_SYSTEM so we can get the timeline and current xlog
-	 * position.
+	 * Identify server, obtaining start LSN position and current timeline ID
+	 * at the same time, necessary if not valid data can be found in the
+	 * existing output directory.
 	 */
-	res = PQexec(conn, "IDENTIFY_SYSTEM");
-	if (PQresultStatus(res) != PGRES_TUPLES_OK)
-	{
-		fprintf(stderr, _("%s: could not identify system: %s\n"),
-				progname, PQerrorMessage(conn));
+	if (!RunIdentifySystem(conn, NULL, &servertli, &serverpos, NULL))
 		disconnect_and_exit(1);
-	}
-	if (PQntuples(res) != 1 || PQnfields(res) != 3)
-	{
-		fprintf(stderr, _("%s: could not identify system, got %i rows and %i fields\n"),
-				progname, PQntuples(res), PQnfields(res));
-		disconnect_and_exit(1);
-	}
-	timeline = atoi(PQgetvalue(res, 0, 1));
-	if (sscanf(PQgetvalue(res, 0, 2), "%X/%X", &startpos.xlogid, &startpos.xrecoff) != 2)
-	{
-		fprintf(stderr, _("%s: could not parse log start position from value \"%s\"\n"),
-				progname, PQgetvalue(res, 0, 2));
-		disconnect_and_exit(1);
-	}
-	PQclear(res);
 
 	/*
 	 * Figure out where to start streaming.
 	 */
-	startpos = FindStreamingStart(startpos, timeline);
+	startpos = FindStreamingStart(&starttli);
+	if (startpos == InvalidXLogRecPtr)
+	{
+		startpos = serverpos;
+		starttli = servertli;
+	}
 
 	/*
 	 * Always start streaming at the beginning of a segment
 	 */
-	startpos.xrecoff -= startpos.xrecoff % XLOG_SEG_SIZE;
+	startpos -= startpos % XLOG_SEG_SIZE;
 
 	/*
 	 * Start the replication
 	 */
 	if (verbose)
-		fprintf(stderr, _("%s: starting log streaming at %X/%X (timeline %u)\n"),
-				progname, startpos.xlogid, startpos.xrecoff, timeline);
+		fprintf(stderr,
+				_("%s: starting log streaming at %X/%X (timeline %u)\n"),
+				progname, (uint32) (startpos >> 32), (uint32) startpos,
+				starttli);
 
-	ReceiveXlogStream(conn, startpos, timeline, NULL, basedir,
-					  segment_callback, continue_streaming,
-					  standby_message_timeout);
+	ReceiveXlogStream(conn, startpos, starttli, NULL, basedir,
+					  stop_streaming, standby_message_timeout, ".partial",
+					  synchronous, false);
 
 	PQfinish(conn);
+	conn = NULL;
 }
 
 /*
@@ -285,7 +359,6 @@ sigint_handler(int signum)
 {
 	time_to_abort = true;
 }
-
 #endif
 
 int
@@ -294,19 +367,27 @@ main(int argc, char **argv)
 	static struct option long_options[] = {
 		{"help", no_argument, NULL, '?'},
 		{"version", no_argument, NULL, 'V'},
-		{"dir", required_argument, NULL, 'D'},
+		{"directory", required_argument, NULL, 'D'},
+		{"dbname", required_argument, NULL, 'd'},
 		{"host", required_argument, NULL, 'h'},
 		{"port", required_argument, NULL, 'p'},
 		{"username", required_argument, NULL, 'U'},
+		{"no-loop", no_argument, NULL, 'n'},
 		{"no-password", no_argument, NULL, 'w'},
 		{"password", no_argument, NULL, 'W'},
-		{"statusint", required_argument, NULL, 's'},
+		{"status-interval", required_argument, NULL, 's'},
+		{"slot", required_argument, NULL, 'S'},
 		{"verbose", no_argument, NULL, 'v'},
+/* action */
+		{"create-slot", no_argument, NULL, 1},
+		{"drop-slot", no_argument, NULL, 2},
+		{"synchronous", no_argument, NULL, 3},
 		{NULL, 0, NULL, 0}
 	};
-	int			c;
 
+	int			c;
 	int			option_index;
+	char	   *db_name;
 
 	progname = get_progname(argv[0]);
 	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_receivexlog"));
@@ -318,24 +399,27 @@ main(int argc, char **argv)
 			usage();
 			exit(0);
 		}
-		else if (strcmp(argv[1], "-V") == 0
-				 || strcmp(argv[1], "--version") == 0)
+		else if (strcmp(argv[1], "-V") == 0 ||
+				 strcmp(argv[1], "--version") == 0)
 		{
 			puts("pg_receivexlog (PostgreSQL) " PG_VERSION);
 			exit(0);
 		}
 	}
 
-	while ((c = getopt_long(argc, argv, "D:h:p:U:s:wWv",
+	while ((c = getopt_long(argc, argv, "D:d:h:p:U:s:S:nwWv",
 							long_options, &option_index)) != -1)
 	{
 		switch (c)
 		{
 			case 'D':
-				basedir = xstrdup(optarg);
+				basedir = pg_strdup(optarg);
+				break;
+			case 'd':
+				connection_string = pg_strdup(optarg);
 				break;
 			case 'h':
-				dbhost = xstrdup(optarg);
+				dbhost = pg_strdup(optarg);
 				break;
 			case 'p':
 				if (atoi(optarg) <= 0)
@@ -344,10 +428,10 @@ main(int argc, char **argv)
 							progname, optarg);
 					exit(1);
 				}
-				dbport = xstrdup(optarg);
+				dbport = pg_strdup(optarg);
 				break;
 			case 'U':
-				dbuser = xstrdup(optarg);
+				dbuser = pg_strdup(optarg);
 				break;
 			case 'w':
 				dbgetpassword = -1;
@@ -356,7 +440,7 @@ main(int argc, char **argv)
 				dbgetpassword = 1;
 				break;
 			case 's':
-				standby_message_timeout = atoi(optarg);
+				standby_message_timeout = atoi(optarg) * 1000;
 				if (standby_message_timeout < 0)
 				{
 					fprintf(stderr, _("%s: invalid status interval \"%s\"\n"),
@@ -364,8 +448,24 @@ main(int argc, char **argv)
 					exit(1);
 				}
 				break;
+			case 'S':
+				replication_slot = pg_strdup(optarg);
+				break;
+			case 'n':
+				noloop = 1;
+				break;
 			case 'v':
 				verbose++;
+				break;
+/* action */
+			case 1:
+				do_create_slot = true;
+				break;
+			case 2:
+				do_drop_slot = true;
+				break;
+			case 3:
+				synchronous = true;
 				break;
 			default:
 
@@ -391,10 +491,26 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
+	if (replication_slot == NULL && (do_drop_slot || do_create_slot))
+	{
+		fprintf(stderr, _("%s: --create-slot and --drop-slot need a slot to be specified using --slot\n"), progname);
+		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+				progname);
+		exit(1);
+	}
+
+	if (do_drop_slot && do_create_slot)
+	{
+		fprintf(stderr, _("%s: cannot use --create-slot together with --drop-slot\n"), progname);
+		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
+				progname);
+		exit(1);
+	}
+
 	/*
 	 * Required arguments
 	 */
-	if (basedir == NULL)
+	if (basedir == NULL && !do_drop_slot)
 	{
 		fprintf(stderr, _("%s: no target directory specified\n"), progname);
 		fprintf(stderr, _("Try \"%s --help\" for more information.\n"),
@@ -402,11 +518,102 @@ main(int argc, char **argv)
 		exit(1);
 	}
 
+	/*
+	 * Check existence of destination folder.
+	 */
+	if (!do_drop_slot)
+	{
+		DIR *dir = get_destination_dir(basedir);
+		close_destination_dir(dir, basedir);
+	}
+
 #ifndef WIN32
 	pqsignal(SIGINT, sigint_handler);
 #endif
 
-	StreamLog();
+	/*
+	 * Obtain a connection before doing anything.
+	 */
+	conn = GetConnection();
+	if (!conn)
+		/* error message already written in GetConnection() */
+		exit(1);
 
-	exit(0);
+	/*
+	 * Run IDENTIFY_SYSTEM to make sure we've successfully have established a
+	 * replication connection and haven't connected using a database specific
+	 * connection.
+	 */
+	if (!RunIdentifySystem(conn, NULL, NULL, NULL, &db_name))
+		disconnect_and_exit(1);
+
+	/*
+	 * Check that there is a database associated with connection, none
+	 * should be defined in this context.
+	 */
+	if (db_name)
+	{
+		fprintf(stderr,
+				_("%s: replication connection using slot \"%s\" is unexpectedly database specific\n"),
+				progname, replication_slot);
+		disconnect_and_exit(1);
+	}
+
+	/*
+	 * Drop a replication slot.
+	 */
+	if (do_drop_slot)
+	{
+		if (verbose)
+			fprintf(stderr,
+					_("%s: dropping replication slot \"%s\"\n"),
+					progname, replication_slot);
+
+		if (!DropReplicationSlot(conn, replication_slot))
+			disconnect_and_exit(1);
+		disconnect_and_exit(0);
+	}
+
+	/* Create a replication slot */
+	if (do_create_slot)
+	{
+		if (verbose)
+			fprintf(stderr,
+					_("%s: creating replication slot \"%s\"\n"),
+					progname, replication_slot);
+
+		if (!CreateReplicationSlot(conn, replication_slot, NULL, NULL, true))
+			disconnect_and_exit(1);
+	}
+
+	/*
+	 * Don't close the connection here so that subsequent StreamLog()
+	 * can reuse it.
+	 */
+
+	while (true)
+	{
+		StreamLog();
+		if (time_to_abort)
+		{
+			/*
+			 * We've been Ctrl-C'ed. That's not an error, so exit without an
+			 * errorcode.
+			 */
+			exit(0);
+		}
+		else if (noloop)
+		{
+			fprintf(stderr, _("%s: disconnected\n"), progname);
+			exit(1);
+		}
+		else
+		{
+			fprintf(stderr,
+			/* translator: check source for value for %d */
+					_("%s: disconnected; waiting %d seconds to try again\n"),
+					progname, RECONNECT_SLEEP_TIME);
+			pg_usleep(RECONNECT_SLEEP_TIME * 1000000);
+		}
+	}
 }

@@ -1,10 +1,10 @@
 /*-------------------------------------------------------------------------
  *
  * date.h
- *	  Definitions for the SQL92 "date" and "time" types.
+ *	  Definitions for the SQL "date" and "time" types.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/date.h
@@ -35,11 +35,9 @@ typedef struct
 
 /*
  * Infinity and minus infinity must be the max and min values of DateADT.
- * We could use INT_MIN and INT_MAX here, but seems better to not assume that
- * int32 == int.
  */
-#define DATEVAL_NOBEGIN		((DateADT) (-0x7fffffff - 1))
-#define DATEVAL_NOEND		((DateADT) 0x7fffffff)
+#define DATEVAL_NOBEGIN		((DateADT) INT32_MIN)
+#define DATEVAL_NOEND		((DateADT) INT32_MAX)
 
 #define DATE_NOBEGIN(j)		((j) = DATEVAL_NOBEGIN)
 #define DATE_IS_NOBEGIN(j)	((j) == DATEVAL_NOBEGIN)
@@ -97,6 +95,7 @@ extern Datum date_in(PG_FUNCTION_ARGS);
 extern Datum date_out(PG_FUNCTION_ARGS);
 extern Datum date_recv(PG_FUNCTION_ARGS);
 extern Datum date_send(PG_FUNCTION_ARGS);
+extern Datum make_date(PG_FUNCTION_ARGS);
 extern Datum date_eq(PG_FUNCTION_ARGS);
 extern Datum date_ne(PG_FUNCTION_ARGS);
 extern Datum date_lt(PG_FUNCTION_ARGS);
@@ -154,6 +153,7 @@ extern Datum time_recv(PG_FUNCTION_ARGS);
 extern Datum time_send(PG_FUNCTION_ARGS);
 extern Datum timetypmodin(PG_FUNCTION_ARGS);
 extern Datum timetypmodout(PG_FUNCTION_ARGS);
+extern Datum make_time(PG_FUNCTION_ARGS);
 extern Datum time_transform(PG_FUNCTION_ARGS);
 extern Datum time_scale(PG_FUNCTION_ARGS);
 extern Datum time_eq(PG_FUNCTION_ARGS);

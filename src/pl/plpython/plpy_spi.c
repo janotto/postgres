@@ -6,11 +6,13 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
-#include "executor/spi_priv.h"
+#include "executor/spi.h"
 #include "mb/pg_wchar.h"
 #include "parser/parse_type.h"
+#include "utils/memutils.h"
 #include "utils/syscache.h"
 
 #include "plpython.h"
@@ -18,6 +20,7 @@
 #include "plpy_spi.h"
 
 #include "plpy_elog.h"
+#include "plpy_main.h"
 #include "plpy_planobject.h"
 #include "plpy_plpymodule.h"
 #include "plpy_procedure.h"
@@ -90,7 +93,6 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			HeapTuple	typeTup;
 			Oid			typeId;
 			int32		typmod;
-			Form_pg_type typeStruct;
 
 			optr = PySequence_GetItem(list, i);
 			if (PyString_Check(optr))
@@ -110,7 +112,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			 *information for input conversion.
 			 ********************************************************/
 
-			parseTypeString(sptr, &typeId, &typmod);
+			parseTypeString(sptr, &typeId, &typmod, false);
 
 			typeTup = SearchSysCache1(TYPEOID,
 									  ObjectIdGetDatum(typeId));
@@ -126,13 +128,7 @@ PLy_spi_prepare(PyObject *self, PyObject *args)
 			optr = NULL;
 
 			plan->types[i] = typeId;
-			typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
-			if (typeStruct->typtype != TYPTYPE_COMPOSITE)
-				PLy_output_datum_func(&plan->args[i], typeTup);
-			else
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				   errmsg("plpy.prepare does not support composite types")));
+			PLy_output_datum_func(&plan->args[i], typeTup);
 			ReleaseSysCache(typeTup);
 		}
 
@@ -236,6 +232,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 
 	PG_TRY();
 	{
+		PLyExecutionContext *exec_ctx = PLy_current_execution_context();
 		char	   *volatile nulls;
 		volatile int j;
 
@@ -281,7 +278,7 @@ PLy_spi_execute_plan(PyObject *ob, PyObject *list, long limit)
 		}
 
 		rv = SPI_execute_plan(plan->plan, plan->values, nulls,
-							  PLy_curr_procedure->fn_readonly, limit);
+							  exec_ctx->curr_proc->fn_readonly, limit);
 		ret = PLy_spi_execute_fetch_result(SPI_tuptable, SPI_processed, rv);
 
 		if (nargs > 0)
@@ -338,7 +335,7 @@ PLy_spi_execute_query(char *query, long limit)
 	int			rv;
 	volatile MemoryContext oldcontext;
 	volatile ResourceOwner oldowner;
-	PyObject   *ret;
+	PyObject   *ret = NULL;
 
 	oldcontext = CurrentMemoryContext;
 	oldowner = CurrentResourceOwner;
@@ -347,8 +344,10 @@ PLy_spi_execute_query(char *query, long limit)
 
 	PG_TRY();
 	{
+		PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+
 		pg_verifymbstr(query, strlen(query), false);
-		rv = SPI_execute(query, PLy_curr_procedure->fn_readonly, limit);
+		rv = SPI_execute(query, exec_ctx->curr_proc->fn_readonly, limit);
 		ret = PLy_spi_execute_fetch_result(SPI_tuptable, SPI_processed, rv);
 
 		PLy_spi_subtransaction_commit(oldcontext, oldowner);
@@ -362,6 +361,7 @@ PLy_spi_execute_query(char *query, long limit)
 
 	if (rv < 0)
 	{
+		Py_XDECREF(ret);
 		PLy_exception_set(PLy_exc_spi_error,
 						  "SPI_execute failed: %s",
 						  SPI_result_code_string(rv));
@@ -398,7 +398,7 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
 		oldcontext = CurrentMemoryContext;
 		PG_TRY();
 		{
-			result->tupdesc = CreateTupleDescCopy(tuptable->tupdesc);
+			MemoryContext oldcontext2;
 
 			if (rows)
 			{
@@ -408,23 +408,32 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
 				PLy_input_tuple_funcs(&args, tuptable->tupdesc);
 				for (i = 0; i < rows; i++)
 				{
-					PyObject   *row = PLyDict_FromTuple(&args, tuptable->vals[i],
+					PyObject   *row = PLyDict_FromTuple(&args,
+														tuptable->vals[i],
 														tuptable->tupdesc);
 
 					PyList_SetItem(result->rows, i, row);
 				}
 			}
+
+			/*
+			 * Save tuple descriptor for later use by result set metadata
+			 * functions.  Save it in TopMemoryContext so that it survives
+			 * outside of an SPI context.  We trust that PLy_result_dealloc()
+			 * will clean it up when the time is right.  (Do this as late as
+			 * possible, to minimize the number of ways the tupdesc could get
+			 * leaked due to errors.)
+			 */
+			oldcontext2 = MemoryContextSwitchTo(TopMemoryContext);
+			result->tupdesc = CreateTupleDescCopy(tuptable->tupdesc);
+			MemoryContextSwitchTo(oldcontext2);
 		}
 		PG_CATCH();
 		{
 			MemoryContextSwitchTo(oldcontext);
-			if (!PyErr_Occurred())
-				PLy_exception_set(PLy_exc_error,
-					   "unrecognized error in PLy_spi_execute_fetch_result");
 			PLy_typeinfo_dealloc(&args);
-			SPI_freetuptable(tuptable);
 			Py_DECREF(result);
-			return NULL;
+			PG_RE_THROW();
 		}
 		PG_END_TRY();
 
@@ -440,22 +449,22 @@ PLy_spi_execute_fetch_result(SPITupleTable *tuptable, int rows, int status)
  *
  * Usage:
  *
- *  MemoryContext oldcontext = CurrentMemoryContext;
- *  ResourceOwner oldowner = CurrentResourceOwner;
+ *	MemoryContext oldcontext = CurrentMemoryContext;
+ *	ResourceOwner oldowner = CurrentResourceOwner;
  *
- *  PLy_spi_subtransaction_begin(oldcontext, oldowner);
- *  PG_TRY();
- *  {
- *      <call SPI functions>
- *      PLy_spi_subtransaction_commit(oldcontext, oldowner);
- *  }
- *  PG_CATCH();
- *  {
- *      <do cleanup>
- *      PLy_spi_subtransaction_abort(oldcontext, oldowner);
- *      return NULL;
- *  }
- *  PG_END_TRY();
+ *	PLy_spi_subtransaction_begin(oldcontext, oldowner);
+ *	PG_TRY();
+ *	{
+ *		<call SPI functions>
+ *		PLy_spi_subtransaction_commit(oldcontext, oldowner);
+ *	}
+ *	PG_CATCH();
+ *	{
+ *		<do cleanup>
+ *		PLy_spi_subtransaction_abort(oldcontext, oldowner);
+ *		return NULL;
+ *	}
+ *	PG_END_TRY();
  *
  * These utilities take care of restoring connection to the SPI manager and
  * setting a Python exception in case of an abort.
@@ -477,8 +486,8 @@ PLy_spi_subtransaction_commit(MemoryContext oldcontext, ResourceOwner oldowner)
 	CurrentResourceOwner = oldowner;
 
 	/*
-	 * AtEOSubXact_SPI() should not have popped any SPI context, but just
-	 * in case it did, make sure we remain connected.
+	 * AtEOSubXact_SPI() should not have popped any SPI context, but just in
+	 * case it did, make sure we remain connected.
 	 */
 	SPI_restore_connection();
 }
@@ -501,8 +510,8 @@ PLy_spi_subtransaction_abort(MemoryContext oldcontext, ResourceOwner oldowner)
 	CurrentResourceOwner = oldowner;
 
 	/*
-	 * If AtEOSubXact_SPI() popped any SPI context of the subxact, it will have
-	 * left us in a disconnected state.  We need this hack to return to
+	 * If AtEOSubXact_SPI() popped any SPI context of the subxact, it will
+	 * have left us in a disconnected state.  We need this hack to return to
 	 * connected state.
 	 */
 	SPI_restore_connection();

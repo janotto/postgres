@@ -3,7 +3,7 @@
  * walsender_private.h
  *	  Private definitions from replication/walsender.c.
  *
- * Portions Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2015, PostgreSQL Global Development Group
  *
  * src/include/replication/walsender_private.h
  *
@@ -35,7 +35,8 @@ typedef struct WalSnd
 	pid_t		pid;			/* this walsender's process id, or 0 */
 	WalSndState state;			/* this walsender's state */
 	XLogRecPtr	sentPtr;		/* WAL has been sent up to this point */
-	bool		needreload;		/* does currently-open file need to be reloaded? */
+	bool		needreload;		/* does currently-open file need to be
+								 * reloaded? */
 
 	/*
 	 * The xlog locations that have been written, flushed, and applied by
@@ -50,10 +51,10 @@ typedef struct WalSnd
 	slock_t		mutex;
 
 	/*
-	 * Latch used by backends to wake up this walsender when it has work to
-	 * do.
+	 * Pointer to the walsender's latch. Used by backends to wake up this
+	 * walsender when it has work to do. NULL if the walsender isn't active.
 	 */
-	Latch		latch;
+	Latch	   *latch;
 
 	/*
 	 * The priority order of the standby managed by this WALSender, as listed
@@ -87,14 +88,13 @@ typedef struct
 	 */
 	bool		sync_standbys_defined;
 
-	WalSnd		walsnds[1];		/* VARIABLE LENGTH ARRAY */
+	WalSnd		walsnds[FLEXIBLE_ARRAY_MEMBER];
 } WalSndCtlData;
 
 extern WalSndCtlData *WalSndCtl;
 
 
 extern void WalSndSetState(WalSndState state);
-extern void XLogRead(char *buf, XLogRecPtr startptr, Size count);
 
 /*
  * Internal functions for parsing the replication grammar, in repl_gram.y and
@@ -102,7 +102,7 @@ extern void XLogRead(char *buf, XLogRecPtr startptr, Size count);
  */
 extern int	replication_yyparse(void);
 extern int	replication_yylex(void);
-extern void replication_yyerror(const char *str);
+extern void replication_yyerror(const char *str) pg_attribute_noreturn();
 extern void replication_scanner_init(const char *query_string);
 extern void replication_scanner_finish(void);
 

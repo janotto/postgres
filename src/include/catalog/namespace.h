@@ -4,7 +4,7 @@
  *	  prototypes for functions in backend/catalog/namespace.c
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/namespace.h
@@ -20,7 +20,7 @@
 
 /*
  *	This structure holds a list of possible functions or operators
- *	found by namespace lookup.	Each function/operator is identified
+ *	found by namespace lookup.  Each function/operator is identified
  *	by OID and by argument types; the list must be pruned by type
  *	resolution rules that are embodied in the parser, not here.
  *	See FuncnameGetCandidates's comments for more info.
@@ -34,8 +34,8 @@ typedef struct _FuncCandidateList
 	int			nvargs;			/* number of args to become variadic array */
 	int			ndargs;			/* number of defaulted args */
 	int		   *argnumbers;		/* args' positional indexes, if named call */
-	Oid			args[1];		/* arg types --- VARIABLE LENGTH ARRAY */
-}	*FuncCandidateList;	/* VARIABLE LENGTH STRUCT */
+	Oid			args[FLEXIBLE_ARRAY_MEMBER];	/* arg types */
+}	*FuncCandidateList;
 
 /*
  *	Structure for xxxOverrideSearchPath functions
@@ -47,18 +47,18 @@ typedef struct OverrideSearchPath
 	bool		addTemp;		/* implicitly prepend temp schema? */
 } OverrideSearchPath;
 
-typedef void (*RangeVarGetRelidCallback)(const RangeVar *relation, Oid relId,
-	Oid oldRelId, void *callback_arg);
+typedef void (*RangeVarGetRelidCallback) (const RangeVar *relation, Oid relId,
+										   Oid oldRelId, void *callback_arg);
 
 #define RangeVarGetRelid(relation, lockmode, missing_ok) \
 	RangeVarGetRelidExtended(relation, lockmode, missing_ok, false, NULL, NULL)
 
-extern Oid	RangeVarGetRelidExtended(const RangeVar *relation,
+extern Oid RangeVarGetRelidExtended(const RangeVar *relation,
 						 LOCKMODE lockmode, bool missing_ok, bool nowait,
 						 RangeVarGetRelidCallback callback,
 						 void *callback_arg);
 extern Oid	RangeVarGetCreationNamespace(const RangeVar *newRelation);
-extern Oid	RangeVarGetAndCheckCreationNamespace(RangeVar *newRelation,
+extern Oid RangeVarGetAndCheckCreationNamespace(RangeVar *newRelation,
 									 LOCKMODE lockmode,
 									 Oid *existing_relation_id);
 extern void RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid);
@@ -71,11 +71,13 @@ extern bool TypeIsVisible(Oid typid);
 extern FuncCandidateList FuncnameGetCandidates(List *names,
 					  int nargs, List *argnames,
 					  bool expand_variadic,
-					  bool expand_defaults);
+					  bool expand_defaults,
+					  bool missing_ok);
 extern bool FunctionIsVisible(Oid funcid);
 
 extern Oid	OpernameGetOprid(List *names, Oid oprleft, Oid oprright);
-extern FuncCandidateList OpernameGetCandidates(List *names, char oprkind);
+extern FuncCandidateList OpernameGetCandidates(List *names, char oprkind,
+					  bool missing_schema_ok);
 extern bool OperatorIsVisible(Oid oprid);
 
 extern Oid	OpclassnameGetOpcid(Oid amid, const char *opcname);
@@ -106,7 +108,7 @@ extern void DeconstructQualifiedName(List *names,
 						 char **nspname_p,
 						 char **objname_p);
 extern Oid	LookupNamespaceNoError(const char *nspname);
-extern Oid	LookupExplicitNamespace(const char *nspname);
+extern Oid	LookupExplicitNamespace(const char *nspname, bool missing_ok);
 extern Oid	get_namespace_oid(const char *nspname, bool missing_ok);
 
 extern Oid	LookupCreationNamespace(const char *nspname);
@@ -119,7 +121,7 @@ extern char *NameListToQuotedString(List *names);
 
 extern bool isTempNamespace(Oid namespaceId);
 extern bool isTempToastNamespace(Oid namespaceId);
-extern bool isTempOrToastNamespace(Oid namespaceId);
+extern bool isTempOrTempToastNamespace(Oid namespaceId);
 extern bool isAnyTempNamespace(Oid namespaceId);
 extern bool isOtherTempNamespace(Oid namespaceId);
 extern int	GetTempNamespaceBackendId(Oid namespaceId);
@@ -128,12 +130,13 @@ extern void ResetTempTableNamespace(void);
 
 extern OverrideSearchPath *GetOverrideSearchPath(MemoryContext context);
 extern OverrideSearchPath *CopyOverrideSearchPath(OverrideSearchPath *path);
+extern bool OverrideSearchPathMatchesCurrent(OverrideSearchPath *path);
 extern void PushOverrideSearchPath(OverrideSearchPath *newpath);
 extern void PopOverrideSearchPath(void);
 
 extern Oid	get_collation_oid(List *collname, bool missing_ok);
 extern Oid	get_conversion_oid(List *conname, bool missing_ok);
-extern Oid	FindDefaultConversionProc(int4 for_encoding, int4 to_encoding);
+extern Oid	FindDefaultConversionProc(int32 for_encoding, int32 to_encoding);
 
 /* initialization & transaction cleanup code */
 extern void InitializeSearchPath(void);

@@ -7,7 +7,7 @@
  *	  stuff - checking the qualification and projecting the tuple
  *	  appropriately.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,7 +30,7 @@ static bool tlist_matches_tupdesc(PlanState *ps, List *tlist, Index varno, Tuple
  * ExecScanFetch -- fetch next potential tuple
  *
  * This routine is concerned with substituting a test tuple if we are
- * inside an EvalPlanQual recheck.	If we aren't, just execute
+ * inside an EvalPlanQual recheck.  If we aren't, just execute
  * the access method's next-tuple routine.
  */
 static inline TupleTableSlot *
@@ -88,7 +88,7 @@ ExecScanFetch(ScanState *node,
  *		Scans the relation using the 'access method' indicated and
  *		returns the next qualifying tuple in the direction specified
  *		in the global variable ExecDirection.
- *		The access method returns the next tuple and execScan() is
+ *		The access method returns the next tuple and ExecScan() is
  *		responsible for checking the tuple returned against the qual-clause.
  *
  *		A 'recheck method' must also be provided that can check an
@@ -155,7 +155,7 @@ ExecScan(ScanState *node,
 	ResetExprContext(econtext);
 
 	/*
-	 * get a tuple from the access method.	Loop until we obtain a tuple that
+	 * get a tuple from the access method.  Loop until we obtain a tuple that
 	 * passes the qualification.
 	 */
 	for (;;)

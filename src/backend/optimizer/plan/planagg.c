@@ -10,14 +10,14 @@
  *		 ORDER BY col ASC/DESC
  *		 LIMIT 1)
  * Given a suitable index on tab.col, this can be much faster than the
- * generic scan-all-the-rows aggregation plan.	We can handle multiple
+ * generic scan-all-the-rows aggregation plan.  We can handle multiple
  * MIN/MAX aggregates by generating multiple subqueries, and their
- * orderings can be different.	However, if the query contains any
+ * orderings can be different.  However, if the query contains any
  * non-optimizable aggregates, there's no point since we'll have to
  * scan all the rows anyway.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -28,6 +28,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_type.h"
 #include "nodes/makefuncs.h"
@@ -36,7 +37,9 @@
 #include "optimizer/cost.h"
 #include "optimizer/paths.h"
 #include "optimizer/planmain.h"
+#include "optimizer/planner.h"
 #include "optimizer/subselect.h"
+#include "optimizer/tlist.h"
 #include "parser/parsetree.h"
 #include "parser/parse_clause.h"
 #include "utils/lsyscache.h"
@@ -46,6 +49,7 @@
 static bool find_minmax_aggs_walker(Node *node, List **context);
 static bool build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 				  Oid eqop, Oid sortop, bool nulls_first);
+static void minmax_qp_callback(PlannerInfo *root, void *extra);
 static void make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo);
 static Node *replace_aggs_with_params_mutator(Node *node, PlannerInfo *root);
 static Oid	fetch_agg_sort_op(Oid aggfnoid);
@@ -99,9 +103,10 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 	 * We also restrict the query to reference exactly one table, since join
 	 * conditions can't be handled reasonably.  (We could perhaps handle a
 	 * query containing cartesian-product joins, but it hardly seems worth the
-	 * trouble.)  However, the single real table could be buried in several
-	 * levels of FromExpr due to subqueries.  Note the single table could be
-	 * an inheritance parent, too.
+	 * trouble.)  However, the single table could be buried in several levels
+	 * of FromExpr due to subqueries.  Note the "single" table could be an
+	 * inheritance parent, too, including the case of a UNION ALL subquery
+	 * that's been flattened to an appendrel.
 	 */
 	jtnode = parse->jointree;
 	while (IsA(jtnode, FromExpr))
@@ -114,12 +119,16 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 		return;
 	rtr = (RangeTblRef *) jtnode;
 	rte = planner_rt_fetch(rtr->rtindex, root);
-	if (rte->rtekind != RTE_RELATION)
+	if (rte->rtekind == RTE_RELATION)
+		 /* ordinary relation, ok */ ;
+	else if (rte->rtekind == RTE_SUBQUERY && rte->inh)
+		 /* flattened UNION ALL subquery, ok */ ;
+	else
 		return;
 
 	/*
 	 * Scan the tlist and HAVING qual to find all the aggregates and verify
-	 * all are MIN/MAX aggregates.	Stop as soon as we find one that isn't.
+	 * all are MIN/MAX aggregates.  Stop as soon as we find one that isn't.
 	 */
 	aggs_list = NIL;
 	if (find_minmax_aggs_walker((Node *) tlist, &aggs_list))
@@ -154,7 +163,7 @@ preprocess_minmax_aggregates(PlannerInfo *root, List *tlist)
 		 * We can use either an ordering that gives NULLS FIRST or one that
 		 * gives NULLS LAST; furthermore there's unlikely to be much
 		 * performance difference between them, so it doesn't seem worth
-		 * costing out both ways if we get a hit on the first one.	NULLS
+		 * costing out both ways if we get a hit on the first one.  NULLS
 		 * FIRST is more likely to be available if the operator is a
 		 * reverse-sort operator, so try that first if reverse.
 		 */
@@ -200,7 +209,6 @@ optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
 	Path		agg_p;
 	Plan	   *plan;
 	Node	   *hqual;
-	QualCost	tlist_cost;
 	ListCell   *lc;
 
 	/* Nothing to do if preprocess_minmax_aggs rejected the query */
@@ -251,7 +259,10 @@ optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
 
 	/*
 	 * We have to replace Aggrefs with Params in equivalence classes too, else
-	 * ORDER BY or DISTINCT on an optimized aggregate will fail.
+	 * ORDER BY or DISTINCT on an optimized aggregate will fail.  We don't
+	 * need to process child eclass members though, since they aren't of
+	 * interest anymore --- and replace_aggs_with_params_mutator isn't able to
+	 * handle Aggrefs containing translated child Vars, anyway.
 	 *
 	 * Note: at some point it might become necessary to mutate other data
 	 * structures too, such as the query's sortClause or distinctClause. Right
@@ -259,7 +270,8 @@ optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
 	 */
 	mutate_eclass_expressions(root,
 							  replace_aggs_with_params_mutator,
-							  (void *) root);
+							  (void *) root,
+							  false);
 
 	/*
 	 * Generate the output plan --- basically just a Result
@@ -267,9 +279,7 @@ optimize_minmax_aggregates(PlannerInfo *root, List *tlist,
 	plan = (Plan *) make_result(root, tlist, hqual, NULL);
 
 	/* Account for evaluation cost of the tlist (make_result did the rest) */
-	cost_qual_eval(&tlist_cost, tlist, root);
-	plan->startup_cost += tlist_cost.startup;
-	plan->total_cost += tlist_cost.startup + tlist_cost.per_tuple;
+	add_tlist_costs_to_plan(root, plan, tlist);
 
 	return plan;
 }
@@ -305,14 +315,39 @@ find_minmax_aggs_walker(Node *node, List **context)
 		ListCell   *l;
 
 		Assert(aggref->agglevelsup == 0);
-		if (list_length(aggref->args) != 1 || aggref->aggorder != NIL)
+		if (list_length(aggref->args) != 1)
 			return true;		/* it couldn't be MIN/MAX */
+
+		/*
+		 * ORDER BY is usually irrelevant for MIN/MAX, but it can change the
+		 * outcome if the aggsortop's operator class recognizes non-identical
+		 * values as equal.  For example, 4.0 and 4.00 are equal according to
+		 * numeric_ops, yet distinguishable.  If MIN() receives more than one
+		 * value equal to 4.0 and no value less than 4.0, it is unspecified
+		 * which of those equal values MIN() returns.  An ORDER BY expression
+		 * that differs for each of those equal values of the argument
+		 * expression makes the result predictable once again.  This is a
+		 * niche requirement, and we do not implement it with subquery paths.
+		 * In any case, this test lets us reject ordered-set aggregates
+		 * quickly.
+		 */
+		if (aggref->aggorder != NIL)
+			return true;
 		/* note: we do not care if DISTINCT is mentioned ... */
-		curTarget = (TargetEntry *) linitial(aggref->args);
+
+		/*
+		 * We might implement the optimization when a FILTER clause is present
+		 * by adding the filter to the quals of the generated subquery.  For
+		 * now, just punt.
+		 */
+		if (aggref->aggfilter != NULL)
+			return true;
 
 		aggsortop = fetch_agg_sort_op(aggref->aggfnoid);
 		if (!OidIsValid(aggsortop))
 			return true;		/* not a MIN/MAX aggregate */
+
+		curTarget = (TargetEntry *) linitial(aggref->args);
 
 		if (contain_mutable_functions((Node *) curTarget->expr))
 			return true;		/* not potentially indexable */
@@ -370,9 +405,8 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	TargetEntry *tle;
 	NullTest   *ntest;
 	SortGroupClause *sortcl;
-	Path	   *cheapest_path;
+	RelOptInfo *final_rel;
 	Path	   *sorted_path;
-	double		dNumGroups;
 	Cost		path_cost;
 	double		path_fraction;
 
@@ -389,8 +423,9 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	subroot->parse = parse = (Query *) copyObject(root->parse);
 	/* make sure subroot planning won't change root->init_plans contents */
 	subroot->init_plans = list_copy(root->init_plans);
-	/* There shouldn't be any OJ info to translate, as yet */
+	/* There shouldn't be any OJ or LATERAL info to translate, as yet */
 	Assert(subroot->join_info_list == NIL);
+	Assert(subroot->lateral_info_list == NIL);
 	/* and we haven't created PlaceHolderInfos, either */
 	Assert(subroot->placeholder_list == NIL);
 
@@ -414,6 +449,7 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	ntest->arg = copyObject(mminfo->target);
 	/* we checked it wasn't a rowtype in find_minmax_aggs_walker */
 	ntest->argisrow = false;
+	ntest->location = -1;
 
 	/* User might have had that in WHERE already */
 	if (!list_member((List *) parse->jointree->quals, ntest))
@@ -437,42 +473,31 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 										   FLOAT8PASSBYVAL);
 
 	/*
-	 * Set up requested pathkeys.
-	 */
-	subroot->group_pathkeys = NIL;
-	subroot->window_pathkeys = NIL;
-	subroot->distinct_pathkeys = NIL;
-
-	subroot->sort_pathkeys =
-		make_pathkeys_for_sortclauses(subroot,
-									  parse->sortClause,
-									  parse->targetList,
-									  false);
-
-	subroot->query_pathkeys = subroot->sort_pathkeys;
-
-	/*
 	 * Generate the best paths for this query, telling query_planner that we
 	 * have LIMIT 1.
 	 */
-	query_planner(subroot, parse->targetList, 1.0, 1.0,
-				  &cheapest_path, &sorted_path, &dNumGroups);
+	subroot->tuple_fraction = 1.0;
+	subroot->limit_tuples = 1.0;
+
+	final_rel = query_planner(subroot, parse->targetList,
+							  minmax_qp_callback, NULL);
 
 	/*
-	 * Fail if no presorted path.  However, if query_planner determines that
-	 * the presorted path is also the cheapest, it will set sorted_path to
-	 * NULL ... don't be fooled.  (This is kind of a pain here, but it
-	 * simplifies life for grouping_planner, so leave it be.)
+	 * Get the best presorted path, that being the one that's cheapest for
+	 * fetching just one row.  If there's no such path, fail.
 	 */
+	if (final_rel->rows > 1.0)
+		path_fraction = 1.0 / final_rel->rows;
+	else
+		path_fraction = 1.0;
+
+	sorted_path =
+		get_cheapest_fractional_path_for_pathkeys(final_rel->pathlist,
+												  subroot->query_pathkeys,
+												  NULL,
+												  path_fraction);
 	if (!sorted_path)
-	{
-		if (cheapest_path &&
-			pathkeys_contained_in(subroot->sort_pathkeys,
-								  cheapest_path->pathkeys))
-			sorted_path = cheapest_path;
-		else
-			return false;
-	}
+		return false;
 
 	/*
 	 * Determine cost to get just the first row of the presorted path.
@@ -480,11 +505,6 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	 * Note: cost calculation here should match
 	 * compare_fractional_path_costs().
 	 */
-	if (sorted_path->parent->rows > 1.0)
-		path_fraction = 1.0 / sorted_path->parent->rows;
-	else
-		path_fraction = 1.0;
-
 	path_cost = sorted_path->startup_cost +
 		path_fraction * (sorted_path->total_cost - sorted_path->startup_cost);
 
@@ -494,6 +514,24 @@ build_minmax_path(PlannerInfo *root, MinMaxAggInfo *mminfo,
 	mminfo->pathcost = path_cost;
 
 	return true;
+}
+
+/*
+ * Compute query_pathkeys and other pathkeys during plan generation
+ */
+static void
+minmax_qp_callback(PlannerInfo *root, void *extra)
+{
+	root->group_pathkeys = NIL;
+	root->window_pathkeys = NIL;
+	root->distinct_pathkeys = NIL;
+
+	root->sort_pathkeys =
+		make_pathkeys_for_sortclauses(root,
+									  root->parse->sortClause,
+									  root->parse->targetList);
+
+	root->query_pathkeys = root->sort_pathkeys;
 }
 
 /*
@@ -512,7 +550,27 @@ make_agg_subplan(PlannerInfo *root, MinMaxAggInfo *mminfo)
 	 */
 	plan = create_plan(subroot, mminfo->path);
 
-	plan->targetlist = subparse->targetList;
+	/*
+	 * If the top-level plan node is one that cannot do expression evaluation
+	 * and its existing target list isn't already what we need, we must insert
+	 * a Result node to project the desired tlist.
+	 */
+	if (!is_projection_capable_plan(plan) &&
+		!tlist_same_exprs(subparse->targetList, plan->targetlist))
+	{
+		plan = (Plan *) make_result(subroot,
+									subparse->targetList,
+									NULL,
+									plan);
+	}
+	else
+	{
+		/*
+		 * Otherwise, just replace the subplan's flat tlist with the desired
+		 * tlist.
+		 */
+		plan->targetlist = subparse->targetList;
+	}
 
 	plan = (Plan *) make_limit(plan,
 							   subparse->limitOffset,

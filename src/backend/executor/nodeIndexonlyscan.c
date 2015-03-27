@@ -3,7 +3,7 @@
  * nodeIndexonlyscan.c
  *	  Routines to support index-only scans
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -30,6 +30,7 @@
 #include "executor/nodeIndexonlyscan.h"
 #include "executor/nodeIndexscan.h"
 #include "storage/bufmgr.h"
+#include "storage/predicate.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -52,7 +53,6 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	ExprContext *econtext;
 	ScanDirection direction;
 	IndexScanDesc scandesc;
-	HeapTuple	tuple;
 	TupleTableSlot *slot;
 	ItemPointer tid;
 
@@ -78,10 +78,41 @@ IndexOnlyNext(IndexOnlyScanState *node)
 	 */
 	while ((tid = index_getnext_tid(scandesc, direction)) != NULL)
 	{
+		HeapTuple	tuple = NULL;
+
 		/*
 		 * We can skip the heap fetch if the TID references a heap page on
 		 * which all tuples are known visible to everybody.  In any case,
 		 * we'll use the index tuple not the heap tuple as the data source.
+		 *
+		 * Note on Memory Ordering Effects: visibilitymap_test does not lock
+		 * the visibility map buffer, and therefore the result we read here
+		 * could be slightly stale.  However, it can't be stale enough to
+		 * matter.
+		 *
+		 * We need to detect clearing a VM bit due to an insert right away,
+		 * because the tuple is present in the index page but not visible. The
+		 * reading of the TID by this scan (using a shared lock on the index
+		 * buffer) is serialized with the insert of the TID into the index
+		 * (using an exclusive lock on the index buffer). Because the VM bit
+		 * is cleared before updating the index, and locking/unlocking of the
+		 * index page acts as a full memory barrier, we are sure to see the
+		 * cleared bit if we see a recently-inserted TID.
+		 *
+		 * Deletes do not update the index page (only VACUUM will clear out
+		 * the TID), so the clearing of the VM bit by a delete is not
+		 * serialized with this test below, and we may see a value that is
+		 * significantly stale. However, we don't care about the delete right
+		 * away, because the tuple is still visible until the deleting
+		 * transaction commits or the statement ends (if it's our
+		 * transaction). In either case, the lock on the VM buffer will have
+		 * been released (acting as a write barrier) after clearing the
+		 * bit. And for us to have a snapshot that includes the deleting
+		 * transaction (making the tuple invisible), we must have acquired
+		 * ProcArrayLock after that time, acting as a read barrier.
+		 *
+		 * It's worth going through this complexity to avoid needing to lock
+		 * the VM buffer, which could cause significant contention.
 		 */
 		if (!visibilitymap_test(scandesc->heapRelation,
 								ItemPointerGetBlockNumber(tid),
@@ -93,7 +124,7 @@ IndexOnlyNext(IndexOnlyScanState *node)
 			node->ioss_HeapFetches++;
 			tuple = index_fetch_heap(scandesc);
 			if (tuple == NULL)
-				continue;	/* no visible tuple, try next index entry */
+				continue;		/* no visible tuple, try next index entry */
 
 			/*
 			 * Only MVCC snapshots are supported here, so there should be no
@@ -134,6 +165,18 @@ IndexOnlyNext(IndexOnlyScanState *node)
 			}
 		}
 
+		/*
+		 * Predicate locks for index-only scans must be acquired at the page
+		 * level when the heap is not accessed, since tuple-level predicate
+		 * locks need the tuple's xmin value.  If we had to visit the tuple
+		 * anyway, then we already have the tuple-level lock and can skip the
+		 * page lock.
+		 */
+		if (tuple == NULL)
+			PredicateLockPage(scandesc->heapRelation,
+							  ItemPointerGetBlockNumber(tid),
+							  estate->es_snapshot);
+
 		return slot;
 	}
 
@@ -163,8 +206,8 @@ StoreIndexTuple(TupleTableSlot *slot, IndexTuple itup, TupleDesc itupdesc)
 	 * Note: we must use the tupdesc supplied by the AM in index_getattr, not
 	 * the slot's tupdesc, in case the latter has different datatypes (this
 	 * happens for btree name_ops in particular).  They'd better have the same
-	 * number of columns though, as well as being datatype-compatible which
-	 * is something we can't so easily check.
+	 * number of columns though, as well as being datatype-compatible which is
+	 * something we can't so easily check.
 	 */
 	Assert(slot->tts_tupleDescriptor->natts == nindexatts);
 
@@ -383,7 +426,7 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	/*
 	 * open the base relation and acquire appropriate lock on it.
 	 */
-	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid);
+	currentRelation = ExecOpenScanRelation(estate, node->scan.scanrelid, eflags);
 
 	indexstate->ss.ss_currentRelation = currentRelation;
 	indexstate->ss.ss_currentScanDesc = NULL;	/* no heap scan here */
@@ -481,10 +524,10 @@ ExecInitIndexOnlyScan(IndexOnlyScan *node, EState *estate, int eflags)
 	 * Initialize scan descriptor.
 	 */
 	indexstate->ioss_ScanDesc = index_beginscan(currentRelation,
-											   indexstate->ioss_RelationDesc,
-											   estate->es_snapshot,
-											   indexstate->ioss_NumScanKeys,
-											 indexstate->ioss_NumOrderByKeys);
+												indexstate->ioss_RelationDesc,
+												estate->es_snapshot,
+												indexstate->ioss_NumScanKeys,
+											indexstate->ioss_NumOrderByKeys);
 
 	/* Set it up for index-only scan */
 	indexstate->ioss_ScanDesc->xs_want_itup = true;

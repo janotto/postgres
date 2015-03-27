@@ -52,7 +52,6 @@ PGTYPESdate_from_timestamp(timestamp dt)
 date
 PGTYPESdate_from_asc(char *str, char **endptr)
 {
-
 	date		dDate;
 	fsec_t		fsec;
 	struct tm	tt,
@@ -61,14 +60,14 @@ PGTYPESdate_from_asc(char *str, char **endptr)
 	int			nf;
 	char	   *field[MAXDATEFIELDS];
 	int			ftype[MAXDATEFIELDS];
-	char		lowstr[MAXDATELEN + 1];
+	char		lowstr[MAXDATELEN + MAXDATEFIELDS];
 	char	   *realptr;
 	char	  **ptr = (endptr != NULL) ? endptr : &realptr;
 
 	bool		EuroDates = FALSE;
 
 	errno = 0;
-	if (strlen(str) >= sizeof(lowstr))
+	if (strlen(str) > MAXDATELEN)
 	{
 		errno = PGTYPES_DATE_BAD_DATE;
 		return INT_MIN;
@@ -265,8 +264,8 @@ PGTYPESdate_fmt_asc(date dDate, const char *fmtstring, char *outbuf)
 			{
 				case PGTYPES_TYPE_STRING_MALLOCED:
 				case PGTYPES_TYPE_STRING_CONSTANT:
-					strncpy(start_pattern, replace_val.str_val,
-							strlen(replace_val.str_val));
+					memcpy(start_pattern, replace_val.str_val,
+						   strlen(replace_val.str_val));
 					if (replace_type == PGTYPES_TYPE_STRING_MALLOCED)
 						free(replace_val.str_val);
 					break;
@@ -278,7 +277,7 @@ PGTYPESdate_fmt_asc(date dDate, const char *fmtstring, char *outbuf)
 							return -1;
 						snprintf(t, PGTYPES_DATE_NUM_MAX_DIGITS,
 								 "%u", replace_val.uint_val);
-						strncpy(start_pattern, t, strlen(t));
+						memcpy(start_pattern, t, strlen(t));
 						free(t);
 					}
 					break;
@@ -290,7 +289,7 @@ PGTYPESdate_fmt_asc(date dDate, const char *fmtstring, char *outbuf)
 							return -1;
 						snprintf(t, PGTYPES_DATE_NUM_MAX_DIGITS,
 								 "%02u", replace_val.uint_val);
-						strncpy(start_pattern, t, strlen(t));
+						memcpy(start_pattern, t, strlen(t));
 						free(t);
 					}
 					break;
@@ -302,7 +301,7 @@ PGTYPESdate_fmt_asc(date dDate, const char *fmtstring, char *outbuf)
 							return -1;
 						snprintf(t, PGTYPES_DATE_NUM_MAX_DIGITS,
 								 "%04u", replace_val.uint_val);
-						strncpy(start_pattern, t, strlen(t));
+						memcpy(start_pattern, t, strlen(t));
 						free(t);
 					}
 					break;

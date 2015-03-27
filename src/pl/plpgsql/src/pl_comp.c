@@ -3,7 +3,7 @@
  * pl_comp.c		- Compiler part of the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -17,6 +17,7 @@
 
 #include <ctype.h>
 
+#include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_proc_fn.h"
@@ -77,7 +78,7 @@ typedef struct
 } ExceptionLabelMap;
 
 static const ExceptionLabelMap exception_label_map[] = {
-#include "plerrcodes.h"	/* pgrminclude ignore */
+#include "plerrcodes.h"			/* pgrminclude ignore */
 	{NULL, 0}
 };
 
@@ -166,7 +167,7 @@ recheck:
 	if (function)
 	{
 		/* We have a compiled function, but is it still valid? */
-		if (function->fn_xmin == HeapTupleHeaderGetXmin(procTup->t_data) &&
+		if (function->fn_xmin == HeapTupleHeaderGetRawXmin(procTup->t_data) &&
 			ItemPointerEquals(&function->fn_tid, &procTup->t_self))
 			function_valid = true;
 		else
@@ -263,7 +264,8 @@ do_compile(FunctionCallInfo fcinfo,
 		   bool forValidator)
 {
 	Form_pg_proc procStruct = (Form_pg_proc) GETSTRUCT(procTup);
-	bool		is_trigger = CALLED_AS_TRIGGER(fcinfo);
+	bool		is_dml_trigger = CALLED_AS_TRIGGER(fcinfo);
+	bool		is_event_trigger = CALLED_AS_EVENT_TRIGGER(fcinfo);
 	Datum		prosrcdatum;
 	bool		isnull;
 	char	   *proc_source;
@@ -286,7 +288,7 @@ do_compile(FunctionCallInfo fcinfo,
 	MemoryContext func_cxt;
 
 	/*
-	 * Setup the scanner input and error info.	We assume that this function
+	 * Setup the scanner input and error info.  We assume that this function
 	 * cannot be invoked recursively, so there's no need to save and restore
 	 * the static variables used here.
 	 */
@@ -343,13 +345,23 @@ do_compile(FunctionCallInfo fcinfo,
 
 	function->fn_signature = format_procedure(fcinfo->flinfo->fn_oid);
 	function->fn_oid = fcinfo->flinfo->fn_oid;
-	function->fn_xmin = HeapTupleHeaderGetXmin(procTup->t_data);
+	function->fn_xmin = HeapTupleHeaderGetRawXmin(procTup->t_data);
 	function->fn_tid = procTup->t_self;
-	function->fn_is_trigger = is_trigger;
 	function->fn_input_collation = fcinfo->fncollation;
 	function->fn_cxt = func_cxt;
 	function->out_param_varno = -1;		/* set up for no OUT param */
 	function->resolve_option = plpgsql_variable_conflict;
+	function->print_strict_params = plpgsql_print_strict_params;
+	/* only promote extra warnings and errors at CREATE FUNCTION time */
+	function->extra_warnings = forValidator ? plpgsql_extra_warnings : 0;
+	function->extra_errors = forValidator ? plpgsql_extra_errors : 0;
+
+	if (is_dml_trigger)
+		function->fn_is_trigger = PLPGSQL_DML_TRIGGER;
+	else if (is_event_trigger)
+		function->fn_is_trigger = PLPGSQL_EVENT_TRIGGER;
+	else
+		function->fn_is_trigger = PLPGSQL_NOT_TRIGGER;
 
 	/*
 	 * Initialize the compiler, particularly the namespace stack.  The
@@ -367,16 +379,16 @@ do_compile(FunctionCallInfo fcinfo,
 									 sizeof(PLpgSQL_datum *) * datums_alloc);
 	datums_last = 0;
 
-	switch (is_trigger)
+	switch (function->fn_is_trigger)
 	{
-		case false:
+		case PLPGSQL_NOT_TRIGGER:
 
 			/*
 			 * Fetch info about the procedure's parameters. Allocations aren't
 			 * needed permanently, so make them in tmp cxt.
 			 *
 			 * We also need to resolve any polymorphic input or output
-			 * argument types.	In validation mode we won't be able to, so we
+			 * argument types.  In validation mode we won't be able to, so we
 			 * arbitrarily assume we are dealing with integers.
 			 */
 			MemoryContextSwitchTo(compile_tmp_cxt);
@@ -459,7 +471,7 @@ do_compile(FunctionCallInfo fcinfo,
 
 			/*
 			 * If there's just one OUT parameter, out_param_varno points
-			 * directly to it.	If there's more than one, build a row that
+			 * directly to it.  If there's more than one, build a row that
 			 * holds all of them.
 			 */
 			if (num_out_args == 1)
@@ -529,7 +541,7 @@ do_compile(FunctionCallInfo fcinfo,
 				if (rettypeid == VOIDOID ||
 					rettypeid == RECORDOID)
 					 /* okay */ ;
-				else if (rettypeid == TRIGGEROID)
+				else if (rettypeid == TRIGGEROID || rettypeid == EVTTRIGGEROID)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("trigger functions can only be called as triggers")));
@@ -547,8 +559,6 @@ do_compile(FunctionCallInfo fcinfo,
 			{
 				function->fn_retbyval = typeStruct->typbyval;
 				function->fn_rettyplen = typeStruct->typlen;
-				function->fn_rettypioparam = getTypeIOParam(typeTup);
-				fmgr_info(typeStruct->typinput, &(function->fn_retinput));
 
 				/*
 				 * install $0 reference, but only for polymorphic return
@@ -568,7 +578,7 @@ do_compile(FunctionCallInfo fcinfo,
 			ReleaseSysCache(typeTup);
 			break;
 
-		case true:
+		case PLPGSQL_DML_TRIGGER:
 			/* Trigger procedure's return type is unknown yet */
 			function->fn_rettype = InvalidOid;
 			function->fn_retbyval = false;
@@ -672,8 +682,39 @@ do_compile(FunctionCallInfo fcinfo,
 
 			break;
 
+		case PLPGSQL_EVENT_TRIGGER:
+			function->fn_rettype = VOIDOID;
+			function->fn_retbyval = false;
+			function->fn_retistuple = true;
+			function->fn_retset = false;
+
+			/* shouldn't be any declared arguments */
+			if (procStruct->pronargs != 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_FUNCTION_DEFINITION),
+						 errmsg("event trigger functions cannot have declared arguments")));
+
+			/* Add the variable tg_event */
+			var = plpgsql_build_variable("tg_event", 0,
+										 plpgsql_build_datatype(TEXTOID,
+																-1,
+											   function->fn_input_collation),
+										 true);
+			function->tg_event_varno = var->dno;
+
+			/* Add the variable tg_tag */
+			var = plpgsql_build_variable("tg_tag", 0,
+										 plpgsql_build_datatype(TEXTOID,
+																-1,
+											   function->fn_input_collation),
+										 true);
+			function->tg_tag_varno = var->dno;
+
+			break;
+
 		default:
-			elog(ERROR, "unrecognized function typecode: %d", (int) is_trigger);
+			elog(ERROR, "unrecognized function typecode: %d",
+				 (int) function->fn_is_trigger);
 			break;
 	}
 
@@ -760,14 +801,13 @@ plpgsql_compile_inline(char *proc_source)
 	char	   *func_name = "inline_code_block";
 	PLpgSQL_function *function;
 	ErrorContextCallback plerrcontext;
-	Oid			typinput;
 	PLpgSQL_variable *var;
 	int			parse_rc;
 	MemoryContext func_cxt;
 	int			i;
 
 	/*
-	 * Setup the scanner input and error info.	We assume that this function
+	 * Setup the scanner input and error info.  We assume that this function
 	 * cannot be invoked recursively, so there's no need to save and restore
 	 * the static variables used here.
 	 */
@@ -803,11 +843,19 @@ plpgsql_compile_inline(char *proc_source)
 	compile_tmp_cxt = MemoryContextSwitchTo(func_cxt);
 
 	function->fn_signature = pstrdup(func_name);
-	function->fn_is_trigger = false;
+	function->fn_is_trigger = PLPGSQL_NOT_TRIGGER;
 	function->fn_input_collation = InvalidOid;
 	function->fn_cxt = func_cxt;
 	function->out_param_varno = -1;		/* set up for no OUT param */
 	function->resolve_option = plpgsql_variable_conflict;
+	function->print_strict_params = plpgsql_print_strict_params;
+
+	/*
+	 * don't do extra validation for inline code as we don't want to add spam
+	 * at runtime
+	 */
+	function->extra_warnings = 0;
+	function->extra_errors = 0;
 
 	plpgsql_ns_init();
 	plpgsql_ns_push(func_name);
@@ -825,8 +873,6 @@ plpgsql_compile_inline(char *proc_source)
 	/* a bit of hardwired knowledge about type VOID here */
 	function->fn_retbyval = true;
 	function->fn_rettyplen = sizeof(int32);
-	getTypeInputInfo(VOIDOID, &typinput, &function->fn_rettypioparam);
-	fmgr_info(typinput, &(function->fn_retinput));
 
 	/*
 	 * Remember if function is STABLE/IMMUTABLE.  XXX would it be better to
@@ -1023,7 +1069,7 @@ plpgsql_post_column_ref(ParseState *pstate, ColumnRef *cref, Node *var)
 
 	/*
 	 * If we find a record/row variable but can't match a field name, throw
-	 * error if there was no core resolution for the ColumnRef either.	In
+	 * error if there was no core resolution for the ColumnRef either.  In
 	 * that situation, the reference is inevitably going to fail, and
 	 * complaining about the record/row variable is likely to be more on-point
 	 * than the core parser's error message.  (It's too bad we don't have
@@ -1217,7 +1263,7 @@ resolve_column_ref(ParseState *pstate, PLpgSQL_expr *expr,
 				/*
 				 * We should not get here, because a RECFIELD datum should
 				 * have been built at parse time for every possible qualified
-				 * reference to fields of this record.	But if we do, handle
+				 * reference to fields of this record.  But if we do, handle
 				 * it like field-not-found: throw error or return NULL.
 				 */
 				if (error_if_no_field)
@@ -1624,7 +1670,7 @@ plpgsql_parse_wordtype(char *ident)
 	 * Word wasn't found in the namespace stack. Try to find a data type with
 	 * that name, but ignore shell types and complex types.
 	 */
-	typeTup = LookupTypeName(NULL, makeTypeName(ident), NULL);
+	typeTup = LookupTypeName(NULL, makeTypeName(ident), NULL, false);
 	if (typeTup)
 	{
 		Form_pg_type typeStruct = (Form_pg_type) GETSTRUCT(typeTup);
@@ -1721,11 +1767,13 @@ plpgsql_parse_cwordtype(List *idents)
 	classStruct = (Form_pg_class) GETSTRUCT(classtup);
 
 	/*
-	 * It must be a relation, sequence, view, composite type, or foreign table
+	 * It must be a relation, sequence, view, materialized view, composite
+	 * type, or foreign table
 	 */
 	if (classStruct->relkind != RELKIND_RELATION &&
 		classStruct->relkind != RELKIND_SEQUENCE &&
 		classStruct->relkind != RELKIND_VIEW &&
+		classStruct->relkind != RELKIND_MATVIEW &&
 		classStruct->relkind != RELKIND_COMPOSITE_TYPE &&
 		classStruct->relkind != RELKIND_FOREIGN_TABLE)
 		goto done;
@@ -1822,7 +1870,7 @@ plpgsql_parse_cwordrowtype(List *idents)
  *
  * The returned struct may be a PLpgSQL_var, PLpgSQL_row, or
  * PLpgSQL_rec depending on the given datatype, and is allocated via
- * palloc.	The struct is automatically added to the current datum
+ * palloc.  The struct is automatically added to the current datum
  * array, and optionally to the current namespace.
  */
 PLpgSQL_variable *
@@ -1943,10 +1991,14 @@ build_row_from_class(Oid classOid)
 	classStruct = RelationGetForm(rel);
 	relname = RelationGetRelationName(rel);
 
-	/* accept relation, sequence, view, composite type, or foreign table */
+	/*
+	 * Accept relation, sequence, view, materialized view, composite type, or
+	 * foreign table.
+	 */
 	if (classStruct->relkind != RELKIND_RELATION &&
 		classStruct->relkind != RELKIND_SEQUENCE &&
 		classStruct->relkind != RELKIND_VIEW &&
+		classStruct->relkind != RELKIND_MATVIEW &&
 		classStruct->relkind != RELKIND_COMPOSITE_TYPE &&
 		classStruct->relkind != RELKIND_FOREIGN_TABLE)
 		ereport(ERROR,
@@ -2143,12 +2195,11 @@ build_datatype(HeapTuple typeTup, int32 typmod, Oid collation)
 	}
 	typ->typlen = typeStruct->typlen;
 	typ->typbyval = typeStruct->typbyval;
+	typ->typtype = typeStruct->typtype;
 	typ->typrelid = typeStruct->typrelid;
-	typ->typioparam = getTypeIOParam(typeTup);
 	typ->collation = typeStruct->typcollation;
 	if (OidIsValid(collation) && OidIsValid(typ->collation))
 		typ->collation = collation;
-	fmgr_info(typeStruct->typinput, &(typ->typinput));
 	typ->atttypmod = typmod;
 
 	return typ;
@@ -2272,7 +2323,7 @@ plpgsql_adddatum(PLpgSQL_datum *new)
  * last call.
  *
  * This is used around a DECLARE section to create a list of the VARs
- * that have to be initialized at block entry.	Note that VARs can also
+ * that have to be initialized at block entry.  Note that VARs can also
  * be created elsewhere than DECLARE, eg by a FOR-loop, but it is then
  * the responsibility of special-purpose code to initialize them.
  * ----------
@@ -2429,7 +2480,7 @@ plpgsql_resolve_polymorphic_argtypes(int numargs,
  * delete_function - clean up as much as possible of a stale function cache
  *
  * We can't release the PLpgSQL_function struct itself, because of the
- * possibility that there are fn_extra pointers to it.	We can release
+ * possibility that there are fn_extra pointers to it.  We can release
  * the subsidiary storage, but only if there are no active evaluations
  * in progress.  Otherwise we'll just leak that storage.  Since the
  * case would only occur if a pg_proc update is detected during a nested
@@ -2462,11 +2513,10 @@ plpgsql_HashTableInit(void)
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(PLpgSQL_func_hashkey);
 	ctl.entrysize = sizeof(plpgsql_HashEnt);
-	ctl.hash = tag_hash;
 	plpgsql_HashTable = hash_create("PLpgSQL function cache",
 									FUNCS_PER_USER,
 									&ctl,
-									HASH_ELEM | HASH_FUNCTION);
+									HASH_ELEM | HASH_BLOBS);
 }
 
 static PLpgSQL_function *

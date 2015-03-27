@@ -4,7 +4,7 @@
  *	  Public header file for SP-GiST access method.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/spgist.h
@@ -15,8 +15,9 @@
 #define SPGIST_H
 
 #include "access/skey.h"
-#include "access/xlog.h"
+#include "access/xlogreader.h"
 #include "fmgr.h"
+#include "lib/stringinfo.h"
 
 
 /* reloption parameters */
@@ -78,25 +79,25 @@ typedef struct spgChooseOut
 	{
 		struct					/* results for spgMatchNode */
 		{
-			int			nodeN;		/* descend to this node (index from 0) */
-			int			levelAdd;	/* increment level by this much */
-			Datum		restDatum;	/* new leaf datum */
+			int			nodeN;	/* descend to this node (index from 0) */
+			int			levelAdd;		/* increment level by this much */
+			Datum		restDatum;		/* new leaf datum */
 		}			matchNode;
 		struct					/* results for spgAddNode */
 		{
-			Datum		nodeLabel;	/* new node's label */
-			int			nodeN;		/* where to insert it (index from 0) */
+			Datum		nodeLabel;		/* new node's label */
+			int			nodeN;	/* where to insert it (index from 0) */
 		}			addNode;
 		struct					/* results for spgSplitTuple */
 		{
 			/* Info to form new inner tuple with one node */
-			bool		prefixHasPrefix;	/* tuple should have a prefix? */
-			Datum		prefixPrefixDatum;	/* if so, its value */
-			Datum		nodeLabel;			/* node's label */
+			bool		prefixHasPrefix;		/* tuple should have a prefix? */
+			Datum		prefixPrefixDatum;		/* if so, its value */
+			Datum		nodeLabel;		/* node's label */
 
 			/* Info to form new lower-level inner tuple with all old nodes */
-			bool		postfixHasPrefix;	/* tuple should have a prefix? */
-			Datum		postfixPrefixDatum;	/* if so, its value */
+			bool		postfixHasPrefix;		/* tuple should have a prefix? */
+			Datum		postfixPrefixDatum;		/* if so, its value */
 		}			splitTuple;
 	}			result;
 } spgChooseOut;
@@ -119,7 +120,7 @@ typedef struct spgPickSplitOut
 	int			nNodes;			/* number of nodes for new inner tuple */
 	Datum	   *nodeLabels;		/* their labels (or NULL for no labels) */
 
-	int		   *mapTuplesToNodes;	/* node index for each leaf tuple */
+	int		   *mapTuplesToNodes;		/* node index for each leaf tuple */
 	Datum	   *leafTupleDatums;	/* datum to store in each new leaf tuple */
 } spgPickSplitOut;
 
@@ -128,8 +129,8 @@ typedef struct spgPickSplitOut
  */
 typedef struct spgInnerConsistentIn
 {
-	StrategyNumber strategy;	/* operator strategy number */
-	Datum		query;			/* operator's RHS value */
+	ScanKey		scankeys;		/* array of operators and comparison values */
+	int			nkeys;			/* length of array */
 
 	Datum		reconstructedValue;		/* value reconstructed at parent */
 	int			level;			/* current level (counting from zero) */
@@ -156,8 +157,8 @@ typedef struct spgInnerConsistentOut
  */
 typedef struct spgLeafConsistentIn
 {
-	StrategyNumber strategy;	/* operator strategy number */
-	Datum		query;			/* operator's RHS value */
+	ScanKey		scankeys;		/* array of operators and comparison values */
+	int			nkeys;			/* length of array */
 
 	Datum		reconstructedValue;		/* value reconstructed at parent */
 	int			level;			/* current level (counting from zero) */
@@ -196,8 +197,9 @@ extern Datum spgbulkdelete(PG_FUNCTION_ARGS);
 extern Datum spgvacuumcleanup(PG_FUNCTION_ARGS);
 
 /* spgxlog.c */
-extern void spg_redo(XLogRecPtr lsn, XLogRecord *record);
-extern void spg_desc(StringInfo buf, uint8 xl_info, char *rec);
+extern void spg_redo(XLogReaderState *record);
+extern void spg_desc(StringInfo buf, XLogReaderState *record);
+extern const char *spg_identify(uint8 info);
 extern void spg_xlog_startup(void);
 extern void spg_xlog_cleanup(void);
 

@@ -4,7 +4,7 @@
  *
  * Routines corresponding to database objects
  *
- * Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2010-2015, PostgreSQL Global Development Group
  *
  * -------------------------------------------------------------------------
  */
@@ -12,12 +12,14 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_database.h"
 #include "catalog/indexing.h"
 #include "commands/dbcommands.h"
 #include "commands/seclabel.h"
+#include "utils/builtins.h"
 #include "utils/fmgroids.h"
 #include "utils/tqual.h"
 #include "sepgsql.h"
@@ -32,19 +34,19 @@ void
 sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 {
 	Relation	rel;
-	ScanKeyData	skey;
-	SysScanDesc	sscan;
+	ScanKeyData skey;
+	SysScanDesc sscan;
 	HeapTuple	tuple;
 	char	   *tcontext;
 	char	   *ncontext;
-	char		audit_name[NAMEDATALEN + 20];
-	ObjectAddress		object;
-	Form_pg_database	datForm;
+	ObjectAddress object;
+	Form_pg_database datForm;
+	StringInfoData audit_name;
 
 	/*
-	 * Oid of the source database is not saved in pg_database catalog,
-	 * so we collect its identifier using contextual information.
-	 * If NULL, its default is "template1" according to createdb().
+	 * Oid of the source database is not saved in pg_database catalog, so we
+	 * collect its identifier using contextual information. If NULL, its
+	 * default is "template1" according to createdb().
 	 */
 	if (!dtemplate)
 		dtemplate = "template1";
@@ -56,22 +58,24 @@ sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 	tcontext = sepgsql_get_label(object.classId,
 								 object.objectId,
 								 object.objectSubId);
+
 	/*
 	 * check db_database:{getattr} permission
 	 */
-	snprintf(audit_name, sizeof(audit_name), "database %s", dtemplate);
+	initStringInfo(&audit_name);
+	appendStringInfo(&audit_name, "%s", quote_identifier(dtemplate));
 	sepgsql_avc_check_perms_label(tcontext,
 								  SEPG_CLASS_DB_DATABASE,
 								  SEPG_DB_DATABASE__GETATTR,
-								  audit_name,
+								  audit_name.data,
 								  true);
 
 	/*
-	 * Compute a default security label of the newly created database
-	 * based on a pair of security label of client and source database.
+	 * Compute a default security label of the newly created database based on
+	 * a pair of security label of client and source database.
 	 *
-	 * XXX - uncoming version of libselinux supports to take object
-	 * name to handle special treatment on default security label.
+	 * XXX - uncoming version of libselinux supports to take object name to
+	 * handle special treatment on default security label.
 	 */
 	rel = heap_open(DatabaseRelationId, AccessShareLock);
 
@@ -90,16 +94,19 @@ sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 
 	ncontext = sepgsql_compute_create(sepgsql_get_client_label(),
 									  tcontext,
-									  SEPG_CLASS_DB_DATABASE);
+									  SEPG_CLASS_DB_DATABASE,
+									  NameStr(datForm->datname));
+
 	/*
 	 * check db_database:{create} permission
 	 */
-	snprintf(audit_name, sizeof(audit_name),
-			 "database %s", NameStr(datForm->datname));
+	resetStringInfo(&audit_name);
+	appendStringInfo(&audit_name, "%s",
+					 quote_identifier(NameStr(datForm->datname)));
 	sepgsql_avc_check_perms_label(ncontext,
 								  SEPG_CLASS_DB_DATABASE,
 								  SEPG_DB_DATABASE__CREATE,
-								  audit_name,
+								  audit_name.data,
 								  true);
 
 	systable_endscan(sscan);
@@ -119,6 +126,60 @@ sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 }
 
 /*
+ * sepgsql_database_drop
+ *
+ * It checks privileges to drop the supplied database
+ */
+void
+sepgsql_database_drop(Oid databaseId)
+{
+	ObjectAddress object;
+	char	   *audit_name;
+
+	/*
+	 * check db_database:{drop} permission
+	 */
+	object.classId = DatabaseRelationId;
+	object.objectId = databaseId;
+	object.objectSubId = 0;
+	audit_name = getObjectIdentity(&object);
+
+	sepgsql_avc_check_perms(&object,
+							SEPG_CLASS_DB_DATABASE,
+							SEPG_DB_DATABASE__DROP,
+							audit_name,
+							true);
+	pfree(audit_name);
+}
+
+/*
+ * sepgsql_database_post_alter
+ *
+ * It checks privileges to alter the supplied database
+ */
+void
+sepgsql_database_setattr(Oid databaseId)
+{
+	ObjectAddress object;
+	char	   *audit_name;
+
+	/*
+	 * check db_database:{setattr} permission
+	 */
+	object.classId = DatabaseRelationId;
+	object.objectId = databaseId;
+	object.objectSubId = 0;
+	audit_name = getObjectIdentity(&object);
+
+	sepgsql_avc_check_perms(&object,
+							SEPG_CLASS_DB_DATABASE,
+							SEPG_DB_DATABASE__SETATTR,
+							audit_name,
+							true);
+	pfree(audit_name);
+}
+
+/*
  * sepgsql_database_relabel
  *
  * It checks privileges to relabel the supplied database with the `seclabel'
@@ -126,13 +187,13 @@ sepgsql_database_post_create(Oid databaseId, const char *dtemplate)
 void
 sepgsql_database_relabel(Oid databaseId, const char *seclabel)
 {
-	ObjectAddress	object;
-	char		   *audit_name;
+	ObjectAddress object;
+	char	   *audit_name;
 
 	object.classId = DatabaseRelationId;
 	object.objectId = databaseId;
 	object.objectSubId = 0;
-	audit_name = getObjectDescription(&object);
+	audit_name = getObjectIdentity(&object);
 
 	/*
 	 * check db_database:{setattr relabelfrom} permission
@@ -143,6 +204,7 @@ sepgsql_database_relabel(Oid databaseId, const char *seclabel)
 							SEPG_DB_DATABASE__RELABELFROM,
 							audit_name,
 							true);
+
 	/*
 	 * check db_database:{relabelto} permission
 	 */

@@ -6,7 +6,7 @@
  *
  * Original coding by Todd A. Brandys
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/libpq/crypt.c
@@ -29,8 +29,14 @@
 #include "utils/timestamp.h"
 
 
+/*
+ * Check given password for given user, and return STATUS_OK or STATUS_ERROR.
+ * In the error case, optionally store a palloc'd string at *logdetail
+ * that will be sent to the postmaster log (but not the client).
+ */
 int
-md5_crypt_verify(const Port *port, const char *role, char *client_pass)
+md5_crypt_verify(const Port *port, const char *role, char *client_pass,
+				 char **logdetail)
 {
 	int			retval = STATUS_ERROR;
 	char	   *shadow_pass,
@@ -40,13 +46,6 @@ md5_crypt_verify(const Port *port, const char *role, char *client_pass)
 	HeapTuple	roleTup;
 	Datum		datum;
 	bool		isnull;
-
-	/*
-	 * Disable immediate interrupts while doing database access.  (Note we
-	 * don't bother to turn this back on if we hit one of the failure
-	 * conditions, since we can expect we'll just exit right away anyway.)
-	 */
-	ImmediateInterruptOK = false;
 
 	/* Get role info from pg_authid */
 	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(role));
@@ -58,6 +57,8 @@ md5_crypt_verify(const Port *port, const char *role, char *client_pass)
 	if (isnull)
 	{
 		ReleaseSysCache(roleTup);
+		*logdetail = psprintf(_("User \"%s\" has no password assigned."),
+							  role);
 		return STATUS_ERROR;	/* user has no password */
 	}
 	shadow_pass = TextDatumGetCString(datum);
@@ -72,9 +73,6 @@ md5_crypt_verify(const Port *port, const char *role, char *client_pass)
 	if (*shadow_pass == '\0')
 		return STATUS_ERROR;	/* empty password */
 
-	/* Re-enable immediate response to SIGTERM/SIGINT/timeout interrupts */
-	ImmediateInterruptOK = true;
-	/* And don't forget to detect one that already arrived */
 	CHECK_FOR_INTERRUPTS();
 
 	/*
@@ -148,7 +146,11 @@ md5_crypt_verify(const Port *port, const char *role, char *client_pass)
 		if (isnull)
 			retval = STATUS_OK;
 		else if (vuntil < GetCurrentTimestamp())
+		{
+			*logdetail = psprintf(_("User \"%s\" has an expired password."),
+								  role);
 			retval = STATUS_ERROR;
+		}
 		else
 			retval = STATUS_OK;
 	}

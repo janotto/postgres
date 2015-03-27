@@ -5,11 +5,12 @@
 
 #include "fmgr.h"
 #include "tsearch/ts_locale.h"
+#include "utils/memutils.h"
 
 typedef struct
 {
 	uint16		len;
-	char		name[1];
+	char		name[FLEXIBLE_ARRAY_MEMBER];
 } ltree_level;
 
 #define LEVEL_HDRSIZE	(offsetof(ltree_level,name))
@@ -19,7 +20,7 @@ typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	uint16		numlevel;
-	char		data[1];
+	char		data[FLEXIBLE_ARRAY_MEMBER];
 } ltree;
 
 #define LTREE_HDRSIZE	MAXALIGN( offsetof(ltree, data) )
@@ -30,10 +31,10 @@ typedef struct
 
 typedef struct
 {
-	int4		val;
+	int32		val;
 	uint16		len;
 	uint8		flag;
-	char		name[1];
+	char		name[FLEXIBLE_ARRAY_MEMBER];
 } lquery_variant;
 
 #define LVAR_HDRSIZE   MAXALIGN(offsetof(lquery_variant, name))
@@ -50,7 +51,7 @@ typedef struct
 	uint16		numvar;
 	uint16		low;
 	uint16		high;
-	char		variants[1];
+	char		variants[FLEXIBLE_ARRAY_MEMBER];
 } lquery_level;
 
 #define LQL_HDRSIZE MAXALIGN( offsetof(lquery_level,variants) )
@@ -71,7 +72,7 @@ typedef struct
 	uint16		numlevel;
 	uint16		firstgood;
 	uint16		flag;
-	char		data[1];
+	char		data[FLEXIBLE_ARRAY_MEMBER];
 } lquery;
 
 #define LQUERY_HDRSIZE	 MAXALIGN( offsetof(lquery, data) )
@@ -89,9 +90,9 @@ typedef struct
  */
 typedef struct ITEM
 {
-	int2		type;
-	int2		left;
-	int4		val;
+	int16		type;
+	int16		left;
+	int32		val;
 	uint8		flag;
 	/* user-friendly value */
 	uint8		length;
@@ -105,12 +106,14 @@ typedef struct ITEM
 typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int4		size;
-	char		data[1];
+	int32		size;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
 } ltxtquery;
 
-#define HDRSIZEQT		MAXALIGN(VARHDRSZ + sizeof(int4))
+#define HDRSIZEQT		MAXALIGN(VARHDRSZ + sizeof(int32))
 #define COMPUTESIZE(size,lenofoperand)	( HDRSIZEQT + (size) * sizeof(ITEM) + (lenofoperand) )
+#define LTXTQUERY_TOO_BIG(size,lenofoperand) \
+	((size) > (MaxAllocSize - HDRSIZEQT - (lenofoperand)) / sizeof(ITEM))
 #define GETQUERY(x)  (ITEM*)( (char*)(x)+HDRSIZEQT )
 #define GETOPERAND(x)	( (char*)GETQUERY(x) + ((ltxtquery*)x)->size * sizeof(ITEM) )
 
@@ -173,7 +176,7 @@ int			ltree_strncasecmp(const char *a, const char *b, size_t s);
 
 #define BITBYTE 8
 #define SIGLENINT  2
-#define SIGLEN	( sizeof(int4)*SIGLENINT )
+#define SIGLEN	( sizeof(int32)*SIGLENINT )
 #define SIGLENBIT (SIGLEN*BITBYTE)
 typedef unsigned char BITVEC[SIGLEN];
 typedef unsigned char *BITVECP;
@@ -205,7 +208,7 @@ typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	uint32		flag;
-	char		data[1];
+	char		data[FLEXIBLE_ARRAY_MEMBER];
 } ltree_gist;
 
 #define LTG_ONENODE 0x01
@@ -229,7 +232,7 @@ typedef struct
 /* GiST support for ltree[] */
 
 #define ASIGLENINT	(7)
-#define ASIGLEN		(sizeof(int4)*ASIGLENINT)
+#define ASIGLEN		(sizeof(int32)*ASIGLENINT)
 #define ASIGLENBIT (ASIGLEN*BITBYTE)
 typedef unsigned char ABITVEC[ASIGLEN];
 

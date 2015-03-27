@@ -6,6 +6,9 @@
 #
 #-------------------------------------------------------------------------
 
+PGFILEDESC = "snowball - natural language stemmers"
+PGAPPICON = win32
+
 subdir = src/backend/snowball
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
@@ -13,7 +16,7 @@ include $(top_builddir)/src/Makefile.global
 override CPPFLAGS := -I$(top_srcdir)/src/include/snowball \
 	-I$(top_srcdir)/src/include/snowball/libstemmer $(CPPFLAGS)
 
-OBJS= dict_snowball.o api.o utilities.o \
+OBJS= $(WIN32RES) dict_snowball.o api.o utilities.o \
 	stem_ISO_8859_1_danish.o \
 	stem_ISO_8859_1_dutch.o \
 	stem_ISO_8859_1_english.o \
@@ -81,7 +84,6 @@ all: all-shared-lib $(SQLSCRIPT)
 include $(top_srcdir)/src/Makefile.shlib
 
 $(SQLSCRIPT): Makefile snowball_func.sql.in snowball.sql.in
-ifeq ($(enable_shared), yes)
 	echo '-- Language-specific snowball dictionaries' > $@
 	cat $(srcdir)/snowball_func.sql.in >> $@
 	@set -e; \
@@ -104,9 +106,6 @@ ifeq ($(enable_shared), yes)
 			sed -e "s#_NONASCDICTNAME_#$${nonascdictname}_stem#g" | \
 			sed -e "s#_STOPWORDS_#$$stop#g" ; \
 	done >> $@
-else
-	echo "-- No language-specific snowball dictionaries, for lack of shared library support" > $@
-endif
 
 install: all installdirs install-lib
 	$(INSTALL_DATA) $(SQLSCRIPT) '$(DESTDIR)$(datadir)'

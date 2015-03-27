@@ -4,7 +4,7 @@
  *	  per-process shared memory data structures
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/proc.h
@@ -14,15 +14,15 @@
 #ifndef _PROC_H_
 #define _PROC_H_
 
-#include "access/xlog.h"
-#include "datatype/timestamp.h"
+#include "access/xlogdefs.h"
+#include "lib/ilist.h"
 #include "storage/latch.h"
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
- * for non-aborted subtransactions of its current top transaction.	These
+ * for non-aborted subtransactions of its current top transaction.  These
  * have to be treated as running XIDs by other backends.
  *
  * We also keep track of whether the cache overflowed (ie, the transaction has
@@ -38,14 +38,17 @@ struct XidCache
 	TransactionId xids[PGPROC_MAX_CACHED_SUBXIDS];
 };
 
-/* Flags for PGPROC->vacuumFlags */
+/* Flags for PGXACT->vacuumFlags */
 #define		PROC_IS_AUTOVACUUM	0x01	/* is it an autovac worker? */
 #define		PROC_IN_VACUUM		0x02	/* currently running lazy vacuum */
 #define		PROC_IN_ANALYZE		0x04	/* currently running analyze */
-#define		PROC_VACUUM_FOR_WRAPAROUND 0x08		/* set by autovac only */
+#define		PROC_VACUUM_FOR_WRAPAROUND	0x08	/* set by autovac only */
+#define		PROC_IN_LOGICAL_DECODING	0x10	/* currently doing logical
+												 * decoding outside xact */
 
 /* flags reset at EOXact */
-#define		PROC_VACUUM_STATE_MASK (0x0E)
+#define		PROC_VACUUM_STATE_MASK \
+	(PROC_IN_VACUUM | PROC_IN_ANALYZE | PROC_VACUUM_FOR_WRAPAROUND)
 
 /*
  * We allow a small number of "weak" relation locks (AccesShareLock,
@@ -59,7 +62,7 @@ struct XidCache
  * Each backend has a PGPROC struct in shared memory.  There is also a list of
  * currently-unused PGPROC structs that will be reallocated to new backends.
  *
- * links: list link for any list the PGPROC is in.	When waiting for a lock,
+ * links: list link for any list the PGPROC is in.  When waiting for a lock,
  * the PGPROC is linked into that lock's waitProcs queue.  A recycled PGPROC
  * is linked into ProcGlobal's freeProcs list.
  *
@@ -102,7 +105,7 @@ struct PGPROC
 	/* Info about LWLock the process is currently waiting for, if any. */
 	bool		lwWaiting;		/* true if waiting for an LW lock */
 	uint8		lwWaitMode;		/* lwlock mode being waited for */
-	struct PGPROC *lwWaitLink;	/* next waiter for same LW lock */
+	dlist_node	lwWaitLink;		/* position in LW lock wait list */
 
 	/* Info about lock the process is currently waiting for, if any. */
 	/* waitLock and waitProcLock are NULL if not currently waiting. */
@@ -132,13 +135,14 @@ struct PGPROC
 	struct XidCache subxids;	/* cache for subtransaction XIDs */
 
 	/* Per-backend LWLock.  Protects fields below. */
-	LWLockId	backendLock;	/* protects the fields below */
+	LWLock	   *backendLock;	/* protects the fields below */
 
 	/* Lock manager data, recording fast-path locks taken by this backend. */
 	uint64		fpLockBits;		/* lock modes held for each fast-path slot */
-	Oid			fpRelId[FP_LOCK_SLOTS_PER_BACKEND]; /* slots for rel oids */
+	Oid			fpRelId[FP_LOCK_SLOTS_PER_BACKEND];		/* slots for rel oids */
 	bool		fpVXIDLock;		/* are we holding a fast-path VXID lock? */
-	LocalTransactionId fpLocalTransactionId;	/* lxid for fast-path VXID lock */
+	LocalTransactionId fpLocalTransactionId;	/* lxid for fast-path VXID
+												 * lock */
 };
 
 /* NOTE: "typedef struct PGPROC PGPROC" appears in storage/lock.h. */
@@ -168,7 +172,8 @@ typedef struct PGXACT
 
 	uint8		vacuumFlags;	/* vacuum-related flags, see above */
 	bool		overflowed;
-	bool		inCommit;		/* true if within commit critical section */
+	bool		delayChkpt;		/* true if this proc delays checkpoint start;
+								 * previously called InCommit */
 
 	uint8		nxids;
 } PGXACT;
@@ -180,7 +185,7 @@ typedef struct PROC_HDR
 {
 	/* Array of PGPROC structures (not including dummies for prepared txns) */
 	PGPROC	   *allProcs;
-	/* Array of PGXACT structures (not including dummies for prepared txns */
+	/* Array of PGXACT structures (not including dummies for prepared txns) */
 	PGXACT	   *allPgXact;
 	/* Length of allProcs array */
 	uint32		allProcCount;
@@ -188,8 +193,12 @@ typedef struct PROC_HDR
 	PGPROC	   *freeProcs;
 	/* Head of list of autovacuum's free PGPROC structures */
 	PGPROC	   *autovacFreeProcs;
-	/* BGWriter process latch */
-	Latch	   *bgwriterLatch;
+	/* Head of list of bgworker free PGPROC structures */
+	PGPROC	   *bgworkerFreeProcs;
+	/* WALWriter process's latch */
+	Latch	   *walwriterLatch;
+	/* Checkpointer process's latch */
+	Latch	   *checkpointerLatch;
 	/* Current shared estimate of appropriate spins_per_delay value */
 	int			spins_per_delay;
 	/* The proc of the Startup process, since not in ProcArray */
@@ -217,9 +226,8 @@ extern PGPROC *PreparedXactProcs;
 /* configurable options */
 extern int	DeadlockTimeout;
 extern int	StatementTimeout;
+extern int	LockTimeout;
 extern bool log_lock_waits;
-
-extern volatile bool cancel_from_timeout;
 
 
 /*
@@ -243,19 +251,11 @@ extern void ProcQueueInit(PROC_QUEUE *queue);
 extern int	ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable);
 extern PGPROC *ProcWakeup(PGPROC *proc, int waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
+extern void CheckDeadLockAlert(void);
 extern bool IsWaitingForLock(void);
-extern void LockWaitCancel(void);
+extern void LockErrorCleanup(void);
 
 extern void ProcWaitForSignal(void);
 extern void ProcSendSignal(int pid);
-
-extern bool enable_sig_alarm(int delayms, bool is_statement_timeout);
-extern bool disable_sig_alarm(bool is_statement_timeout);
-extern void handle_sig_alarm(SIGNAL_ARGS);
-
-extern bool enable_standby_sig_alarm(TimestampTz now,
-						 TimestampTz fin_time, bool deadlock_only);
-extern bool disable_standby_sig_alarm(void);
-extern void handle_standby_sig_alarm(SIGNAL_ARGS);
 
 #endif   /* PROC_H */

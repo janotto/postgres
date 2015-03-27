@@ -1,7 +1,7 @@
 /* contrib/pg_stat_statements/pg_stat_statements--1.0--1.1.sql */
 
 -- complain if script is sourced in psql, rather than via ALTER EXTENSION
-\echo Use "ALTER EXTENSION pg_stat_statements UPDATE" to load this file. \quit
+\echo Use "ALTER EXTENSION pg_stat_statements UPDATE TO '1.1'" to load this file. \quit
 
 /* First we have to remove them from the extension */
 ALTER EXTENSION pg_stat_statements DROP VIEW pg_stat_statements;
@@ -28,7 +28,9 @@ CREATE FUNCTION pg_stat_statements(
     OUT local_blks_dirtied int8,
     OUT local_blks_written int8,
     OUT temp_blks_read int8,
-    OUT temp_blks_written int8
+    OUT temp_blks_written int8,
+    OUT blk_read_time float8,
+    OUT blk_write_time float8
 )
 RETURNS SETOF record
 AS 'MODULE_PATHNAME'

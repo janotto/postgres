@@ -263,7 +263,6 @@ create table defaulttest
             , col7 ddef4 DEFAULT 8000
             , col8 ddef5
             );
-NOTICE:  CREATE TABLE / PRIMARY KEY will create implicit index "defaulttest_pkey" for table "defaulttest"
 insert into defaulttest(col4) values(0); -- fails, col5 defaults to null
 ERROR:  null value in column "col5" violates not-null constraint
 DETAIL:  Failing row contains (3, 12, 5, 0, null, 88, 8000, 12.12).
@@ -653,9 +652,46 @@ ERROR:  value for domain orderedpair violates check constraint "orderedpair_chec
 CONTEXT:  PL/pgSQL function array_elem_check(integer) line 5 at assignment
 drop function array_elem_check(int);
 --
+-- Check enforcement of changing constraints in plpgsql
+--
+create domain di as int;
+create function dom_check(int) returns di as $$
+declare d di;
+begin
+  d := $1;
+  return d;
+end
+$$ language plpgsql immutable;
+select dom_check(0);
+ dom_check 
+-----------
+         0
+(1 row)
+
+alter domain di add constraint pos check (value > 0);
+select dom_check(0); -- fail
+ERROR:  value for domain di violates check constraint "pos"
+CONTEXT:  PL/pgSQL function dom_check(integer) line 4 at assignment
+alter domain di drop constraint pos;
+select dom_check(0);
+ dom_check 
+-----------
+         0
+(1 row)
+
+drop function dom_check(int);
+drop domain di;
+--
 -- Renaming
 --
 create domain testdomain1 as int;
 alter domain testdomain1 rename to testdomain2;
 alter type testdomain2 rename to testdomain3;  -- alter type also works
 drop domain testdomain3;
+--
+-- Renaming domain constraints
+--
+create domain testdomain1 as int constraint unsigned check (value > 0);
+alter domain testdomain1 rename constraint unsigned to unsigned_foo;
+alter domain testdomain1 drop constraint unsigned_foo;
+drop domain testdomain1;

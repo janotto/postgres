@@ -33,8 +33,8 @@
  * ResetLatch	- Clears the latch, allowing it to be set again
  * WaitLatch	- Waits for the latch to become set
  *
- * WaitLatch includes a provision for timeouts (which should hopefully not
- * be necessary once the code is fully latch-ified) and a provision for
+ * WaitLatch includes a provision for timeouts (which should be avoided
+ * when possible, as they incur extra overhead) and a provision for
  * postmaster child processes to wake up immediately on postmaster death.
  * See unix_latch.c for detailed specifications for the exported functions.
  *
@@ -57,15 +57,18 @@
  * SetLatch *after* that. SetLatch is designed to return quickly if the
  * latch is already set.
  *
- * Presently, when using a shared latch for interprocess signalling, the
- * flag variable(s) set by senders and inspected by the wait loop must
- * be protected by spinlocks or LWLocks, else it is possible to miss events
- * on machines with weak memory ordering (such as PPC).  This restriction
- * will be lifted in future by inserting suitable memory barriers into
- * SetLatch and ResetLatch.
+ * On some platforms, signals will not interrupt the latch wait primitive
+ * by themselves.  Therefore, it is critical that any signal handler that
+ * is meant to terminate a WaitLatch wait calls SetLatch.
+ *
+ * Note that use of the process latch (PGPROC.procLatch) is generally better
+ * than an ad-hoc shared latch for signaling auxiliary processes.  This is
+ * because generic signal handlers will call SetLatch on the process latch
+ * only, so using any latch other than the process latch effectively precludes
+ * use of any generic handler.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/latch.h
@@ -82,7 +85,7 @@
  * the public functions. It is defined here to allow embedding Latches as
  * part of bigger structs.
  */
-typedef struct
+typedef struct Latch
 {
 	sig_atomic_t is_set;
 	bool		is_shared;
@@ -93,20 +96,21 @@ typedef struct
 } Latch;
 
 /* Bitmasks for events that may wake-up WaitLatch() clients */
-#define WL_LATCH_SET         (1 << 0)
-#define WL_SOCKET_READABLE   (1 << 1)
+#define WL_LATCH_SET		 (1 << 0)
+#define WL_SOCKET_READABLE	 (1 << 1)
 #define WL_SOCKET_WRITEABLE  (1 << 2)
-#define WL_TIMEOUT           (1 << 3)
+#define WL_TIMEOUT			 (1 << 3)
 #define WL_POSTMASTER_DEATH  (1 << 4)
 
 /*
  * prototypes for functions in latch.c
  */
+extern void InitializeLatchSupport(void);
 extern void InitLatch(volatile Latch *latch);
 extern void InitSharedLatch(volatile Latch *latch);
 extern void OwnLatch(volatile Latch *latch);
 extern void DisownLatch(volatile Latch *latch);
-extern int WaitLatch(volatile Latch *latch, int wakeEvents, long timeout);
+extern int	WaitLatch(volatile Latch *latch, int wakeEvents, long timeout);
 extern int WaitLatchOrSocket(volatile Latch *latch, int wakeEvents,
 				  pgsocket sock, long timeout);
 extern void SetLatch(volatile Latch *latch);

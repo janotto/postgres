@@ -3,7 +3,7 @@
  * fmgr.c
  *	  The Postgres function manager.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -24,6 +24,7 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "pgstat.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/fmgrtab.h"
 #include "utils/guc.h"
@@ -95,7 +96,7 @@ static Datum fmgr_security_definer(PG_FUNCTION_ARGS);
 
 
 /*
- * Lookup routines for builtin-function table.	We can search by either Oid
+ * Lookup routines for builtin-function table.  We can search by either Oid
  * or name, but search by Oid is much faster.
  */
 
@@ -158,7 +159,7 @@ fmgr_lookupByName(const char *name)
 void
 fmgr_info(Oid functionId, FmgrInfo *finfo)
 {
-	fmgr_info_cxt(functionId, finfo, CurrentMemoryContext);
+	fmgr_info_cxt_security(functionId, finfo, CurrentMemoryContext, false);
 }
 
 /*
@@ -173,7 +174,7 @@ fmgr_info_cxt(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt)
 
 /*
  * This one does the actual work.  ignore_security is ordinarily false
- * but is set to true by fmgr_security_definer to avoid recursion.
+ * but is set to true when we need to avoid recursion.
  */
 static void
 fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
@@ -223,7 +224,8 @@ fmgr_info_cxt_security(Oid functionId, FmgrInfo *finfo, MemoryContext mcxt,
 	/*
 	 * If it has prosecdef set, non-null proconfig, or if a plugin wants to
 	 * hook function entry/exit, use fmgr_security_definer call handler ---
-	 * unless we are being called again by fmgr_security_definer.
+	 * unless we are being called again by fmgr_security_definer or
+	 * fmgr_info_other_lang.
 	 *
 	 * When using fmgr_security_definer, function stats tracking is always
 	 * disabled at the outer level, and instead we set the flag properly in
@@ -405,7 +407,13 @@ fmgr_info_other_lang(Oid functionId, FmgrInfo *finfo, HeapTuple procedureTuple)
 		elog(ERROR, "cache lookup failed for language %u", language);
 	languageStruct = (Form_pg_language) GETSTRUCT(languageTuple);
 
-	fmgr_info(languageStruct->lanplcallfoid, &plfinfo);
+	/*
+	 * Look up the language's call handler function, ignoring any attributes
+	 * that would normally cause insertion of fmgr_security_definer.  We need
+	 * to get back a bare pointer to the actual C-language function.
+	 */
+	fmgr_info_cxt_security(languageStruct->lanplcallfoid, &plfinfo,
+						   CurrentMemoryContext, true);
 	finfo->fn_addr = plfinfo.fn_addr;
 
 	/*
@@ -441,10 +449,7 @@ fetch_finfo_record(void *filehandle, char *funcname)
 	const Pg_finfo_record *inforec;
 	static Pg_finfo_record default_inforec = {0};
 
-	/* Compute name of info func */
-	infofuncname = (char *) palloc(strlen(funcname) + 10);
-	strcpy(infofuncname, "pg_finfo_");
-	strcat(infofuncname, funcname);
+	infofuncname = psprintf("pg_finfo_%s", funcname);
 
 	/* Try to look up the info function */
 	infofunc = (PGFInfoFunction) lookup_external_function(filehandle,
@@ -510,7 +515,7 @@ lookup_C_func(HeapTuple procedureTuple)
 					NULL);
 	if (entry == NULL)
 		return NULL;			/* no such entry */
-	if (entry->fn_xmin == HeapTupleHeaderGetXmin(procedureTuple->t_data) &&
+	if (entry->fn_xmin == HeapTupleHeaderGetRawXmin(procedureTuple->t_data) &&
 		ItemPointerEquals(&entry->fn_tid, &procedureTuple->t_self))
 		return entry;			/* OK */
 	return NULL;				/* entry is out of date */
@@ -535,11 +540,10 @@ record_C_func(HeapTuple procedureTuple,
 		MemSet(&hash_ctl, 0, sizeof(hash_ctl));
 		hash_ctl.keysize = sizeof(Oid);
 		hash_ctl.entrysize = sizeof(CFuncHashTabEntry);
-		hash_ctl.hash = oid_hash;
 		CFuncHash = hash_create("CFuncHash",
 								100,
 								&hash_ctl,
-								HASH_ELEM | HASH_FUNCTION);
+								HASH_ELEM | HASH_BLOBS);
 	}
 
 	entry = (CFuncHashTabEntry *)
@@ -548,7 +552,7 @@ record_C_func(HeapTuple procedureTuple,
 					HASH_ENTER,
 					&found);
 	/* OID is already filled in */
-	entry->fn_xmin = HeapTupleHeaderGetXmin(procedureTuple->t_data);
+	entry->fn_xmin = HeapTupleHeaderGetRawXmin(procedureTuple->t_data);
 	entry->fn_tid = procedureTuple->t_self;
 	entry->user_fn = user_fn;
 	entry->inforec = inforec;
@@ -573,7 +577,7 @@ clear_external_function_hash(void *filehandle)
  * Copy an FmgrInfo struct
  *
  * This is inherently somewhat bogus since we can't reliably duplicate
- * language-dependent subsidiary info.	We cheat by zeroing fn_extra,
+ * language-dependent subsidiary info.  We cheat by zeroing fn_extra,
  * instead, meaning that subsidiary info will have to be recomputed.
  */
 void
@@ -853,7 +857,7 @@ fmgr_oldstyle(PG_FUNCTION_ARGS)
 
 
 /*
- * Support for security-definer and proconfig-using functions.	We support
+ * Support for security-definer and proconfig-using functions.  We support
  * both of these features using the same call handler, because they are
  * often used together and it would be inefficient (as well as notationally
  * messy) to have two levels of call handler involved.
@@ -873,7 +877,7 @@ struct fmgr_security_definer_cache
  * (All this info is cached for the duration of the current query.)
  * To execute a call, we temporarily replace the flinfo with the cached
  * and looked-up one, while keeping the outer fcinfo (which contains all
- * the actual arguments, etc.) intact.	This is not re-entrant, but then
+ * the actual arguments, etc.) intact.  This is not re-entrant, but then
  * the fcinfo itself can't be used re-entrantly anyway.
  */
 static Datum
@@ -953,7 +957,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 
 	/*
 	 * We don't need to restore GUC or userid settings on error, because the
-	 * ensuing xact or subxact abort will do that.	The PG_TRY block is only
+	 * ensuing xact or subxact abort will do that.  The PG_TRY block is only
 	 * needed to clean up the flinfo link.
 	 */
 	save_flinfo = fcinfo->flinfo;
@@ -1006,7 +1010,7 @@ fmgr_security_definer(PG_FUNCTION_ARGS)
 /*
  * These are for invocation of a specifically named function with a
  * directly-computed parameter list.  Note that neither arguments nor result
- * are allowed to be NULL.	Also, the function cannot be one that needs to
+ * are allowed to be NULL.  Also, the function cannot be one that needs to
  * look at FmgrInfo, since there won't be any.
  */
 Datum
@@ -1551,8 +1555,8 @@ FunctionCall9Coll(FmgrInfo *flinfo, Oid collation, Datum arg1, Datum arg2,
 /*
  * These are for invocation of a function identified by OID with a
  * directly-computed parameter list.  Note that neither arguments nor result
- * are allowed to be NULL.	These are essentially fmgr_info() followed
- * by FunctionCallN().	If the same function is to be invoked repeatedly,
+ * are allowed to be NULL.  These are essentially fmgr_info() followed
+ * by FunctionCallN().  If the same function is to be invoked repeatedly,
  * do the fmgr_info() once and then use FunctionCallN().
  */
 Datum
@@ -1881,7 +1885,7 @@ OidFunctionCall9Coll(Oid functionId, Oid collation, Datum arg1, Datum arg2,
  *
  * One important difference from the bare function call is that we will
  * push any active SPI context, allowing SPI-using I/O functions to be
- * called from other SPI functions without extra notation.	This is a hack,
+ * called from other SPI functions without extra notation.  This is a hack,
  * but the alternative of expecting all SPI functions to do SPI_push/SPI_pop
  * around I/O calls seems worse.
  */
@@ -2274,6 +2278,7 @@ pg_detoast_datum_packed(struct varlena * datum)
  * These are needed by polymorphic functions, which accept multiple possible
  * input types and need help from the parser to know what they've got.
  * Also, some functions might be interested in whether a parameter is constant.
+ * Functions taking VARIADIC ANY also need to know about the VARIADIC keyword.
  *-------------------------------------------------------------------------
  */
 
@@ -2437,4 +2442,114 @@ get_call_expr_arg_stable(Node *expr, int argnum)
 		return true;
 
 	return false;
+}
+
+/*
+ * Get the VARIADIC flag from the function invocation
+ *
+ * Returns false (the default assumption) if information is not available
+ *
+ * Note this is generally only of interest to VARIADIC ANY functions
+ */
+bool
+get_fn_expr_variadic(FmgrInfo *flinfo)
+{
+	Node	   *expr;
+
+	/*
+	 * can't return anything useful if we have no FmgrInfo or if its fn_expr
+	 * node has not been initialized
+	 */
+	if (!flinfo || !flinfo->fn_expr)
+		return false;
+
+	expr = flinfo->fn_expr;
+
+	if (IsA(expr, FuncExpr))
+		return ((FuncExpr *) expr)->funcvariadic;
+	else
+		return false;
+}
+
+/*-------------------------------------------------------------------------
+ *		Support routines for procedural language implementations
+ *-------------------------------------------------------------------------
+ */
+
+/*
+ * Verify that a validator is actually associated with the language of a
+ * particular function and that the user has access to both the language and
+ * the function.  All validators should call this before doing anything
+ * substantial.  Doing so ensures a user cannot achieve anything with explicit
+ * calls to validators that he could not achieve with CREATE FUNCTION or by
+ * simply calling an existing function.
+ *
+ * When this function returns false, callers should skip all validation work
+ * and call PG_RETURN_VOID().  This never happens at present; it is reserved
+ * for future expansion.
+ *
+ * In particular, checking that the validator corresponds to the function's
+ * language allows untrusted language validators to assume they process only
+ * superuser-chosen source code.  (Untrusted language call handlers, by
+ * definition, do assume that.)  A user lacking the USAGE language privilege
+ * would be unable to reach the validator through CREATE FUNCTION, so we check
+ * that to block explicit calls as well.  Checking the EXECUTE privilege on
+ * the function is often superfluous, because most users can clone the
+ * function to get an executable copy.  It is meaningful against users with no
+ * database TEMP right and no permanent schema CREATE right, thereby unable to
+ * create any function.  Also, if the function tracks persistent state by
+ * function OID or name, validating the original function might permit more
+ * mischief than creating and validating a clone thereof.
+ */
+bool
+CheckFunctionValidatorAccess(Oid validatorOid, Oid functionOid)
+{
+	HeapTuple	procTup;
+	HeapTuple	langTup;
+	Form_pg_proc procStruct;
+	Form_pg_language langStruct;
+	AclResult	aclresult;
+
+	/* Get the function's pg_proc entry */
+	procTup = SearchSysCache1(PROCOID, ObjectIdGetDatum(functionOid));
+	if (!HeapTupleIsValid(procTup))
+		elog(ERROR, "cache lookup failed for function %u", functionOid);
+	procStruct = (Form_pg_proc) GETSTRUCT(procTup);
+
+	/*
+	 * Fetch pg_language entry to know if this is the correct validation
+	 * function for that pg_proc entry.
+	 */
+	langTup = SearchSysCache1(LANGOID, ObjectIdGetDatum(procStruct->prolang));
+	if (!HeapTupleIsValid(langTup))
+		elog(ERROR, "cache lookup failed for language %u", procStruct->prolang);
+	langStruct = (Form_pg_language) GETSTRUCT(langTup);
+
+	if (langStruct->lanvalidator != validatorOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("language validation function %u called for language %u instead of %u",
+						validatorOid, procStruct->prolang,
+						langStruct->lanvalidator)));
+
+	/* first validate that we have permissions to use the language */
+	aclresult = pg_language_aclcheck(procStruct->prolang, GetUserId(),
+									 ACL_USAGE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, ACL_KIND_LANGUAGE,
+					   NameStr(langStruct->lanname));
+
+	/*
+	 * Check whether we are allowed to execute the function itself. If we can
+	 * execute it, there should be no possible side-effect of
+	 * compiling/validation that execution can't have.
+	 */
+	aclresult = pg_proc_aclcheck(functionOid, GetUserId(), ACL_EXECUTE);
+	if (aclresult != ACLCHECK_OK)
+		aclcheck_error(aclresult, ACL_KIND_PROC, NameStr(procStruct->proname));
+
+	ReleaseSysCache(procTup);
+	ReleaseSysCache(langTup);
+
+	return true;
 }

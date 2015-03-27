@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2015, PostgreSQL Global Development Group
  *
  * src/bin/psql/large_obj.c
  */
@@ -12,9 +12,7 @@
 #include "settings.h"
 #include "common.h"
 
-static void
-print_lo_result(const char *fmt,...)
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
+static void print_lo_result(const char *fmt,...) pg_attribute_printf(1, 2);
 
 static void
 print_lo_result(const char *fmt,...)
@@ -47,7 +45,7 @@ print_lo_result(const char *fmt,...)
 
 
 /*
- * Prepare to do a large-object operation.	We *must* be inside a transaction
+ * Prepare to do a large-object operation.  We *must* be inside a transaction
  * block for all these operations, so start one if needed.
  *
  * Returns TRUE if okay, FALSE if failed.  *own_transaction is set to indicate
@@ -73,7 +71,7 @@ start_lo_xact(const char *operation, bool *own_transaction)
 	{
 		case PQTRANS_IDLE:
 			/* need to start our own xact */
-			if (!(res = PSQLexec("BEGIN", false)))
+			if (!(res = PSQLexec("BEGIN")))
 				return false;
 			PQclear(res);
 			*own_transaction = true;
@@ -103,9 +101,9 @@ finish_lo_xact(const char *operation, bool own_transaction)
 	if (own_transaction && pset.autocommit)
 	{
 		/* close out our own xact */
-		if (!(res = PSQLexec("COMMIT", false)))
+		if (!(res = PSQLexec("COMMIT")))
 		{
-			res = PSQLexec("ROLLBACK", false);
+			res = PSQLexec("ROLLBACK");
 			PQclear(res);
 			return false;
 		}
@@ -126,7 +124,7 @@ fail_lo_xact(const char *operation, bool own_transaction)
 	if (own_transaction && pset.autocommit)
 	{
 		/* close out our own xact */
-		res = PSQLexec("ROLLBACK", false);
+		res = PSQLexec("ROLLBACK");
 		PQclear(res);
 	}
 
@@ -155,7 +153,7 @@ do_lo_export(const char *loid_arg, const char *filename_arg)
 	/* of course this status is documented nowhere :( */
 	if (status != 1)
 	{
-		fputs(PQerrorMessage(pset.db), stderr);
+		psql_error("%s", PQerrorMessage(pset.db));
 		return fail_lo_xact("\\lo_export", own_transaction);
 	}
 
@@ -190,7 +188,7 @@ do_lo_import(const char *filename_arg, const char *comment_arg)
 
 	if (loid == InvalidOid)
 	{
-		fputs(PQerrorMessage(pset.db), stderr);
+		psql_error("%s", PQerrorMessage(pset.db));
 		return fail_lo_xact("\\lo_import", own_transaction);
 	}
 
@@ -209,7 +207,7 @@ do_lo_import(const char *filename_arg, const char *comment_arg)
 		bufptr += PQescapeStringConn(pset.db, bufptr, comment_arg, slen, NULL);
 		strcpy(bufptr, "'");
 
-		if (!(res = PSQLexec(cmdbuf, false)))
+		if (!(res = PSQLexec(cmdbuf)))
 		{
 			free(cmdbuf);
 			return fail_lo_xact("\\lo_import", own_transaction);
@@ -252,7 +250,7 @@ do_lo_unlink(const char *loid_arg)
 
 	if (status == -1)
 	{
-		fputs(PQerrorMessage(pset.db), stderr);
+		psql_error("%s", PQerrorMessage(pset.db));
 		return fail_lo_xact("\\lo_unlink", own_transaction);
 	}
 
@@ -301,7 +299,7 @@ do_lo_list(void)
 				 gettext_noop("Description"));
 	}
 
-	res = PSQLexec(buf, false);
+	res = PSQLexec(buf);
 	if (!res)
 		return false;
 

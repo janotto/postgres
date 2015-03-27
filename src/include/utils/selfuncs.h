@@ -5,7 +5,7 @@
  *	  standard operators and index access methods.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/utils/selfuncs.h
@@ -23,7 +23,7 @@
 /*
  * Note: the default selectivity estimates are not chosen entirely at random.
  * We want them to be small enough to ensure that indexscans will be used if
- * available, for typical table densities of ~100 tuples/page.	Thus, for
+ * available, for typical table densities of ~100 tuples/page.  Thus, for
  * example, 0.01 is not quite small enough, since that makes it appear that
  * nearly all pages will be hit anyway.  Also, since we sometimes estimate
  * eqsel as 1/num_distinct, we probably want DEFAULT_NUM_DISTINCT to equal
@@ -121,7 +121,7 @@ extern void get_join_variables(PlannerInfo *root, List *args,
 				   VariableStatData *vardata2,
 				   bool *join_is_reversed);
 extern double get_variable_numdistinct(VariableStatData *vardata,
-									   bool *isdefault);
+						 bool *isdefault);
 extern double mcv_selectivity(VariableStatData *vardata, FmgrInfo *opproc,
 				Datum constval, bool varonleft,
 				double *sumcommonp);
@@ -134,7 +134,7 @@ extern Pattern_Prefix_Status pattern_fixed_prefix(Const *patt,
 					 Pattern_Type ptype,
 					 Oid collation,
 					 Const **prefix,
-					 Const **rest);
+					 Selectivity *rest_selec);
 extern Const *make_greater_string(const Const *str_const, FmgrInfo *ltproc,
 					Oid collation);
 
@@ -190,6 +190,7 @@ extern double estimate_num_groups(PlannerInfo *root, List *groupExprs,
 extern Selectivity estimate_hash_bucketsize(PlannerInfo *root, Node *hashkey,
 						 double nbuckets);
 
+extern Datum brincostestimate(PG_FUNCTION_ARGS);
 extern Datum btcostestimate(PG_FUNCTION_ARGS);
 extern Datum hashcostestimate(PG_FUNCTION_ARGS);
 extern Datum gistcostestimate(PG_FUNCTION_ARGS);

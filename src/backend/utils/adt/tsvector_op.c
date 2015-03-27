@@ -3,7 +3,7 @@
  * tsvector_op.c
  *	  operations over tsvector
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -44,14 +44,14 @@ typedef struct StatEntry
 	struct StatEntry *left;
 	struct StatEntry *right;
 	uint32		lenlexeme;
-	char		lexeme[1];
+	char		lexeme[FLEXIBLE_ARRAY_MEMBER];
 } StatEntry;
 
 #define STATENTRYHDRSZ	(offsetof(StatEntry, lexeme))
 
 typedef struct
 {
-	int4		weight;
+	int32		weight;
 
 	uint32		maxdepth;
 
@@ -221,7 +221,7 @@ Datum
 tsvector_length(PG_FUNCTION_ARGS)
 {
 	TSVector	in = PG_GETARG_TSVECTOR(0);
-	int4		ret = in->size;
+	int32		ret = in->size;
 
 	PG_FREE_IF_COPY(in, 0);
 	PG_RETURN_INT32(ret);
@@ -293,10 +293,10 @@ tsvector_setweight(PG_FUNCTION_ARGS)
  * Add positions from src to dest after offsetting them by maxpos.
  * Return the number added (might be less than expected due to overflow)
  */
-static int4
+static int32
 add_pos(TSVector src, WordEntry *srcptr,
 		TSVector dest, WordEntry *destptr,
-		int4 maxpos)
+		int32 maxpos)
 {
 	uint16	   *clen = &_POSVECPTR(dest, destptr)->npos;
 	int			i;
@@ -373,9 +373,9 @@ tsvector_concat(PG_FUNCTION_ARGS)
 	i2 = in2->size;
 
 	/*
-	 * Conservative estimate of space needed.  We might need all the data
-	 * in both inputs, and conceivably add a pad byte before position data
-	 * for each item where there was none before.
+	 * Conservative estimate of space needed.  We might need all the data in
+	 * both inputs, and conceivably add a pad byte before position data for
+	 * each item where there was none before.
 	 */
 	output_bytes = VARSIZE(in1) + VARSIZE(in2) + i1 + i2;
 
@@ -552,7 +552,7 @@ tsvector_concat(PG_FUNCTION_ARGS)
  *
  * if isPrefix = true then it returns zero value iff b has prefix a
  */
-int4
+int32
 tsCompareString(char *a, int lena, char *b, int lenb, bool prefix)
 {
 	int			cmp;

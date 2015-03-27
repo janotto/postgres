@@ -6,6 +6,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "commands/trigger.h"
@@ -30,9 +31,9 @@ static void PLy_function_delete_args(PLyProcedure *proc);
 static void plpython_return_error_callback(void *arg);
 
 static PyObject *PLy_trigger_build_args(FunctionCallInfo fcinfo, PLyProcedure *proc,
-										HeapTuple *rv);
+					   HeapTuple *rv);
 static HeapTuple PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd,
-								  TriggerData *tdata, HeapTuple otup);
+				 TriggerData *tdata, HeapTuple otup);
 static void plpython_trigger_error_callback(void *arg);
 
 static PyObject *PLy_procedure_call(PLyProcedure *proc, char *kargs, PyObject *vargs);
@@ -88,7 +89,7 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("unsupported set function return mode"),
-							 errdetail("PL/Python set-returning functions only support returning only value per call.")));
+							 errdetail("PL/Python set-returning functions only support returning one value per call.")));
 				}
 				rsi->returnMode = SFRM_ValuePerCall;
 
@@ -181,7 +182,6 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 		else if (proc->result.is_rowtype >= 1)
 		{
 			TupleDesc	desc;
-			HeapTuple	tuple = NULL;
 
 			/* make sure it's not an unnamed record */
 			Assert((proc->result.out.d.typoid == RECORDOID &&
@@ -192,18 +192,10 @@ PLy_exec_function(FunctionCallInfo fcinfo, PLyProcedure *proc)
 			desc = lookup_rowtype_tupdesc(proc->result.out.d.typoid,
 										  proc->result.out.d.typmod);
 
-			tuple = PLyObject_ToTuple(&proc->result, desc, plrv);
+			rv = PLyObject_ToCompositeDatum(&proc->result, desc, plrv);
+			fcinfo->isnull = (rv == (Datum) NULL);
 
-			if (tuple != NULL)
-			{
-				fcinfo->isnull = false;
-				rv = HeapTupleGetDatum(tuple);
-			}
-			else
-			{
-				fcinfo->isnull = true;
-				rv = (Datum) NULL;
-			}
+			ReleaseTupleDesc(desc);
 		}
 		else
 		{
@@ -257,7 +249,7 @@ PLy_exec_trigger(FunctionCallInfo fcinfo, PLyProcedure *proc)
 	Assert(CALLED_AS_TRIGGER(fcinfo));
 
 	/*
-	 * Input/output conversion for trigger tuples.	Use the result TypeInfo
+	 * Input/output conversion for trigger tuples.  Use the result TypeInfo
 	 * variable to store the tuple conversion info.  We do this over again on
 	 * each call to cover the possibility that the relation's tupdesc changed
 	 * since the trigger was last called. PLy_input_tuple_funcs and
@@ -455,7 +447,9 @@ PLy_function_delete_args(PLyProcedure *proc)
 static void
 plpython_return_error_callback(void *arg)
 {
-	if (PLy_curr_procedure)
+	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+
+	if (exec_ctx->curr_proc)
 		errcontext("while creating return value");
 }
 
@@ -643,9 +637,7 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 {
 	PyObject   *volatile plntup;
 	PyObject   *volatile plkeys;
-	PyObject   *volatile platt;
 	PyObject   *volatile plval;
-	PyObject   *volatile plstr;
 	HeapTuple	rtup;
 	int			natts,
 				i,
@@ -661,7 +653,7 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 	plerrcontext.previous = error_context_stack;
 	error_context_stack = &plerrcontext;
 
-	plntup = plkeys = platt = plval = plstr = NULL;
+	plntup = plkeys = plval = NULL;
 	modattrs = NULL;
 	modvalues = NULL;
 	modnulls = NULL;
@@ -671,10 +663,10 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 		if ((plntup = PyDict_GetItemString(pltd, "new")) == NULL)
 			ereport(ERROR,
 					(errmsg("TD[\"new\"] deleted, cannot modify row")));
+		Py_INCREF(plntup);
 		if (!PyDict_Check(plntup))
 			ereport(ERROR,
 					(errmsg("TD[\"new\"] is not a dictionary")));
-		Py_INCREF(plntup);
 
 		plkeys = PyDict_Keys(plntup);
 		natts = PyList_Size(plkeys);
@@ -687,6 +679,7 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 
 		for (i = 0; i < natts; i++)
 		{
+			PyObject   *platt;
 			char	   *plattstr;
 
 			platt = PyList_GetItem(plkeys, i);
@@ -753,7 +746,6 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 		Py_XDECREF(plntup);
 		Py_XDECREF(plkeys);
 		Py_XDECREF(plval);
-		Py_XDECREF(plstr);
 
 		if (modnulls)
 			pfree(modnulls);
@@ -781,7 +773,9 @@ PLy_modify_tuple(PLyProcedure *proc, PyObject *pltd, TriggerData *tdata,
 static void
 plpython_trigger_error_callback(void *arg)
 {
-	if (PLy_curr_procedure)
+	PLyExecutionContext *exec_ctx = PLy_current_execution_context();
+
+	if (exec_ctx->curr_proc)
 		errcontext("while modifying trigger row");
 }
 

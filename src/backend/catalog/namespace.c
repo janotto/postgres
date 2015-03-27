@@ -9,7 +9,7 @@
  * and implementing search-path-controlled searches.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -19,8 +19,11 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "catalog/dependency.h"
+#include "catalog/objectaccess.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_conversion.h"
@@ -46,6 +49,7 @@
 #include "storage/sinval.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -63,10 +67,10 @@
  * when we are obeying an override search path spec that says not to use the
  * temp namespace, or the temp namespace is included in the explicit list.)
  *
- * 2. The system catalog namespace is always searched.	If the system
+ * 2. The system catalog namespace is always searched.  If the system
  * namespace is present in the explicit path then it will be searched in
  * the specified order; otherwise it will be searched after TEMP tables and
- * *before* the explicit list.	(It might seem that the system namespace
+ * *before* the explicit list.  (It might seem that the system namespace
  * should be implicitly last, but this behavior appears to be required by
  * SQL99.  Also, this provides a way to search the system namespace first
  * without thereby making it the default creation target namespace.)
@@ -84,7 +88,7 @@
  * to refer to the current backend's temp namespace.  This is usually also
  * ignorable if the temp namespace hasn't been set up, but there's a special
  * case: if "pg_temp" appears first then it should be the default creation
- * target.	We kluge this case a little bit so that the temp namespace isn't
+ * target.  We kluge this case a little bit so that the temp namespace isn't
  * set up until the first attempt to create something in it.  (The reason for
  * klugery is that we can't create the temp namespace outside a transaction,
  * but initial GUC processing of search_path happens outside a transaction.)
@@ -95,7 +99,7 @@
  * In bootstrap mode, the search path is set equal to "pg_catalog", so that
  * the system namespace is the only one searched or inserted into.
  * initdb is also careful to set search_path to "pg_catalog" for its
- * post-bootstrap standalone backend runs.	Otherwise the default search
+ * post-bootstrap standalone backend runs.  Otherwise the default search
  * path is determined by GUC.  The factory default path contains the PUBLIC
  * namespace (if it exists), preceded by the user's personal namespace
  * (if one exists).
@@ -159,13 +163,13 @@ static List *overrideStack = NIL;
 /*
  * myTempNamespace is InvalidOid until and unless a TEMP namespace is set up
  * in a particular backend session (this happens when a CREATE TEMP TABLE
- * command is first executed).	Thereafter it's the OID of the temp namespace.
+ * command is first executed).  Thereafter it's the OID of the temp namespace.
  *
  * myTempToastNamespace is the OID of the namespace for my temp tables' toast
- * tables.	It is set when myTempNamespace is, and is InvalidOid before that.
+ * tables.  It is set when myTempNamespace is, and is InvalidOid before that.
  *
  * myTempNamespaceSubID shows whether we've created the TEMP namespace in the
- * current subtransaction.	The flag propagates up the subtransaction tree,
+ * current subtransaction.  The flag propagates up the subtransaction tree,
  * so the main transaction will correctly recognize the flag if all
  * intermediate subtransactions commit.  When it is InvalidSubTransactionId,
  * we either haven't made the TEMP namespace yet, or have successfully
@@ -215,8 +219,8 @@ Datum		pg_is_other_temp_schema(PG_FUNCTION_ARGS);
  *		Given a RangeVar describing an existing relation,
  *		select the proper namespace and look up the relation OID.
  *
- * If the relation is not found, return InvalidOid if missing_ok = true,
- * otherwise raise an error.
+ * If the schema or relation is not found, return InvalidOid if missing_ok
+ * = true, otherwise raise an error.
  *
  * If nowait = true, throw an error if we'd have to wait for a lock.
  *
@@ -226,7 +230,7 @@ Datum		pg_is_other_temp_schema(PG_FUNCTION_ARGS);
 Oid
 RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 						 bool missing_ok, bool nowait,
-						 RangeVarGetRelidCallback callback, void *callback_arg)
+					   RangeVarGetRelidCallback callback, void *callback_arg)
 {
 	uint64		inval_count;
 	Oid			relId;
@@ -247,20 +251,20 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	}
 
 	/*
-	 * DDL operations can change the results of a name lookup.  Since all
-	 * such operations will generate invalidation messages, we keep track
-	 * of whether any such messages show up while we're performing the
-	 * operation, and retry until either (1) no more invalidation messages
-	 * show up or (2) the answer doesn't change.
+	 * DDL operations can change the results of a name lookup.  Since all such
+	 * operations will generate invalidation messages, we keep track of
+	 * whether any such messages show up while we're performing the operation,
+	 * and retry until either (1) no more invalidation messages show up or (2)
+	 * the answer doesn't change.
 	 *
 	 * But if lockmode = NoLock, then we assume that either the caller is OK
 	 * with the answer changing under them, or that they already hold some
 	 * appropriate lock, and therefore return the first answer we get without
 	 * checking for invalidation messages.  Also, if the requested lock is
-	 * already held, no LockRelationOid will not AcceptInvalidationMessages,
-	 * so we may fail to notice a change.  We could protect against that case
-	 * by calling AcceptInvalidationMessages() before beginning this loop,
-	 * but that would add a significant amount overhead, so for now we don't.
+	 * already held, LockRelationOid will not AcceptInvalidationMessages, so
+	 * we may fail to notice a change.  We could protect against that case by
+	 * calling AcceptInvalidationMessages() before beginning this loop, but
+	 * that would add a significant amount overhead, so for now we don't.
 	 */
 	for (;;)
 	{
@@ -282,17 +286,23 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 		if (relation->relpersistence == RELPERSISTENCE_TEMP)
 		{
 			if (!OidIsValid(myTempNamespace))
-				relId = InvalidOid;	/* this probably can't happen? */
+				relId = InvalidOid;		/* this probably can't happen? */
 			else
 			{
 				if (relation->schemaname)
 				{
-					Oid		namespaceId;
-					namespaceId = LookupExplicitNamespace(relation->schemaname);
+					Oid			namespaceId;
+
+					namespaceId = LookupExplicitNamespace(relation->schemaname, missing_ok);
+
+					/*
+					 * For missing_ok, allow a non-existant schema name to
+					 * return InvalidOid.
+					 */
 					if (namespaceId != myTempNamespace)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-							   errmsg("temporary tables cannot specify a schema name")));
+								 errmsg("temporary tables cannot specify a schema name")));
 				}
 
 				relId = get_relname_relid(relation->relname, myTempNamespace);
@@ -303,8 +313,11 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 			Oid			namespaceId;
 
 			/* use exact schema given */
-			namespaceId = LookupExplicitNamespace(relation->schemaname);
-			relId = get_relname_relid(relation->relname, namespaceId);
+			namespaceId = LookupExplicitNamespace(relation->schemaname, missing_ok);
+			if (missing_ok && !OidIsValid(namespaceId))
+				relId = InvalidOid;
+			else
+				relId = get_relname_relid(relation->relname, namespaceId);
 		}
 		else
 		{
@@ -315,12 +328,12 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 		/*
 		 * Invoke caller-supplied callback, if any.
 		 *
-		 * This callback is a good place to check permissions: we haven't taken
-		 * the table lock yet (and it's really best to check permissions before
-		 * locking anything!), but we've gotten far enough to know what OID we
-		 * think we should lock.  Of course, concurrent DDL might change things
-		 * while we're waiting for the lock, but in that case the callback will
-		 * be invoked again for the new OID.
+		 * This callback is a good place to check permissions: we haven't
+		 * taken the table lock yet (and it's really best to check permissions
+		 * before locking anything!), but we've gotten far enough to know what
+		 * OID we think we should lock.  Of course, concurrent DDL might
+		 * change things while we're waiting for the lock, but in that case
+		 * the callback will be invoked again for the new OID.
 		 */
 		if (callback)
 			callback(relation, relId, oldRelId, callback_arg);
@@ -328,21 +341,21 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 		/*
 		 * If no lock requested, we assume the caller knows what they're
 		 * doing.  They should have already acquired a heavyweight lock on
-		 * this relation earlier in the processing of this same statement,
-		 * so it wouldn't be appropriate to AcceptInvalidationMessages()
-		 * here, as that might pull the rug out from under them.
+		 * this relation earlier in the processing of this same statement, so
+		 * it wouldn't be appropriate to AcceptInvalidationMessages() here, as
+		 * that might pull the rug out from under them.
 		 */
 		if (lockmode == NoLock)
 			break;
 
 		/*
-		 * If, upon retry, we get back the same OID we did last time, then
-		 * the invalidation messages we processed did not change the final
-		 * answer.  So we're done.
+		 * If, upon retry, we get back the same OID we did last time, then the
+		 * invalidation messages we processed did not change the final answer.
+		 * So we're done.
 		 *
 		 * If we got a different OID, we've locked the relation that used to
-		 * have this name rather than the one that does now.  So release
-		 * the lock.
+		 * have this name rather than the one that does now.  So release the
+		 * lock.
 		 */
 		if (retry)
 		{
@@ -384,8 +397,8 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 			break;
 
 		/*
-		 * Something may have changed.  Let's repeat the name lookup, to
-		 * make sure this name still references the same relation it did
+		 * Something may have changed.  Let's repeat the name lookup, to make
+		 * sure this name still references the same relation it did
 		 * previously.
 		 */
 		retry = true;
@@ -490,7 +503,7 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
  * the same name which already exists in that namespace, or to InvalidOid if
  * no such relation exists.
  *
- * If lockmode != NoLock, the specified lock mode is acquire on the existing
+ * If lockmode != NoLock, the specified lock mode is acquired on the existing
  * relation, if any, provided that the current user owns the target relation.
  * However, if lockmode != NoLock and the user does not own the target
  * relation, we throw an ERROR, as we must not try to lock relations the
@@ -550,8 +563,8 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 			relid = InvalidOid;
 
 		/*
-		 * In bootstrap processing mode, we don't bother with permissions
-		 * or locking.  Permissions might not be working yet, and locking is
+		 * In bootstrap processing mode, we don't bother with permissions or
+		 * locking.  Permissions might not be working yet, and locking is
 		 * unnecessary.
 		 */
 		if (IsBootstrapProcessingMode())
@@ -617,7 +630,7 @@ RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid)
 	switch (newRelation->relpersistence)
 	{
 		case RELPERSISTENCE_TEMP:
-			if (!isTempOrToastNamespace(nspid))
+			if (!isTempOrTempToastNamespace(nspid))
 			{
 				if (isAnyTempNamespace(nspid))
 					ereport(ERROR,
@@ -630,7 +643,7 @@ RangeVarAdjustRelationPersistence(RangeVar *newRelation, Oid nspid)
 			}
 			break;
 		case RELPERSISTENCE_PERMANENT:
-			if (isTempOrToastNamespace(nspid))
+			if (isTempOrTempToastNamespace(nspid))
 				newRelation->relpersistence = RELPERSISTENCE_TEMP;
 			else if (isAnyTempNamespace(nspid))
 				ereport(ERROR,
@@ -857,7 +870,7 @@ TypeIsVisible(Oid typid)
  * and the returned nvargs will always be zero.
  *
  * If expand_defaults is true, functions that could match after insertion of
- * default argument values will also be retrieved.	In this case the returned
+ * default argument values will also be retrieved.  In this case the returned
  * structs could have nargs > passed-in nargs, and ndargs is set to the number
  * of additional args (which can be retrieved from the function's
  * proargdefaults entry).
@@ -894,10 +907,15 @@ TypeIsVisible(Oid typid)
  * with oid = 0 that represents a set of such conflicting candidates.
  * The caller might end up discarding such an entry anyway, but if it selects
  * such an entry it should react as though the call were ambiguous.
+ *
+ * If missing_ok is true, an empty list (NULL) is returned if the name was
+ * schema- qualified with a schema that does not exist.  Likewise if no
+ * candidate is found for other reasons.
  */
 FuncCandidateList
 FuncnameGetCandidates(List *names, int nargs, List *argnames,
-					  bool expand_variadic, bool expand_defaults)
+					  bool expand_variadic, bool expand_defaults,
+					  bool missing_ok)
 {
 	FuncCandidateList resultList = NULL;
 	bool		any_special = false;
@@ -916,7 +934,9 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (!OidIsValid(namespaceId))
+			return NULL;
 	}
 	else
 	{
@@ -1013,7 +1033,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 			 * Call uses positional notation
 			 *
 			 * Check if function is variadic, and get variadic element type if
-			 * so.	If expand_variadic is false, we should just ignore
+			 * so.  If expand_variadic is false, we should just ignore
 			 * variadic-ness.
 			 */
 			if (pronargs <= nargs && expand_variadic)
@@ -1055,8 +1075,8 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 		 */
 		effective_nargs = Max(pronargs, nargs);
 		newResult = (FuncCandidateList)
-			palloc(sizeof(struct _FuncCandidateList) - sizeof(Oid)
-				   + effective_nargs * sizeof(Oid));
+			palloc(offsetof(struct _FuncCandidateList, args) +
+				   effective_nargs * sizeof(Oid));
 		newResult->pathpos = pathpos;
 		newResult->oid = HeapTupleGetOid(proctup);
 		newResult->nargs = effective_nargs;
@@ -1143,7 +1163,7 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 			if (prevResult)
 			{
 				/*
-				 * We have a match with a previous result.	Decide which one
+				 * We have a match with a previous result.  Decide which one
 				 * to keep, or mark it ambiguous if we can't decide.  The
 				 * logic here is preference > 0 means prefer the old result,
 				 * preference < 0 means prefer the new, preference = 0 means
@@ -1402,7 +1422,7 @@ FunctionIsVisible(Oid funcid)
 		visible = false;
 
 		clist = FuncnameGetCandidates(list_make1(makeString(proname)),
-									  nargs, NIL, false, false);
+									  nargs, NIL, false, false, false);
 
 		for (; clist; clist = clist->next)
 		{
@@ -1431,7 +1451,8 @@ FunctionIsVisible(Oid funcid)
  * a postfix op.
  *
  * If the operator name is not schema-qualified, it is sought in the current
- * namespace search path.
+ * namespace search path.  If the name is schema-qualified and the given
+ * schema does not exist, InvalidOid is returned.
  */
 Oid
 OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
@@ -1448,21 +1469,26 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 	{
 		/* search only in exact schema given */
 		Oid			namespaceId;
-		HeapTuple	opertup;
 
-		namespaceId = LookupExplicitNamespace(schemaname);
-		opertup = SearchSysCache4(OPERNAMENSP,
-								  CStringGetDatum(opername),
-								  ObjectIdGetDatum(oprleft),
-								  ObjectIdGetDatum(oprright),
-								  ObjectIdGetDatum(namespaceId));
-		if (HeapTupleIsValid(opertup))
+		namespaceId = LookupExplicitNamespace(schemaname, true);
+		if (OidIsValid(namespaceId))
 		{
-			Oid			result = HeapTupleGetOid(opertup);
+			HeapTuple	opertup;
 
-			ReleaseSysCache(opertup);
-			return result;
+			opertup = SearchSysCache4(OPERNAMENSP,
+									  CStringGetDatum(opername),
+									  ObjectIdGetDatum(oprleft),
+									  ObjectIdGetDatum(oprright),
+									  ObjectIdGetDatum(namespaceId));
+			if (HeapTupleIsValid(opertup))
+			{
+				Oid			result = HeapTupleGetOid(opertup);
+
+				ReleaseSysCache(opertup);
+				return result;
+			}
 		}
+
 		return InvalidOid;
 	}
 
@@ -1528,10 +1554,10 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
  * identical entries in later namespaces.
  *
  * The returned items always have two args[] entries --- one or the other
- * will be InvalidOid for a prefix or postfix oprkind.	nargs is 2, too.
+ * will be InvalidOid for a prefix or postfix oprkind.  nargs is 2, too.
  */
 FuncCandidateList
-OpernameGetCandidates(List *names, char oprkind)
+OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok)
 {
 	FuncCandidateList resultList = NULL;
 	char	   *resultSpace = NULL;
@@ -1548,7 +1574,9 @@ OpernameGetCandidates(List *names, char oprkind)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
+		namespaceId = LookupExplicitNamespace(schemaname, missing_schema_ok);
+		if (missing_schema_ok && !OidIsValid(namespaceId))
+			return NULL;
 	}
 	else
 	{
@@ -1569,7 +1597,8 @@ OpernameGetCandidates(List *names, char oprkind)
 	 * separate palloc for each operator, but profiling revealed that the
 	 * pallocs used an unreasonably large fraction of parsing time.
 	 */
-#define SPACE_PER_OP MAXALIGN(sizeof(struct _FuncCandidateList) + sizeof(Oid))
+#define SPACE_PER_OP MAXALIGN(offsetof(struct _FuncCandidateList, args) + \
+							  2 * sizeof(Oid))
 
 	if (catlist->n_members > 0)
 		resultSpace = palloc(catlist->n_members * SPACE_PER_OP);
@@ -1717,7 +1746,7 @@ OperatorIsVisible(Oid oprid)
 		 * If it is in the path, it might still not be visible; it could be
 		 * hidden by another operator of the same name and arguments earlier
 		 * in the path.  So we must do a slow check to see if this is the same
-		 * operator that would be found by OpernameGetOprId.
+		 * operator that would be found by OpernameGetOprid.
 		 */
 		char	   *oprname = NameStr(oprform->oprname);
 
@@ -2090,10 +2119,13 @@ get_ts_parser_oid(List *names, bool missing_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
-		prsoid = GetSysCacheOid2(TSPARSERNAMENSP,
-								 PointerGetDatum(parser_name),
-								 ObjectIdGetDatum(namespaceId));
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			prsoid = InvalidOid;
+		else
+			prsoid = GetSysCacheOid2(TSPARSERNAMENSP,
+									 PointerGetDatum(parser_name),
+									 ObjectIdGetDatum(namespaceId));
 	}
 	else
 	{
@@ -2213,10 +2245,13 @@ get_ts_dict_oid(List *names, bool missing_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
-		dictoid = GetSysCacheOid2(TSDICTNAMENSP,
-								  PointerGetDatum(dict_name),
-								  ObjectIdGetDatum(namespaceId));
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			dictoid = InvalidOid;
+		else
+			dictoid = GetSysCacheOid2(TSDICTNAMENSP,
+									  PointerGetDatum(dict_name),
+									  ObjectIdGetDatum(namespaceId));
 	}
 	else
 	{
@@ -2337,10 +2372,13 @@ get_ts_template_oid(List *names, bool missing_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
-		tmploid = GetSysCacheOid2(TSTEMPLATENAMENSP,
-								  PointerGetDatum(template_name),
-								  ObjectIdGetDatum(namespaceId));
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			tmploid = InvalidOid;
+		else
+			tmploid = GetSysCacheOid2(TSTEMPLATENAMENSP,
+									  PointerGetDatum(template_name),
+									  ObjectIdGetDatum(namespaceId));
 	}
 	else
 	{
@@ -2460,10 +2498,13 @@ get_ts_config_oid(List *names, bool missing_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
-		cfgoid = GetSysCacheOid2(TSCONFIGNAMENSP,
-								 PointerGetDatum(config_name),
-								 ObjectIdGetDatum(namespaceId));
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			cfgoid = InvalidOid;
+		else
+			cfgoid = GetSysCacheOid2(TSCONFIGNAMENSP,
+									 PointerGetDatum(config_name),
+									 ObjectIdGetDatum(namespaceId));
 	}
 	else
 	{
@@ -2497,7 +2538,7 @@ get_ts_config_oid(List *names, bool missing_ok)
 /*
  * TSConfigIsVisible
  *		Determine whether a text search configuration (identified by OID)
- *		is visible in the current search path.	Visible means "would be found
+ *		is visible in the current search path.  Visible means "would be found
  *		by searching for the unqualified text search configuration name".
  */
 bool
@@ -2633,7 +2674,10 @@ LookupNamespaceNoError(const char *nspname)
 	if (strcmp(nspname, "pg_temp") == 0)
 	{
 		if (OidIsValid(myTempNamespace))
+		{
+			InvokeNamespaceSearchHook(myTempNamespace, true);
 			return myTempNamespace;
+		}
 
 		/*
 		 * Since this is used only for looking up existing objects, there is
@@ -2651,10 +2695,10 @@ LookupNamespaceNoError(const char *nspname)
  *		Process an explicitly-specified schema name: look up the schema
  *		and verify we have USAGE (lookup) rights in it.
  *
- * Returns the namespace OID.  Raises ereport if any problem.
+ * Returns the namespace OID
  */
 Oid
-LookupExplicitNamespace(const char *nspname)
+LookupExplicitNamespace(const char *nspname, bool missing_ok)
 {
 	Oid			namespaceId;
 	AclResult	aclresult;
@@ -2668,17 +2712,20 @@ LookupExplicitNamespace(const char *nspname)
 		/*
 		 * Since this is used only for looking up existing objects, there is
 		 * no point in trying to initialize the temp namespace here; and doing
-		 * so might create problems for some callers. Just fall through and
-		 * give the "does not exist" error.
+		 * so might create problems for some callers --- just fall through.
 		 */
 	}
 
-	namespaceId = get_namespace_oid(nspname, false);
+	namespaceId = get_namespace_oid(nspname, missing_ok);
+	if (missing_ok && !OidIsValid(namespaceId))
+		return InvalidOid;
 
 	aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(), ACL_USAGE);
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, ACL_KIND_NAMESPACE,
 					   nspname);
+	/* Schema search hook for this lookup */
+	InvokeNamespaceSearchHook(namespaceId, true);
 
 	return namespaceId;
 }
@@ -2810,7 +2857,7 @@ QualifiedNameGetCreationNamespace(List *names, char **objname_p)
 /*
  * get_namespace_oid - given a namespace name, look up the OID
  *
- * If missing_ok is false, throw an error if namespace name not found.	If
+ * If missing_ok is false, throw an error if namespace name not found.  If
  * true, just return InvalidOid.
  */
 Oid
@@ -2947,11 +2994,11 @@ isTempToastNamespace(Oid namespaceId)
 }
 
 /*
- * isTempOrToastNamespace - is the given namespace my temporary-table
+ * isTempOrTempToastNamespace - is the given namespace my temporary-table
  *		namespace or my temporary-toast-table namespace?
  */
 bool
-isTempOrToastNamespace(Oid namespaceId)
+isTempOrTempToastNamespace(Oid namespaceId)
 {
 	if (OidIsValid(myTempNamespace) &&
 	 (myTempNamespace == namespaceId || myTempToastNamespace == namespaceId))
@@ -2991,7 +3038,7 @@ bool
 isOtherTempNamespace(Oid namespaceId)
 {
 	/* If it's my own temp namespace, say "false" */
-	if (isTempOrToastNamespace(namespaceId))
+	if (isTempOrTempToastNamespace(namespaceId))
 		return false;
 	/* Else, if it's any temp namespace, say "true" */
 	return isAnyTempNamespace(namespaceId);
@@ -3025,7 +3072,7 @@ GetTempNamespaceBackendId(Oid namespaceId)
 
 /*
  * GetTempToastNamespace - get the OID of my temporary-toast-table namespace,
- * which must already be assigned.	(This is only used when creating a toast
+ * which must already be assigned.  (This is only used when creating a toast
  * table for a temp table, so we must have already done InitTempTableNamespace)
  */
 Oid
@@ -3094,6 +3141,52 @@ CopyOverrideSearchPath(OverrideSearchPath *path)
 }
 
 /*
+ * OverrideSearchPathMatchesCurrent - does path match current setting?
+ */
+bool
+OverrideSearchPathMatchesCurrent(OverrideSearchPath *path)
+{
+	ListCell   *lc,
+			   *lcp;
+
+	recomputeNamespacePath();
+
+	/* We scan down the activeSearchPath to see if it matches the input. */
+	lc = list_head(activeSearchPath);
+
+	/* If path->addTemp, first item should be my temp namespace. */
+	if (path->addTemp)
+	{
+		if (lc && lfirst_oid(lc) == myTempNamespace)
+			lc = lnext(lc);
+		else
+			return false;
+	}
+	/* If path->addCatalog, next item should be pg_catalog. */
+	if (path->addCatalog)
+	{
+		if (lc && lfirst_oid(lc) == PG_CATALOG_NAMESPACE)
+			lc = lnext(lc);
+		else
+			return false;
+	}
+	/* We should now be looking at the activeCreationNamespace. */
+	if (activeCreationNamespace != (lc ? lfirst_oid(lc) : InvalidOid))
+		return false;
+	/* The remainder of activeSearchPath should match path->schemas. */
+	foreach(lcp, path->schemas)
+	{
+		if (lc && lfirst_oid(lc) == lfirst_oid(lcp))
+			lc = lnext(lc);
+		else
+			return false;
+	}
+	if (lc)
+		return false;
+	return true;
+}
+
+/*
  * PushOverrideSearchPath - temporarily override the search path
  *
  * We allow nested overrides, hence the push/pop terminology.  The GUC
@@ -3101,8 +3194,8 @@ CopyOverrideSearchPath(OverrideSearchPath *path)
  *
  * It's possible that newpath->useTemp is set but there is no longer any
  * active temp namespace, if the path was saved during a transaction that
- * created a temp namespace and was later rolled back.	In that case we just
- * ignore useTemp.	A plausible alternative would be to create a new temp
+ * created a temp namespace and was later rolled back.  In that case we just
+ * ignore useTemp.  A plausible alternative would be to create a new temp
  * namespace, but for existing callers that's not necessary because an empty
  * temp namespace wouldn't affect their results anyway.
  *
@@ -3135,7 +3228,7 @@ PushOverrideSearchPath(OverrideSearchPath *newpath)
 		firstNS = linitial_oid(oidlist);
 
 	/*
-	 * Add any implicitly-searched namespaces to the list.	Note these go on
+	 * Add any implicitly-searched namespaces to the list.  Note these go on
 	 * the front, not the back; also notice that we do not check USAGE
 	 * permissions for these.
 	 */
@@ -3223,7 +3316,9 @@ get_collation_oid(List *name, bool missing_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			return InvalidOid;
 
 		/* first try for encoding-specific entry, then any-encoding */
 		colloid = GetSysCacheOid3(COLLNAMEENCNSP,
@@ -3293,10 +3388,13 @@ get_conversion_oid(List *name, bool missing_ok)
 	if (schemaname)
 	{
 		/* use exact schema given */
-		namespaceId = LookupExplicitNamespace(schemaname);
-		conoid = GetSysCacheOid2(CONNAMENSP,
-								 PointerGetDatum(conversion_name),
-								 ObjectIdGetDatum(namespaceId));
+		namespaceId = LookupExplicitNamespace(schemaname, missing_ok);
+		if (missing_ok && !OidIsValid(namespaceId))
+			conoid = InvalidOid;
+		else
+			conoid = GetSysCacheOid2(CONNAMENSP,
+									 PointerGetDatum(conversion_name),
+									 ObjectIdGetDatum(namespaceId));
 	}
 	else
 	{
@@ -3331,7 +3429,7 @@ get_conversion_oid(List *name, bool missing_ok)
  * FindDefaultConversionProc - find default encoding conversion proc
  */
 Oid
-FindDefaultConversionProc(int4 for_encoding, int4 to_encoding)
+FindDefaultConversionProc(int32 for_encoding, int32 to_encoding)
 {
 	Oid			proc;
 	ListCell   *l;
@@ -3418,7 +3516,8 @@ recomputeNamespacePath(void)
 				if (OidIsValid(namespaceId) &&
 					!list_member_oid(oidlist, namespaceId) &&
 					pg_namespace_aclcheck(namespaceId, roleid,
-										  ACL_USAGE) == ACLCHECK_OK)
+										  ACL_USAGE) == ACLCHECK_OK &&
+					InvokeNamespaceSearchHook(namespaceId, false))
 					oidlist = lappend_oid(oidlist, namespaceId);
 			}
 		}
@@ -3427,7 +3526,8 @@ recomputeNamespacePath(void)
 			/* pg_temp --- substitute temp namespace, if any */
 			if (OidIsValid(myTempNamespace))
 			{
-				if (!list_member_oid(oidlist, myTempNamespace))
+				if (!list_member_oid(oidlist, myTempNamespace) &&
+					InvokeNamespaceSearchHook(myTempNamespace, false))
 					oidlist = lappend_oid(oidlist, myTempNamespace);
 			}
 			else
@@ -3444,13 +3544,14 @@ recomputeNamespacePath(void)
 			if (OidIsValid(namespaceId) &&
 				!list_member_oid(oidlist, namespaceId) &&
 				pg_namespace_aclcheck(namespaceId, roleid,
-									  ACL_USAGE) == ACLCHECK_OK)
+									  ACL_USAGE) == ACLCHECK_OK &&
+				InvokeNamespaceSearchHook(namespaceId, false))
 				oidlist = lappend_oid(oidlist, namespaceId);
 		}
 	}
 
 	/*
-	 * Remember the first member of the explicit list.	(Note: this is
+	 * Remember the first member of the explicit list.  (Note: this is
 	 * nominally wrong if temp_missing, but we need it anyway to distinguish
 	 * explicit from implicit mention of pg_catalog.)
 	 */
@@ -3460,7 +3561,7 @@ recomputeNamespacePath(void)
 		firstNS = linitial_oid(oidlist);
 
 	/*
-	 * Add any implicitly-searched namespaces to the list.	Note these go on
+	 * Add any implicitly-searched namespaces to the list.  Note these go on
 	 * the front, not the back; also notice that we do not check USAGE
 	 * permissions for these.
 	 */
@@ -3515,7 +3616,7 @@ InitTempTableNamespace(void)
 
 	/*
 	 * First, do permission check to see if we are authorized to make temp
-	 * tables.	We use a nonstandard error message here since "databasename:
+	 * tables.  We use a nonstandard error message here since "databasename:
 	 * permission denied" might be a tad cryptic.
 	 *
 	 * Note that ACL_CREATE_TEMP rights are rechecked in pg_namespace_aclmask;
@@ -3534,9 +3635,9 @@ InitTempTableNamespace(void)
 	 * Do not allow a Hot Standby slave session to make temp tables.  Aside
 	 * from problems with modifying the system catalogs, there is a naming
 	 * conflict: pg_temp_N belongs to the session with BackendId N on the
-	 * master, not to a slave session with the same BackendId.	We should not
+	 * master, not to a slave session with the same BackendId.  We should not
 	 * be able to get here anyway due to XactReadOnly checks, but let's just
-	 * make real sure.	Note that this also backstops various operations that
+	 * make real sure.  Note that this also backstops various operations that
 	 * allow XactReadOnly transactions to modify temp tables; they'd need
 	 * RecoveryInProgress checks if not for this.
 	 */
@@ -3558,7 +3659,8 @@ InitTempTableNamespace(void)
 		 * temp tables.  This works because the places that access the temp
 		 * namespace for my own backend skip permissions checks on it.
 		 */
-		namespaceId = NamespaceCreate(namespaceName, BOOTSTRAP_SUPERUSERID);
+		namespaceId = NamespaceCreate(namespaceName, BOOTSTRAP_SUPERUSERID,
+									  true);
 		/* Advance command counter to make namespace visible */
 		CommandCounterIncrement();
 	}
@@ -3582,7 +3684,8 @@ InitTempTableNamespace(void)
 	toastspaceId = get_namespace_oid(namespaceName, true);
 	if (!OidIsValid(toastspaceId))
 	{
-		toastspaceId = NamespaceCreate(namespaceName, BOOTSTRAP_SUPERUSERID);
+		toastspaceId = NamespaceCreate(namespaceName, BOOTSTRAP_SUPERUSERID,
+									   true);
 		/* Advance command counter to make namespace visible */
 		CommandCounterIncrement();
 	}
@@ -3619,7 +3722,7 @@ AtEOXact_Namespace(bool isCommit)
 	if (myTempNamespaceSubID != InvalidSubTransactionId)
 	{
 		if (isCommit)
-			on_shmem_exit(RemoveTempRelationsCallback, 0);
+			before_shmem_exit(RemoveTempRelationsCallback, 0);
 		else
 		{
 			myTempNamespace = InvalidOid;
@@ -3771,14 +3874,12 @@ ResetTempTableNamespace(void)
  * Routines for handling the GUC variable 'search_path'.
  */
 
-/* check_hook: validate new search_path, if possible */
+/* check_hook: validate new search_path value */
 bool
 check_search_path(char **newval, void **extra, GucSource source)
 {
-	bool		result = true;
 	char	   *rawname;
 	List	   *namelist;
-	ListCell   *l;
 
 	/* Need a modifiable copy of string */
 	rawname = pstrdup(*newval);
@@ -3794,52 +3895,17 @@ check_search_path(char **newval, void **extra, GucSource source)
 	}
 
 	/*
-	 * If we aren't inside a transaction, we cannot do database access so
-	 * cannot verify the individual names.	Must accept the list on faith.
+	 * We used to try to check that the named schemas exist, but there are
+	 * many valid use-cases for having search_path settings that include
+	 * schemas that don't exist; and often, we are not inside a transaction
+	 * here and so can't consult the system catalogs anyway.  So now, the only
+	 * requirement is syntactic validity of the identifier list.
 	 */
-	if (IsTransactionState())
-	{
-		/*
-		 * Verify that all the names are either valid namespace names or
-		 * "$user" or "pg_temp".  We do not require $user to correspond to a
-		 * valid namespace, and pg_temp might not exist yet.  We do not check
-		 * for USAGE rights, either; should we?
-		 *
-		 * When source == PGC_S_TEST, we are checking the argument of an ALTER
-		 * DATABASE SET or ALTER USER SET command.	It could be that the
-		 * intended use of the search path is for some other database, so we
-		 * should not error out if it mentions schemas not present in the
-		 * current database.  We issue a NOTICE instead.
-		 */
-		foreach(l, namelist)
-		{
-			char	   *curname = (char *) lfirst(l);
-
-			if (strcmp(curname, "$user") == 0)
-				continue;
-			if (strcmp(curname, "pg_temp") == 0)
-				continue;
-			if (!SearchSysCacheExists1(NAMESPACENAME,
-									   CStringGetDatum(curname)))
-			{
-				if (source == PGC_S_TEST)
-					ereport(NOTICE,
-							(errcode(ERRCODE_UNDEFINED_SCHEMA),
-						   errmsg("schema \"%s\" does not exist", curname)));
-				else
-				{
-					GUC_check_errdetail("schema \"%s\" does not exist", curname);
-					result = false;
-					break;
-				}
-			}
-		}
-	}
 
 	pfree(rawname);
 	list_free(namelist);
 
-	return result;
+	return true;
 }
 
 /* assign_hook: do extra actions as needed */
@@ -3927,7 +3993,7 @@ fetch_search_path(bool includeImplicit)
 	/*
 	 * If the temp namespace should be first, force it to exist.  This is so
 	 * that callers can trust the result to reflect the actual default
-	 * creation namespace.	It's a bit bogus to do this here, since
+	 * creation namespace.  It's a bit bogus to do this here, since
 	 * current_schema() is supposedly a stable function without side-effects,
 	 * but the alternatives seem worse.
 	 */
@@ -3949,7 +4015,7 @@ fetch_search_path(bool includeImplicit)
 
 /*
  * Fetch the active search path into a caller-allocated array of OIDs.
- * Returns the number of path entries.	(If this is more than sarray_len,
+ * Returns the number of path entries.  (If this is more than sarray_len,
  * then the data didn't fit and is not all stored.)
  *
  * The returned list always includes the implicitly-prepended namespaces,
@@ -3988,8 +4054,8 @@ fetch_search_path_array(Oid *sarray, int sarray_len)
  * a nonexistent object OID, rather than failing.  This is to avoid race
  * condition errors when a query that's scanning a catalog using an MVCC
  * snapshot uses one of these functions.  The underlying IsVisible functions
- * operate on SnapshotNow semantics and so might see the object as already
- * gone when it's still visible to the MVCC snapshot.  (There is no race
+ * always use an up-to-date snapshot and so might see the object as already
+ * gone when it's still visible to the transaction snapshot.  (There is no race
  * condition in the current coding because we don't accept sinval messages
  * between the SearchSysCacheExists test and the subsequent lookup.)
  */

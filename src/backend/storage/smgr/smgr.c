@@ -6,7 +6,7 @@
  *	  All file system operations in POSTGRES dispatch through these
  *	  routines.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -76,11 +76,16 @@ static const int NSmgr = lengthof(smgrsw);
 
 /*
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
+ * In addition, "unowned" SMgrRelation objects are chained together in a list.
  */
 static HTAB *SMgrRelationHash = NULL;
 
+static SMgrRelation first_unowned_reln = NULL;
+
 /* local function prototypes */
 static void smgrshutdown(int code, Datum arg);
+static void add_to_unowned_list(SMgrRelation reln);
+static void remove_from_unowned_list(SMgrRelation reln);
 
 
 /*
@@ -124,7 +129,7 @@ smgrshutdown(int code, Datum arg)
 /*
  *	smgropen() -- Return an SMgrRelation object, creating it if need be.
  *
- *		This does not attempt to actually open the object.
+ *		This does not attempt to actually open the underlying file.
  */
 SMgrRelation
 smgropen(RelFileNode rnode, BackendId backend)
@@ -141,9 +146,9 @@ smgropen(RelFileNode rnode, BackendId backend)
 		MemSet(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(RelFileNodeBackend);
 		ctl.entrysize = sizeof(SMgrRelationData);
-		ctl.hash = tag_hash;
 		SMgrRelationHash = hash_create("smgr relation table", 400,
-									   &ctl, HASH_ELEM | HASH_FUNCTION);
+									   &ctl, HASH_ELEM | HASH_BLOBS);
+		first_unowned_reln = NULL;
 	}
 
 	/* Look up or create an entry */
@@ -163,31 +168,17 @@ smgropen(RelFileNode rnode, BackendId backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		reln->smgr_fsm_nblocks = InvalidBlockNumber;
 		reln->smgr_vm_nblocks = InvalidBlockNumber;
-		reln->smgr_transient = false;
 		reln->smgr_which = 0;	/* we only have md.c at present */
 
 		/* mark it not open */
 		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
 			reln->md_fd[forknum] = NULL;
+
+		/* it has no owner yet */
+		add_to_unowned_list(reln);
 	}
-	else
-		/* if it was transient before, it no longer is */
-		reln->smgr_transient = false;
 
 	return reln;
-}
-
-/*
- * smgrsettransient() -- mark an SMgrRelation object as transaction-bound
- *
- * The main effect of this is that all opened files are marked to be
- * kernel-level closed (but not necessarily VFD-closed) when the current
- * transaction ends.
- */
-void
-smgrsettransient(SMgrRelation reln)
-{
-	reln->smgr_transient = true;
 }
 
 /*
@@ -199,18 +190,92 @@ smgrsettransient(SMgrRelation reln)
 void
 smgrsetowner(SMgrRelation *owner, SMgrRelation reln)
 {
+	/* We don't support "disowning" an SMgrRelation here, use smgrclearowner */
+	Assert(owner != NULL);
+
 	/*
 	 * First, unhook any old owner.  (Normally there shouldn't be any, but it
 	 * seems possible that this can happen during swap_relation_files()
 	 * depending on the order of processing.  It's ok to close the old
 	 * relcache entry early in that case.)
+	 *
+	 * If there isn't an old owner, then the reln should be in the unowned
+	 * list, and we need to remove it.
 	 */
 	if (reln->smgr_owner)
 		*(reln->smgr_owner) = NULL;
+	else
+		remove_from_unowned_list(reln);
 
 	/* Now establish the ownership relationship. */
 	reln->smgr_owner = owner;
 	*owner = reln;
+}
+
+/*
+ * smgrclearowner() -- Remove long-lived reference to an SMgrRelation object
+ *					   if one exists
+ */
+void
+smgrclearowner(SMgrRelation *owner, SMgrRelation reln)
+{
+	/* Do nothing if the SMgrRelation object is not owned by the owner */
+	if (reln->smgr_owner != owner)
+		return;
+
+	/* unset the owner's reference */
+	*owner = NULL;
+
+	/* unset our reference to the owner */
+	reln->smgr_owner = NULL;
+
+	add_to_unowned_list(reln);
+}
+
+/*
+ * add_to_unowned_list -- link an SMgrRelation onto the unowned list
+ *
+ * Check remove_from_unowned_list()'s comments for performance
+ * considerations.
+ */
+static void
+add_to_unowned_list(SMgrRelation reln)
+{
+	/* place it at head of the list (to make smgrsetowner cheap) */
+	reln->next_unowned_reln = first_unowned_reln;
+	first_unowned_reln = reln;
+}
+
+/*
+ * remove_from_unowned_list -- unlink an SMgrRelation from the unowned list
+ *
+ * If the reln is not present in the list, nothing happens.  Typically this
+ * would be caller error, but there seems no reason to throw an error.
+ *
+ * In the worst case this could be rather slow; but in all the cases that seem
+ * likely to be performance-critical, the reln being sought will actually be
+ * first in the list.  Furthermore, the number of unowned relns touched in any
+ * one transaction shouldn't be all that high typically.  So it doesn't seem
+ * worth expending the additional space and management logic needed for a
+ * doubly-linked list.
+ */
+static void
+remove_from_unowned_list(SMgrRelation reln)
+{
+	SMgrRelation *link;
+	SMgrRelation cur;
+
+	for (link = &first_unowned_reln, cur = *link;
+		 cur != NULL;
+		 link = &cur->next_unowned_reln, cur = *link)
+	{
+		if (cur == reln)
+		{
+			*link = cur->next_unowned_reln;
+			cur->next_unowned_reln = NULL;
+			break;
+		}
+	}
 }
 
 /*
@@ -235,6 +300,9 @@ smgrclose(SMgrRelation reln)
 		(*(smgrsw[reln->smgr_which].smgr_close)) (reln, forknum);
 
 	owner = reln->smgr_owner;
+
+	if (!owner)
+		remove_from_unowned_list(reln);
 
 	if (hash_search(SMgrRelationHash,
 					(void *) &(reln->smgr_rnode),
@@ -329,7 +397,144 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 }
 
 /*
- *	smgrdounlink() -- Immediately unlink a relation.
+ *	smgrdounlink() -- Immediately unlink all forks of a relation.
+ *
+ *		All forks of the relation are removed from the store.  This should
+ *		not be used during transactional operations, since it can't be undone.
+ *
+ *		If isRedo is true, it is okay for the underlying file(s) to be gone
+ *		already.
+ *
+ *		This is equivalent to calling smgrdounlinkfork for each fork, but
+ *		it's significantly quicker so should be preferred when possible.
+ */
+void
+smgrdounlink(SMgrRelation reln, bool isRedo)
+{
+	RelFileNodeBackend rnode = reln->smgr_rnode;
+	int			which = reln->smgr_which;
+	ForkNumber	forknum;
+
+	/* Close the forks at smgr level */
+	for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+		(*(smgrsw[which].smgr_close)) (reln, forknum);
+
+	/*
+	 * Get rid of any remaining buffers for the relation.  bufmgr will just
+	 * drop them without bothering to write the contents.
+	 */
+	DropRelFileNodesAllBuffers(&rnode, 1);
+
+	/*
+	 * It'd be nice to tell the stats collector to forget it immediately, too.
+	 * But we can't because we don't know the OID (and in cases involving
+	 * relfilenode swaps, it's not always clear which table OID to forget,
+	 * anyway).
+	 */
+
+	/*
+	 * Send a shared-inval message to force other backends to close any
+	 * dangling smgr references they may have for this rel.  We should do this
+	 * before starting the actual unlinking, in case we fail partway through
+	 * that step.  Note that the sinval message will eventually come back to
+	 * this backend, too, and thereby provide a backstop that we closed our
+	 * own smgr rel.
+	 */
+	CacheInvalidateSmgr(rnode);
+
+	/*
+	 * Delete the physical file(s).
+	 *
+	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
+	 * ERROR, because we've already decided to commit or abort the current
+	 * xact.
+	 */
+	(*(smgrsw[which].smgr_unlink)) (rnode, InvalidForkNumber, isRedo);
+}
+
+/*
+ *	smgrdounlinkall() -- Immediately unlink all forks of all given relations
+ *
+ *		All forks of all given relations are removed from the store.  This
+ *		should not be used during transactional operations, since it can't be
+ *		undone.
+ *
+ *		If isRedo is true, it is okay for the underlying file(s) to be gone
+ *		already.
+ *
+ *		This is equivalent to calling smgrdounlink for each relation, but it's
+ *		significantly quicker so should be preferred when possible.
+ */
+void
+smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
+{
+	int			i = 0;
+	RelFileNodeBackend *rnodes;
+	ForkNumber	forknum;
+
+	if (nrels == 0)
+		return;
+
+	/*
+	 * create an array which contains all relations to be dropped, and close
+	 * each relation's forks at the smgr level while at it
+	 */
+	rnodes = palloc(sizeof(RelFileNodeBackend) * nrels);
+	for (i = 0; i < nrels; i++)
+	{
+		RelFileNodeBackend rnode = rels[i]->smgr_rnode;
+		int			which = rels[i]->smgr_which;
+
+		rnodes[i] = rnode;
+
+		/* Close the forks at smgr level */
+		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+			(*(smgrsw[which].smgr_close)) (rels[i], forknum);
+	}
+
+	/*
+	 * Get rid of any remaining buffers for the relations.  bufmgr will just
+	 * drop them without bothering to write the contents.
+	 */
+	DropRelFileNodesAllBuffers(rnodes, nrels);
+
+	/*
+	 * It'd be nice to tell the stats collector to forget them immediately,
+	 * too. But we can't because we don't know the OIDs.
+	 */
+
+	/*
+	 * Send a shared-inval message to force other backends to close any
+	 * dangling smgr references they may have for these rels.  We should do
+	 * this before starting the actual unlinking, in case we fail partway
+	 * through that step.  Note that the sinval messages will eventually come
+	 * back to this backend, too, and thereby provide a backstop that we
+	 * closed our own smgr rel.
+	 */
+	for (i = 0; i < nrels; i++)
+		CacheInvalidateSmgr(rnodes[i]);
+
+	/*
+	 * Delete the physical file(s).
+	 *
+	 * Note: smgr_unlink must treat deletion failure as a WARNING, not an
+	 * ERROR, because we've already decided to commit or abort the current
+	 * xact.
+	 */
+
+	for (i = 0; i < nrels; i++)
+	{
+		int			which = rels[i]->smgr_which;
+
+		for (forknum = 0; forknum <= MAX_FORKNUM; forknum++)
+			(*(smgrsw[which].smgr_unlink)) (rnodes[i], forknum, isRedo);
+	}
+
+	pfree(rnodes);
+}
+
+/*
+ *	smgrdounlinkfork() -- Immediately unlink one fork of a relation.
  *
  *		The specified fork of the relation is removed from the store.  This
  *		should not be used during transactional operations, since it can't be
@@ -339,17 +544,17 @@ smgrcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
  *		already.
  */
 void
-smgrdounlink(SMgrRelation reln, ForkNumber forknum, bool isRedo)
+smgrdounlinkfork(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 {
 	RelFileNodeBackend rnode = reln->smgr_rnode;
 	int			which = reln->smgr_which;
 
-	/* Close the fork */
+	/* Close the fork at smgr level */
 	(*(smgrsw[which].smgr_close)) (reln, forknum);
 
 	/*
-	 * Get rid of any remaining buffers for the relation.  bufmgr will just
-	 * drop them without bothering to write the contents.
+	 * Get rid of any remaining buffers for the fork.  bufmgr will just drop
+	 * them without bothering to write the contents.
 	 */
 	DropRelFileNodeBuffers(rnode, forknum, 0);
 
@@ -473,7 +678,7 @@ smgrtruncate(SMgrRelation reln, ForkNumber forknum, BlockNumber nblocks)
 	 * Send a shared-inval message to force other backends to close any smgr
 	 * references they may have for this rel.  This is useful because they
 	 * might have open file pointers to segments that got removed, and/or
-	 * smgr_targblock variables pointing past the new rel end.	(The inval
+	 * smgr_targblock variables pointing past the new rel end.  (The inval
 	 * message will come back to our backend, too, causing a
 	 * probably-unnecessary local smgr flush.  But we don't expect that this
 	 * is a performance-critical path.)  As in the unlink code, we want to be
@@ -559,5 +764,31 @@ smgrpostckpt(void)
 	{
 		if (smgrsw[i].smgr_post_ckpt)
 			(*(smgrsw[i].smgr_post_ckpt)) ();
+	}
+}
+
+/*
+ * AtEOXact_SMgr
+ *
+ * This routine is called during transaction commit or abort (it doesn't
+ * particularly care which).  All transient SMgrRelation objects are closed.
+ *
+ * We do this as a compromise between wanting transient SMgrRelations to
+ * live awhile (to amortize the costs of blind writes of multiple blocks)
+ * and needing them to not live forever (since we're probably holding open
+ * a kernel file descriptor for the underlying file, and we need to ensure
+ * that gets closed reasonably soon if the file gets deleted).
+ */
+void
+AtEOXact_SMgr(void)
+{
+	/*
+	 * Zap all unowned SMgrRelations.  We rely on smgrclose() to remove each
+	 * one from the list.
+	 */
+	while (first_unowned_reln != NULL)
+	{
+		Assert(first_unowned_reln->smgr_owner == NULL);
+		smgrclose(first_unowned_reln);
 	}
 }

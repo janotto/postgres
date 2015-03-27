@@ -5,7 +5,7 @@
  *
  * Code originally contributed by Adriaan Joubert.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,10 +16,9 @@
 
 #include "postgres.h"
 
-#include "access/htup.h"
+#include "access/htup_details.h"
 #include "libpq/pqformat.h"
 #include "nodes/nodeFuncs.h"
-#include "parser/parse_clause.h"
 #include "utils/array.h"
 #include "utils/varbit.h"
 
@@ -149,12 +148,22 @@ bit_in(PG_FUNCTION_ARGS)
 		sp = input_string;
 	}
 
+	/*
+	 * Determine bitlength from input string.  MaxAllocSize ensures a regular
+	 * input is small enough, but we must check hex input.
+	 */
 	slen = strlen(sp);
-	/* Determine bitlength from input string */
 	if (bit_not_hex)
 		bitlen = slen;
 	else
+	{
+		if (slen > VARBITMAXLEN / 4)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("bit string length exceeds the maximum allowed (%d)",
+						VARBITMAXLEN)));
 		bitlen = slen * 4;
+	}
 
 	/*
 	 * Sometimes atttypmod is not supplied. If it is supplied we need to make
@@ -451,12 +460,22 @@ varbit_in(PG_FUNCTION_ARGS)
 		sp = input_string;
 	}
 
+	/*
+	 * Determine bitlength from input string.  MaxAllocSize ensures a regular
+	 * input is small enough, but we must check hex input.
+	 */
 	slen = strlen(sp);
-	/* Determine bitlength from input string */
 	if (bit_not_hex)
 		bitlen = slen;
 	else
+	{
+		if (slen > VARBITMAXLEN / 4)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("bit string length exceeds the maximum allowed (%d)",
+						VARBITMAXLEN)));
 		bitlen = slen * 4;
+	}
 
 	/*
 	 * Sometimes atttypmod is not supplied. If it is supplied we need to make
@@ -536,6 +555,9 @@ varbit_in(PG_FUNCTION_ARGS)
 /*
  * varbit_out -
  *	  Prints the string as bits to preserve length accurately
+ *
+ * XXX varbit_recv() and hex input to varbit_in() can load a value that this
+ * cannot emit.  Consider using hex output for such values.
  */
 Datum
 varbit_out(PG_FUNCTION_ARGS)
@@ -649,31 +671,31 @@ varbit_send(PG_FUNCTION_ARGS)
 
 /*
  * varbit_transform()
- * Flatten calls to our length coercion function that leave the new maximum
- * length >= the previous maximum length.  We ignore the isExplicit argument,
- * which only affects truncation.
+ * Flatten calls to varbit's length coercion function that set the new maximum
+ * length >= the previous maximum length.  We can ignore the isExplicit
+ * argument, since that only affects truncation cases.
  */
 Datum
 varbit_transform(PG_FUNCTION_ARGS)
 {
 	FuncExpr   *expr = (FuncExpr *) PG_GETARG_POINTER(0);
-	Node	   *typmod;
 	Node	   *ret = NULL;
+	Node	   *typmod;
 
-	if (!IsA(expr, FuncExpr))
-		PG_RETURN_POINTER(ret);
+	Assert(IsA(expr, FuncExpr));
+	Assert(list_length(expr->args) >= 2);
 
-	Assert(list_length(expr->args) == 3);
-	typmod = lsecond(expr->args);
+	typmod = (Node *) lsecond(expr->args);
 
-	if (IsA(typmod, Const))
+	if (IsA(typmod, Const) &&!((Const *) typmod)->constisnull)
 	{
-		Node	   *source = linitial(expr->args);
+		Node	   *source = (Node *) linitial(expr->args);
 		int32		new_typmod = DatumGetInt32(((Const *) typmod)->constvalue);
 		int32		old_max = exprTypmod(source);
 		int32		new_max = new_typmod;
 
-		if (new_max <= 0 || (old_max >= 0 && old_max <= new_max))
+		/* Note: varbit() treats typmod 0 as invalid, so we do too */
+		if (new_max <= 0 || (old_max > 0 && old_max <= new_max))
 			ret = relabel_to_typmod(source, new_typmod);
 	}
 
@@ -945,6 +967,11 @@ bit_catenate(VarBit *arg1, VarBit *arg2)
 	bitlen1 = VARBITLEN(arg1);
 	bitlen2 = VARBITLEN(arg2);
 
+	if (bitlen1 > VARBITMAXLEN - bitlen2)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("bit string length exceeds the maximum allowed (%d)",
+						VARBITMAXLEN)));
 	bytelen = VARBITTOTALLEN(bitlen1 + bitlen2);
 
 	result = (VarBit *) palloc(bytelen);

@@ -4,7 +4,7 @@
  *	  POSTGRES index tuple definitions.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/itup.h
@@ -22,7 +22,7 @@
 /*
  * Index tuple header structure
  *
- * All index tuples start with IndexTupleData.	If the HasNulls bit is set,
+ * All index tuples start with IndexTupleData.  If the HasNulls bit is set,
  * this is followed by an IndexAttributeBitMapData.  The index attribute
  * values follow, beginning at a MAXALIGN boundary.
  *
@@ -37,7 +37,7 @@ typedef struct IndexTupleData
 	ItemPointerData t_tid;		/* reference TID to heap tuple */
 
 	/* ---------------
-	 * t_info is layed out in the following fashion:
+	 * t_info is laid out in the following fashion:
 	 *
 	 * 15th (high) bit: has nulls
 	 * 14th bit: has var-width attributes
@@ -133,6 +133,7 @@ typedef IndexAttributeBitMapData *IndexAttributeBitMap;
  * IndexTupleData struct.  We arrive at the divisor because each tuple
  * must be maxaligned, and it must have an associated item pointer.
  */
+#define MinIndexTupleSize MAXALIGN(sizeof(IndexTupleData) + 1)
 #define MaxIndexTuplesPerPage	\
 	((int) ((BLCKSZ - SizeOfPageHeaderData) / \
 			(MAXALIGN(sizeof(IndexTupleData) + 1) + sizeof(ItemIdData))))

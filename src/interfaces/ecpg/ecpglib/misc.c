@@ -260,7 +260,7 @@ ecpg_log(const char *format,...)
 	if (!simple_debug)
 		return;
 
-	/* internationalize the error message string */
+	/* localize the error message string */
 	intl_format = ecpg_gettext(format);
 
 	/*
@@ -497,7 +497,7 @@ ecpg_gettext(const char *msgid)
 #endif
 	}
 
-	return dgettext(PG_TEXTDOMAIN("ecpg"), msgid);
+	return dgettext(PG_TEXTDOMAIN("ecpglib"), msgid);
 }
 #endif   /* ENABLE_NLS */
 
@@ -525,7 +525,7 @@ ECPGset_var(int number, void *pointer, int lineno)
 		struct sqlca_t *sqlca = ECPGget_sqlca();
 
 		sqlca->sqlcode = ECPG_OUT_OF_MEMORY;
-		strncpy(sqlca->sqlstate, "YE001", sizeof("YE001"));
+		strncpy(sqlca->sqlstate, "YE001", sizeof(sqlca->sqlstate));
 		snprintf(sqlca->sqlerrm.sqlerrmc, sizeof(sqlca->sqlerrm.sqlerrmc), "out of memory on line %d", lineno);
 		sqlca->sqlerrm.sqlerrml = strlen(sqlca->sqlerrm.sqlerrmc);
 		/* free all memory we have allocated for the user */

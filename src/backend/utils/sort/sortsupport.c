@@ -4,7 +4,7 @@
  *	  Support routines for accelerated sorting.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -15,8 +15,13 @@
 
 #include "postgres.h"
 
+/* See sortsupport.h */
+#define SORTSUPPORT_INCLUDE_DEFINITIONS
+
+#include "access/nbtree.h"
 #include "fmgr.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 #include "utils/sortsupport.h"
 
 
@@ -24,54 +29,9 @@
 typedef struct
 {
 	FunctionCallInfoData fcinfo;	/* reusable callinfo structure */
-	FmgrInfo	flinfo;				/* lookup data for comparison function */
+	FmgrInfo	flinfo;			/* lookup data for comparison function */
 } SortShimExtra;
 
-
-/*
- * sortsupport.h defines inline versions of these functions if allowed by the
- * compiler; in which case the definitions below are skipped.
- */
-#ifndef USE_INLINE
-
-/*
- * Apply a sort comparator function and return a 3-way comparison result.
- * This takes care of handling reverse-sort and NULLs-ordering properly.
- */
-int
-ApplySortComparator(Datum datum1, bool isNull1,
-					Datum datum2, bool isNull2,
-					SortSupport ssup)
-{
-	int			compare;
-
-	if (isNull1)
-	{
-		if (isNull2)
-			compare = 0;		/* NULL "=" NULL */
-		else if (ssup->ssup_nulls_first)
-			compare = -1;		/* NULL "<" NOT_NULL */
-		else
-			compare = 1;		/* NULL ">" NOT_NULL */
-	}
-	else if (isNull2)
-	{
-		if (ssup->ssup_nulls_first)
-			compare = 1;		/* NOT_NULL ">" NULL */
-		else
-			compare = -1;		/* NOT_NULL "<" NULL */
-	}
-	else
-	{
-		compare = (*ssup->comparator) (datum1, datum2, ssup);
-		if (ssup->ssup_reverse)
-			compare = -compare;
-	}
-
-	return compare;
-}
-
-#endif   /* ! USE_INLINE */
 
 /*
  * Shim function for calling an old-style comparator
@@ -108,7 +68,7 @@ comparison_shim(Datum x, Datum y, SortSupport ssup)
 void
 PrepareSortSupportComparisonShim(Oid cmpFunc, SortSupport ssup)
 {
-	SortShimExtra   *extra;
+	SortShimExtra *extra;
 
 	extra = (SortShimExtra *) MemoryContextAlloc(ssup->ssup_cxt,
 												 sizeof(SortShimExtra));
@@ -127,6 +87,44 @@ PrepareSortSupportComparisonShim(Oid cmpFunc, SortSupport ssup)
 }
 
 /*
+ * Look up and call sortsupport function to setup SortSupport comparator;
+ * or if no such function exists or it declines to set up the appropriate
+ * state, prepare a suitable shim.
+ */
+static void
+FinishSortSupportFunction(Oid opfamily, Oid opcintype, SortSupport ssup)
+{
+	Oid			sortSupportFunction;
+
+	/* Look for a sort support function */
+	sortSupportFunction = get_opfamily_proc(opfamily, opcintype, opcintype,
+											BTSORTSUPPORT_PROC);
+	if (OidIsValid(sortSupportFunction))
+	{
+		/*
+		 * The sort support function can provide a comparator, but it can
+		 * also choose not to so (e.g. based on the selected collation).
+		 */
+		OidFunctionCall1(sortSupportFunction, PointerGetDatum(ssup));
+	}
+
+	if (ssup->comparator == NULL)
+	{
+		Oid			sortFunction;
+
+		sortFunction = get_opfamily_proc(opfamily, opcintype, opcintype,
+										 BTORDER_PROC);
+
+		if (!OidIsValid(sortFunction))
+			elog(ERROR, "missing support function %d(%u,%u) in opfamily %u",
+				 BTORDER_PROC, opcintype, opcintype, opfamily);
+
+		/* We'll use a shim to call the old-style btree comparator */
+		PrepareSortSupportComparisonShim(sortFunction, ssup);
+	}
+}
+
+/*
  * Fill in SortSupport given an ordering operator (btree "<" or ">" operator).
  *
  * Caller must previously have zeroed the SortSupportData structure and then
@@ -136,25 +134,45 @@ PrepareSortSupportComparisonShim(Oid cmpFunc, SortSupport ssup)
 void
 PrepareSortSupportFromOrderingOp(Oid orderingOp, SortSupport ssup)
 {
-	Oid			sortFunction;
-	bool		issupport;
+	Oid			opfamily;
+	Oid			opcintype;
+	int16		strategy;
 
-	if (!get_sort_function_for_ordering_op(orderingOp,
-										   &sortFunction,
-										   &issupport,
-										   &ssup->ssup_reverse))
+	Assert(ssup->comparator == NULL);
+
+	/* Find the operator in pg_amop */
+	if (!get_ordering_op_properties(orderingOp, &opfamily, &opcintype,
+									&strategy))
 		elog(ERROR, "operator %u is not a valid ordering operator",
 			 orderingOp);
+	ssup->ssup_reverse = (strategy == BTGreaterStrategyNumber);
 
-	if (issupport)
-	{
-		/* The sort support function should provide a comparator */
-		OidFunctionCall1(sortFunction, PointerGetDatum(ssup));
-		Assert(ssup->comparator != NULL);
-	}
-	else
-	{
-		/* We'll use a shim to call the old-style btree comparator */
-		PrepareSortSupportComparisonShim(sortFunction, ssup);
-	}
+	FinishSortSupportFunction(opfamily, opcintype, ssup);
+}
+
+/*
+ * Fill in SortSupport given an index relation, attribute, and strategy.
+ *
+ * Caller must previously have zeroed the SortSupportData structure and then
+ * filled in ssup_cxt, ssup_attno, ssup_collation, and ssup_nulls_first.  This
+ * will fill in ssup_reverse (based on the supplied strategy), as well as the
+ * comparator function pointer.
+ */
+void
+PrepareSortSupportFromIndexRel(Relation indexRel, int16 strategy,
+							   SortSupport ssup)
+{
+	Oid			opfamily = indexRel->rd_opfamily[ssup->ssup_attno - 1];
+	Oid			opcintype = indexRel->rd_opcintype[ssup->ssup_attno - 1];
+
+	Assert(ssup->comparator == NULL);
+
+	if (indexRel->rd_rel->relam != BTREE_AM_OID)
+		elog(ERROR, "unexpected non-btree AM: %u", indexRel->rd_rel->relam);
+	if (strategy != BTGreaterStrategyNumber &&
+		strategy != BTLessStrategyNumber)
+		elog(ERROR, "unexpected sort support strategy: %d", strategy);
+	ssup->ssup_reverse = (strategy == BTGreaterStrategyNumber);
+
+	FinishSortSupportFunction(opfamily, opcintype, ssup);
 }

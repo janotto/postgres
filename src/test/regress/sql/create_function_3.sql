@@ -11,7 +11,7 @@ GRANT ALL ON SCHEMA temp_func_test TO public;
 SET search_path TO temp_func_test, public;
 
 --
--- ARGUMENT and RETURN TYPES 
+-- ARGUMENT and RETURN TYPES
 --
 CREATE FUNCTION functest_A_1(text, date) RETURNS bool LANGUAGE 'sql'
        AS 'SELECT $1 = ''abcd'' AND $2 > ''2001-01-01''';
@@ -107,11 +107,6 @@ CREATE FUNCTION functext_E_3(int) RETURNS bool LANGUAGE 'sql'
 
 RESET SESSION AUTHORIZATION;
 
--- list of built-in leakproof functions
-SELECT proname, prorettype::regtype, proargtypes::regtype[]
-       FROM pg_proc JOIN pg_namespace ON pronamespace = pg_namespace.oid
-       WHERE nspname = 'pg_catalog' AND proleakproof ORDER BY proname;
-
 --
 -- CALLED ON NULL INPUT | RETURNS NULL ON NULL INPUT | STRICT
 --
@@ -137,6 +132,30 @@ SELECT proname, proisstrict FROM pg_proc
                      'functext_F_2'::regproc,
                      'functext_F_3'::regproc,
                      'functext_F_4'::regproc) ORDER BY proname;
+
+
+-- information_schema tests
+
+CREATE FUNCTION functest_IS_1(a int, b int default 1, c text default 'foo')
+    RETURNS int
+    LANGUAGE SQL
+    AS 'SELECT $1 + $2';
+
+CREATE FUNCTION functest_IS_2(out a int, b int default 1)
+    RETURNS int
+    LANGUAGE SQL
+    AS 'SELECT $1';
+
+CREATE FUNCTION functest_IS_3(a int default 1, out b int)
+    RETURNS int
+    LANGUAGE SQL
+    AS 'SELECT $1';
+
+SELECT routine_name, ordinal_position, parameter_name, parameter_default
+    FROM information_schema.parameters JOIN information_schema.routines USING (specific_schema, specific_name)
+    WHERE routine_schema = 'temp_func_test' AND routine_name ~ '^functest_is_'
+    ORDER BY 1, 2;
+
 
 -- Cleanups
 DROP SCHEMA temp_func_test CASCADE;

@@ -7,7 +7,7 @@
  *	 ExecProcNode, or ExecEndNode on its subnodes and do the appropriate
  *	 processing.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -32,6 +32,7 @@
  *		the number of employees in that department.  So we have the query:
  *
  *				select DEPT.no_emps, EMP.age
+ *				from DEPT, EMP
  *				where EMP.name = DEPT.mgr and
  *					  DEPT.name = "shoe"
  *
@@ -51,7 +52,7 @@
  *	  * ExecInitNode() notices that it is looking at a nest loop and
  *		as the code below demonstrates, it calls ExecInitNestLoop().
  *		Eventually this calls ExecInitNode() on the right and left subplans
- *		and so forth until the entire plan is initialized.	The result
+ *		and so forth until the entire plan is initialized.  The result
  *		of ExecInitNode() is a plan state tree built with the same structure
  *		as the underlying plan tree.
  *
@@ -84,6 +85,7 @@
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
 #include "executor/nodeCtescan.h"
+#include "executor/nodeCustom.h"
 #include "executor/nodeForeignscan.h"
 #include "executor/nodeFunctionscan.h"
 #include "executor/nodeGroup.h"
@@ -241,6 +243,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_ForeignScan:
 			result = (PlanState *) ExecInitForeignScan((ForeignScan *) node,
 													   estate, eflags);
+			break;
+
+		case T_CustomScan:
+			result = (PlanState *) ExecInitCustomScan((CustomScan *) node,
+													  estate, eflags);
 			break;
 
 			/*
@@ -441,6 +448,10 @@ ExecProcNode(PlanState *node)
 			result = ExecForeignScan((ForeignScanState *) node);
 			break;
 
+		case T_CustomScanState:
+			result = ExecCustomScan((CustomScanState *) node);
+			break;
+
 			/*
 			 * join nodes
 			 */
@@ -574,7 +585,7 @@ MultiExecProcNode(PlanState *node)
  *		at 'node'.
  *
  *		After this operation, the query plan will not be able to be
- *		processed any further.	This should be called only after
+ *		processed any further.  This should be called only after
  *		the query plan has been fully executed.
  * ----------------------------------------------------------------
  */
@@ -675,6 +686,10 @@ ExecEndNode(PlanState *node)
 
 		case T_ForeignScanState:
 			ExecEndForeignScan((ForeignScanState *) node);
+			break;
+
+		case T_CustomScanState:
+			ExecEndCustomScan((CustomScanState *) node);
 			break;
 
 			/*

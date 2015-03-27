@@ -3,7 +3,7 @@
  * pg_constraint.c
  *	  routines to support manipulation of the pg_constraint relation
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -37,8 +38,10 @@
  *	Create a constraint table entry.
  *
  * Subsidiary records (such as triggers or indexes to implement the
- * constraint) are *not* created here.	But we do make dependency links
+ * constraint) are *not* created here.  But we do make dependency links
  * from the constraint to the things it depends on.
+ *
+ * The new constraint's OID is returned.
  */
 Oid
 CreateConstraintEntry(const char *constraintName,
@@ -67,7 +70,8 @@ CreateConstraintEntry(const char *constraintName,
 					  const char *conSrc,
 					  bool conIsLocal,
 					  int conInhCount,
-					  bool conIsOnly)
+					  bool conNoInherit,
+					  bool is_internal)
 {
 	Relation	conDesc;
 	Oid			conOid;
@@ -170,7 +174,7 @@ CreateConstraintEntry(const char *constraintName,
 	values[Anum_pg_constraint_confmatchtype - 1] = CharGetDatum(foreignMatchType);
 	values[Anum_pg_constraint_conislocal - 1] = BoolGetDatum(conIsLocal);
 	values[Anum_pg_constraint_coninhcount - 1] = Int32GetDatum(conInhCount);
-	values[Anum_pg_constraint_conisonly - 1] = BoolGetDatum(conIsOnly);
+	values[Anum_pg_constraint_connoinherit - 1] = BoolGetDatum(conNoInherit);
 
 	if (conkeyArray)
 		values[Anum_pg_constraint_conkey - 1] = PointerGetDatum(conkeyArray);
@@ -303,7 +307,7 @@ CreateConstraintEntry(const char *constraintName,
 	{
 		/*
 		 * Register normal dependency on the unique index that supports a
-		 * foreign-key constraint.	(Note: for indexes associated with unique
+		 * foreign-key constraint.  (Note: for indexes associated with unique
 		 * or primary-key constraints, the dependency runs the other way, and
 		 * is not made here.)
 		 */
@@ -366,7 +370,8 @@ CreateConstraintEntry(const char *constraintName,
 	}
 
 	/* Post creation hook for new constraint */
-	InvokeObjectAccessHook(OAT_POST_CREATE, ConstraintRelationId, conOid, 0);
+	InvokeObjectPostCreateHookArg(ConstraintRelationId, conOid, 0,
+								  is_internal);
 
 	return conOid;
 }
@@ -409,7 +414,7 @@ ConstraintNameIsUsed(ConstraintCategory conCat, Oid objId,
 				ObjectIdGetDatum(objNamespace));
 
 	conscan = systable_beginscan(conDesc, ConstraintNameNspIndexId, true,
-								 SnapshotNow, 2, skey);
+								 NULL, 2, skey);
 
 	while (HeapTupleIsValid(tup = systable_getnext(conscan)))
 	{
@@ -503,7 +508,7 @@ ChooseConstraintName(const char *name1, const char *name2,
 						ObjectIdGetDatum(namespaceid));
 
 			conscan = systable_beginscan(conDesc, ConstraintNameNspIndexId, true,
-										 SnapshotNow, 2, skey);
+										 NULL, 2, skey);
 
 			found = (HeapTupleIsValid(systable_getnext(conscan)));
 
@@ -664,6 +669,8 @@ RenameConstraintById(Oid conId, const char *newname)
 	/* update the system catalog indexes */
 	CatalogUpdateIndexes(conDesc, tuple);
 
+	InvokeObjectPostAlterHook(ConstraintRelationId, conId, 0);
+
 	heap_freetuple(tuple);
 	heap_close(conDesc, RowExclusiveLock);
 }
@@ -677,7 +684,7 @@ RenameConstraintById(Oid conId, const char *newname)
  */
 void
 AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
-						  Oid newNspId, bool isType)
+					   Oid newNspId, bool isType, ObjectAddresses *objsMoved)
 {
 	Relation	conRel;
 	ScanKeyData key[1];
@@ -694,7 +701,7 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 					ObjectIdGetDatum(ownerId));
 
 		scan = systable_beginscan(conRel, ConstraintTypidIndexId, true,
-								  SnapshotNow, 1, key);
+								  NULL, 1, key);
 	}
 	else
 	{
@@ -704,12 +711,20 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 					ObjectIdGetDatum(ownerId));
 
 		scan = systable_beginscan(conRel, ConstraintRelidIndexId, true,
-								  SnapshotNow, 1, key);
+								  NULL, 1, key);
 	}
 
 	while (HeapTupleIsValid((tup = systable_getnext(scan))))
 	{
 		Form_pg_constraint conform = (Form_pg_constraint) GETSTRUCT(tup);
+		ObjectAddress thisobj;
+
+		thisobj.classId = ConstraintRelationId;
+		thisobj.objectId = HeapTupleGetOid(tup);
+		thisobj.objectSubId = 0;
+
+		if (object_address_present(&thisobj, objsMoved))
+			continue;
 
 		if (conform->connamespace == oldNspId)
 		{
@@ -727,6 +742,10 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 			 * changeDependencyFor().
 			 */
 		}
+
+		InvokeObjectPostAlterHook(ConstraintRelationId, thisobj.objectId, 0);
+
+		add_exact_object_address(&thisobj, objsMoved);
 	}
 
 	systable_endscan(scan);
@@ -735,12 +754,31 @@ AlterConstraintNamespaces(Oid ownerId, Oid oldNspId,
 }
 
 /*
- * get_constraint_oid
+ * get_constraint_relation_oids
+ *		Find the IDs of the relations to which a constraint refers.
+ */
+void
+get_constraint_relation_oids(Oid constraint_oid, Oid *conrelid, Oid *confrelid)
+{
+	HeapTuple	tup;
+	Form_pg_constraint con;
+
+	tup = SearchSysCache1(CONSTROID, ObjectIdGetDatum(constraint_oid));
+	if (!HeapTupleIsValid(tup)) /* should not happen */
+		elog(ERROR, "cache lookup failed for constraint %u", constraint_oid);
+	con = (Form_pg_constraint) GETSTRUCT(tup);
+	*conrelid = con->conrelid;
+	*confrelid = con->confrelid;
+	ReleaseSysCache(tup);
+}
+
+/*
+ * get_relation_constraint_oid
  *		Find a constraint on the specified relation with the specified name.
  *		Returns constraint's OID.
  */
 Oid
-get_constraint_oid(Oid relid, const char *conname, bool missing_ok)
+get_relation_constraint_oid(Oid relid, const char *conname, bool missing_ok)
 {
 	Relation	pg_constraint;
 	HeapTuple	tuple;
@@ -761,7 +799,7 @@ get_constraint_oid(Oid relid, const char *conname, bool missing_ok)
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(pg_constraint, ConstraintRelidIndexId, true,
-							  SnapshotNow, 1, skey);
+							  NULL, 1, skey);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{
@@ -793,6 +831,64 @@ get_constraint_oid(Oid relid, const char *conname, bool missing_ok)
 }
 
 /*
+ * get_domain_constraint_oid
+ *		Find a constraint on the specified domain with the specified name.
+ *		Returns constraint's OID.
+ */
+Oid
+get_domain_constraint_oid(Oid typid, const char *conname, bool missing_ok)
+{
+	Relation	pg_constraint;
+	HeapTuple	tuple;
+	SysScanDesc scan;
+	ScanKeyData skey[1];
+	Oid			conOid = InvalidOid;
+
+	/*
+	 * Fetch the constraint tuple from pg_constraint.  There may be more than
+	 * one match, because constraints are not required to have unique names;
+	 * if so, error out.
+	 */
+	pg_constraint = heap_open(ConstraintRelationId, AccessShareLock);
+
+	ScanKeyInit(&skey[0],
+				Anum_pg_constraint_contypid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(typid));
+
+	scan = systable_beginscan(pg_constraint, ConstraintTypidIndexId, true,
+							  NULL, 1, skey);
+
+	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+	{
+		Form_pg_constraint con = (Form_pg_constraint) GETSTRUCT(tuple);
+
+		if (strcmp(NameStr(con->conname), conname) == 0)
+		{
+			if (OidIsValid(conOid))
+				ereport(ERROR,
+						(errcode(ERRCODE_DUPLICATE_OBJECT),
+				errmsg("domain \"%s\" has multiple constraints named \"%s\"",
+					   format_type_be(typid), conname)));
+			conOid = HeapTupleGetOid(tuple);
+		}
+	}
+
+	systable_endscan(scan);
+
+	/* If no such constraint exists, complain */
+	if (!OidIsValid(conOid) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("constraint \"%s\" for domain \"%s\" does not exist",
+						conname, format_type_be(typid))));
+
+	heap_close(pg_constraint, AccessShareLock);
+
+	return conOid;
+}
+
+/*
  * Determine whether a relation can be proven functionally dependent on
  * a set of grouping columns.  If so, return TRUE and add the pg_constraint
  * OIDs of the constraints needed for the proof to the *constraintDeps list.
@@ -801,10 +897,10 @@ get_constraint_oid(Oid relid, const char *conname, bool missing_ok)
  * the rel of interest are Vars with the indicated varno/varlevelsup.
  *
  * Currently we only check to see if the rel has a primary key that is a
- * subset of the grouping_columns.	We could also use plain unique constraints
+ * subset of the grouping_columns.  We could also use plain unique constraints
  * if all their columns are known not null, but there's a problem: we need
  * to be able to represent the not-null-ness as part of the constraints added
- * to *constraintDeps.	FIXME whenever not-null constraints get represented
+ * to *constraintDeps.  FIXME whenever not-null constraints get represented
  * in pg_constraint.
  */
 bool
@@ -828,7 +924,7 @@ check_functional_grouping(Oid relid,
 				ObjectIdGetDatum(relid));
 
 	scan = systable_beginscan(pg_constraint, ConstraintRelidIndexId, true,
-							  SnapshotNow, 1, skey);
+							  NULL, 1, skey);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{

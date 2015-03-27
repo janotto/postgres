@@ -12,24 +12,25 @@
 
 #include "plpy_elog.h"
 
+#include "plpy_main.h"
 #include "plpy_procedure.h"
 
 
-PyObject *PLy_exc_error = NULL;
-PyObject *PLy_exc_fatal = NULL;
-PyObject *PLy_exc_spi_error = NULL;
+PyObject   *PLy_exc_error = NULL;
+PyObject   *PLy_exc_fatal = NULL;
+PyObject   *PLy_exc_spi_error = NULL;
 
 
 static void PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth);
 static void PLy_get_spi_error_data(PyObject *exc, int *sqlerrcode, char **detail,
-								   char **hint, char **query, int *position);
-static char * get_source_line(const char *src, int lineno);
+					   char **hint, char **query, int *position);
+static char *get_source_line(const char *src, int lineno);
 
 
 /*
  * Emit a PG error or notice, together with any available info about
  * the current Python error, previously set by PLy_exception_set().
- * This should be used to propagate Python errors into PG.	If fmt is
+ * This should be used to propagate Python errors into PG.  If fmt is
  * NULL, the Python error becomes the primary error message, otherwise
  * it becomes the detail.  If there is a Python traceback, it is put
  * in the context.
@@ -45,7 +46,7 @@ PLy_elog(int elevel, const char *fmt,...)
 			   *val,
 			   *tb;
 	const char *primary = NULL;
-	int		   sqlerrcode = 0;
+	int			sqlerrcode = 0;
 	char	   *detail = NULL;
 	char	   *hint = NULL;
 	char	   *query = NULL;
@@ -69,14 +70,14 @@ PLy_elog(int elevel, const char *fmt,...)
 		for (;;)
 		{
 			va_list		ap;
-			bool		success;
+			int			needed;
 
 			va_start(ap, fmt);
-			success = appendStringInfoVA(&emsg, dgettext(TEXTDOMAIN, fmt), ap);
+			needed = appendStringInfoVA(&emsg, dgettext(TEXTDOMAIN, fmt), ap);
 			va_end(ap);
-			if (success)
+			if (needed == 0)
 				break;
-			enlargeStringInfo(&emsg, emsg.maxlen);
+			enlargeStringInfo(&emsg, needed);
 		}
 		primary = emsg.data;
 
@@ -97,7 +98,7 @@ PLy_elog(int elevel, const char *fmt,...)
 	{
 		ereport(elevel,
 				(errcode(sqlerrcode ? sqlerrcode : ERRCODE_INTERNAL_ERROR),
-				 errmsg_internal("%s", primary ? primary : "no exception data"),
+			  errmsg_internal("%s", primary ? primary : "no exception data"),
 				 (detail) ? errdetail_internal("%s", detail) : 0,
 				 (tb_depth > 0 && tbmsg) ? errcontext("%s", tbmsg) : 0,
 				 (hint) ? errhint("%s", hint) : 0,
@@ -255,6 +256,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 		/* The first frame always points at <module>, skip it. */
 		if (*tb_depth > 0)
 		{
+			PLyExecutionContext *exec_ctx = PLy_current_execution_context();
 			char	   *proname;
 			char	   *fname;
 			char	   *line;
@@ -270,7 +272,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 			else
 				fname = PyString_AsString(name);
 
-			proname = PLy_procedure_name(PLy_curr_procedure);
+			proname = PLy_procedure_name(exec_ctx->curr_proc);
 			plain_filename = PyString_AsString(filename);
 			plain_lineno = PyInt_AsLong(lineno);
 
@@ -287,7 +289,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 			 * function code object was compiled with "<string>" as the
 			 * filename
 			 */
-			if (PLy_curr_procedure && plain_filename != NULL &&
+			if (exec_ctx->curr_proc && plain_filename != NULL &&
 				strcmp(plain_filename, "<string>") == 0)
 			{
 				/*
@@ -299,7 +301,7 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 				 * for.  But we do not go as far as traceback.py in reading
 				 * the source of imported modules.
 				 */
-				line = get_source_line(PLy_curr_procedure->src, plain_lineno);
+				line = get_source_line(exec_ctx->curr_proc->src, plain_lineno);
 				if (line)
 				{
 					appendStringInfo(&tbstr, "\n    %s", line);
@@ -335,6 +337,31 @@ PLy_traceback(char **xmsg, char **tbmsg, int *tb_depth)
 }
 
 /*
+ * Extract error code from SPIError's sqlstate attribute.
+ */
+static void
+PLy_get_spi_sqlerrcode(PyObject *exc, int *sqlerrcode)
+{
+	PyObject   *sqlstate;
+	char	   *buffer;
+
+	sqlstate = PyObject_GetAttrString(exc, "sqlstate");
+	if (sqlstate == NULL)
+		return;
+
+	buffer = PyString_AsString(sqlstate);
+	if (strlen(buffer) == 5 &&
+		strspn(buffer, "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ") == 5)
+	{
+		*sqlerrcode = MAKE_SQLSTATE(buffer[0], buffer[1], buffer[2],
+									buffer[3], buffer[4]);
+	}
+
+	Py_DECREF(sqlstate);
+}
+
+
+/*
  * Extract the error data from a SPIError
  */
 static void
@@ -343,13 +370,20 @@ PLy_get_spi_error_data(PyObject *exc, int *sqlerrcode, char **detail, char **hin
 	PyObject   *spidata = NULL;
 
 	spidata = PyObject_GetAttrString(exc, "spidata");
-	if (!spidata)
-		goto cleanup;
 
-	if (!PyArg_ParseTuple(spidata, "izzzi", sqlerrcode, detail, hint, query, position))
-		goto cleanup;
+	if (spidata != NULL)
+	{
+		PyArg_ParseTuple(spidata, "izzzi", sqlerrcode, detail, hint, query, position);
+	}
+	else
+	{
+		/*
+		 * If there's no spidata, at least set the sqlerrcode. This can happen
+		 * if someone explicitly raises a SPI exception from Python code.
+		 */
+		PLy_get_spi_sqlerrcode(exc, sqlerrcode);
+	}
 
-cleanup:
 	PyErr_Clear();
 	/* no elog here, we simply won't report the errhint, errposition etc */
 	Py_XDECREF(spidata);
@@ -364,6 +398,10 @@ get_source_line(const char *src, int lineno)
 	const char *s = NULL;
 	const char *next = src;
 	int			current = 0;
+
+	/* sanity check */
+	if (lineno <= 0)
+		return NULL;
 
 	while (current < lineno)
 	{

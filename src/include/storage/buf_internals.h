@@ -5,7 +5,7 @@
  *	  strategy.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/buf_internals.h
@@ -16,6 +16,7 @@
 #define BUFMGR_INTERNALS_H
 
 #include "storage/buf.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "storage/smgr.h"
@@ -103,16 +104,19 @@ typedef struct buftag
 #define BufTableHashPartition(hashcode) \
 	((hashcode) % NUM_BUFFER_PARTITIONS)
 #define BufMappingPartitionLock(hashcode) \
-	((LWLockId) (FirstBufMappingLock + BufTableHashPartition(hashcode)))
+	(&MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + \
+		BufTableHashPartition(hashcode)].lock)
+#define BufMappingPartitionLockByIndex(i) \
+	(&MainLWLockArray[BUFFER_MAPPING_LWLOCK_OFFSET + (i)].lock)
 
 /*
  *	BufferDesc -- shared descriptor/state data for a single shared buffer.
  *
  * Note: buf_hdr_lock must be held to examine or change the tag, flags,
  * usage_count, refcount, or wait_backend_pid fields.  buf_id field never
- * changes after initialization, so does not need locking.	freeNext is
- * protected by the BufFreelistLock not buf_hdr_lock.  The LWLocks can take
- * care of themselves.	The buf_hdr_lock is *not* used to control access to
+ * changes after initialization, so does not need locking.  freeNext is
+ * protected by the buffer_strategy_lock not buf_hdr_lock.  The LWLocks can take
+ * care of themselves.  The buf_hdr_lock is *not* used to control access to
  * the data in the buffer!
  *
  * An exception is that if we have the buffer pinned, its tag can't change
@@ -123,14 +127,14 @@ typedef struct buftag
  *
  * We can't physically remove items from a disk page if another backend has
  * the buffer pinned.  Hence, a backend may need to wait for all other pins
- * to go away.	This is signaled by storing its own PID into
+ * to go away.  This is signaled by storing its own PID into
  * wait_backend_pid and setting flag bit BM_PIN_COUNT_WAITER.  At present,
  * there can be only one such waiter per buffer.
  *
  * We use this same struct for local buffer headers, but the lock fields
  * are not used and not all of the flag bits are useful either.
  */
-typedef struct sbufdesc
+typedef struct BufferDesc
 {
 	BufferTag	tag;			/* ID of page contained in buffer */
 	BufFlags	flags;			/* see bit definitions above */
@@ -143,9 +147,40 @@ typedef struct sbufdesc
 	int			buf_id;			/* buffer's index number (from 0) */
 	int			freeNext;		/* link in freelist chain */
 
-	LWLockId	io_in_progress_lock;	/* to wait for I/O to complete */
-	LWLockId	content_lock;	/* to lock access to buffer contents */
+	LWLock	   *io_in_progress_lock;	/* to wait for I/O to complete */
+	LWLock	   *content_lock;	/* to lock access to buffer contents */
 } BufferDesc;
+
+/*
+ * Concurrent access to buffer headers has proven to be more efficient if
+ * they're cache line aligned. So we force the start of the BufferDescriptors
+ * array to be on a cache line boundary and force the elements to be cache
+ * line sized.
+ *
+ * XXX: As this is primarily matters in highly concurrent workloads which
+ * probably all are 64bit these days, and the space wastage would be a bit
+ * more noticeable on 32bit systems, we don't force the stride to be cache
+ * line sized on those. If somebody does actual performance testing, we can
+ * reevaluate.
+ *
+ * Note that local buffer descriptors aren't forced to be aligned - as there's
+ * no concurrent access to those it's unlikely to be beneficial.
+ *
+ * We use 64bit as the cache line size here, because that's the most common
+ * size. Making it bigger would be a waste of memory. Even if running on a
+ * platform with either 32 or 128 byte line sizes, it's good to align to
+ * boundaries and avoid false sharing.
+ */
+#define BUFFERDESC_PAD_TO_SIZE	(SIZEOF_VOID_P == 8 ? 64 : 1)
+
+typedef union BufferDescPadded
+{
+	BufferDesc	bufferdesc;
+	char		pad[BUFFERDESC_PAD_TO_SIZE];
+} BufferDescPadded;
+
+#define GetBufferDescriptor(id) (&BufferDescriptors[(id)].bufferdesc)
+#define GetLocalBufferDescriptor(id) (&LocalBufferDescriptors[(id)])
 
 #define BufferDescriptorGetBuffer(bdesc) ((bdesc)->buf_id + 1)
 
@@ -170,7 +205,7 @@ typedef struct sbufdesc
 
 
 /* in buf_init.c */
-extern PGDLLIMPORT BufferDesc *BufferDescriptors;
+extern PGDLLIMPORT BufferDescPadded *BufferDescriptors;
 
 /* in localbuf.c */
 extern BufferDesc *LocalBufferDescriptors;
@@ -181,13 +216,14 @@ extern BufferDesc *LocalBufferDescriptors;
  */
 
 /* freelist.c */
-extern volatile BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy,
-				  bool *lock_held);
+extern volatile BufferDesc *StrategyGetBuffer(BufferAccessStrategy strategy);
 extern void StrategyFreeBuffer(volatile BufferDesc *buf);
 extern bool StrategyRejectBuffer(BufferAccessStrategy strategy,
 					 volatile BufferDesc *buf);
 
 extern int	StrategySyncStart(uint32 *complete_passes, uint32 *num_buf_alloc);
+extern void StrategyNotifyBgWriter(int bgwprocno);
+
 extern Size StrategyShmemSize(void);
 extern void StrategyInitialize(bool init);
 
@@ -207,6 +243,7 @@ extern BufferDesc *LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum,
 extern void MarkLocalBufferDirty(Buffer buffer);
 extern void DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 							BlockNumber firstDelBlock);
+extern void DropRelFileNodeAllLocalBuffers(RelFileNode rnode);
 extern void AtEOXact_LocalBuffers(bool isCommit);
 
 #endif   /* BUFMGR_INTERNALS_H */

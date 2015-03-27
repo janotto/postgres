@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ROLLBACK-PREPARED">
+ <indexterm zone="sql-rollback-prepared">
+  <primary>ROLLBACK PREPARED</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ROLLBACK PREPARED</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -14,10 +18,6 @@ PostgreSQL documentation
   <refname>ROLLBACK PREPARED</refname>
   <refpurpose>cancel a transaction that was earlier prepared for two-phase commit</refpurpose>
  </refnamediv>
-
- <indexterm zone="sql-rollback-prepared">
-  <primary>ROLLBACK PREPARED</primary>
- </indexterm>
 
  <refsynopsisdiv>
 <synopsis>
@@ -81,6 +81,18 @@ ROLLBACK PREPARED <replaceable class="PARAMETER">transaction_id</replaceable>
 ROLLBACK PREPARED 'foobar';
 </programlisting></para>
 
+ </refsect1>
+
+ <refsect1>
+  <title>Compatibility</title>
+
+  <para>
+   <command>ROLLBACK PREPARED</command> is a
+   <productname>PostgreSQL</productname> extension.  It is intended for use by
+   external transaction management systems, some of which are covered by
+   standards (such as X/Open XA), but the SQL side of those systems is not
+   standardized.
+  </para>
  </refsect1>
 
  <refsect1>

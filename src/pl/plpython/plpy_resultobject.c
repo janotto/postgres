@@ -9,6 +9,7 @@
 #include "plpython.h"
 
 #include "plpy_resultobject.h"
+#include "plpy_elog.h"
 
 
 static void PLy_result_dealloc(PyObject *arg);
@@ -20,8 +21,10 @@ static PyObject *PLy_result_status(PyObject *self, PyObject *args);
 static Py_ssize_t PLy_result_length(PyObject *arg);
 static PyObject *PLy_result_item(PyObject *arg, Py_ssize_t idx);
 static PyObject *PLy_result_slice(PyObject *arg, Py_ssize_t lidx, Py_ssize_t hidx);
-static int	PLy_result_ass_item(PyObject *arg, Py_ssize_t idx, PyObject *item);
-static int	PLy_result_ass_slice(PyObject *rg, Py_ssize_t lidx, Py_ssize_t hidx, PyObject *slice);
+static int	PLy_result_ass_slice(PyObject *arg, Py_ssize_t lidx, Py_ssize_t hidx, PyObject *slice);
+static PyObject *PLy_result_str(PyObject *arg);
+static PyObject *PLy_result_subscript(PyObject *arg, PyObject *item);
+static int	PLy_result_ass_subscript(PyObject *self, PyObject *item, PyObject *value);
 
 static char PLy_result_doc[] = {
 	"Results of a PostgreSQL query"
@@ -33,8 +36,14 @@ static PySequenceMethods PLy_result_as_sequence = {
 	NULL,						/* sq_repeat */
 	PLy_result_item,			/* sq_item */
 	PLy_result_slice,			/* sq_slice */
-	PLy_result_ass_item,		/* sq_ass_item */
+	NULL,						/* sq_ass_item */
 	PLy_result_ass_slice,		/* sq_ass_slice */
+};
+
+static PyMappingMethods PLy_result_as_mapping = {
+	PLy_result_length,			/* mp_length */
+	PLy_result_subscript,		/* mp_subscript */
+	PLy_result_ass_subscript,	/* mp_ass_subscript */
 };
 
 static PyMethodDef PLy_result_methods[] = {
@@ -63,10 +72,10 @@ static PyTypeObject PLy_ResultType = {
 	0,							/* tp_repr */
 	0,							/* tp_as_number */
 	&PLy_result_as_sequence,	/* tp_as_sequence */
-	0,							/* tp_as_mapping */
+	&PLy_result_as_mapping,		/* tp_as_mapping */
 	0,							/* tp_hash */
 	0,							/* tp_call */
-	0,							/* tp_str */
+	&PLy_result_str,			/* tp_str */
 	0,							/* tp_getattro */
 	0,							/* tp_setattro */
 	0,							/* tp_as_buffer */
@@ -131,6 +140,12 @@ PLy_result_colnames(PyObject *self, PyObject *unused)
 	PyObject   *list;
 	int			i;
 
+	if (!ob->tupdesc)
+	{
+		PLy_exception_set(PLy_exc_error, "command did not produce a result set");
+		return NULL;
+	}
+
 	list = PyList_New(ob->tupdesc->natts);
 	for (i = 0; i < ob->tupdesc->natts; i++)
 		PyList_SET_ITEM(list, i, PyString_FromString(NameStr(ob->tupdesc->attrs[i]->attname)));
@@ -145,6 +160,12 @@ PLy_result_coltypes(PyObject *self, PyObject *unused)
 	PyObject   *list;
 	int			i;
 
+	if (!ob->tupdesc)
+	{
+		PLy_exception_set(PLy_exc_error, "command did not produce a result set");
+		return NULL;
+	}
+
 	list = PyList_New(ob->tupdesc->natts);
 	for (i = 0; i < ob->tupdesc->natts; i++)
 		PyList_SET_ITEM(list, i, PyInt_FromLong(ob->tupdesc->attrs[i]->atttypid));
@@ -158,6 +179,12 @@ PLy_result_coltypmods(PyObject *self, PyObject *unused)
 	PLyResultObject *ob = (PLyResultObject *) self;
 	PyObject   *list;
 	int			i;
+
+	if (!ob->tupdesc)
+	{
+		PLy_exception_set(PLy_exc_error, "command did not produce a result set");
+		return NULL;
+	}
 
 	list = PyList_New(ob->tupdesc->natts);
 	for (i = 0; i < ob->tupdesc->natts; i++)
@@ -204,17 +231,6 @@ PLy_result_item(PyObject *arg, Py_ssize_t idx)
 	return rv;
 }
 
-static int
-PLy_result_ass_item(PyObject *arg, Py_ssize_t idx, PyObject *item)
-{
-	int			rv;
-	PLyResultObject *ob = (PLyResultObject *) arg;
-
-	Py_INCREF(item);
-	rv = PyList_SetItem(ob->rows, idx, item);
-	return rv;
-}
-
 static PyObject *
 PLy_result_slice(PyObject *arg, Py_ssize_t lidx, Py_ssize_t hidx)
 {
@@ -231,4 +247,40 @@ PLy_result_ass_slice(PyObject *arg, Py_ssize_t lidx, Py_ssize_t hidx, PyObject *
 
 	rv = PyList_SetSlice(ob->rows, lidx, hidx, slice);
 	return rv;
+}
+
+static PyObject *
+PLy_result_str(PyObject *arg)
+{
+	PLyResultObject *ob = (PLyResultObject *) arg;
+
+#if PY_MAJOR_VERSION >= 3
+	return PyUnicode_FromFormat("<%s status=%S nrows=%S rows=%S>",
+								Py_TYPE(ob)->tp_name,
+								ob->status,
+								ob->nrows,
+								ob->rows);
+#else
+	return PyString_FromFormat("<%s status=%ld nrows=%ld rows=%s>",
+							   ob->ob_type->tp_name,
+							   PyInt_AsLong(ob->status),
+							   PyInt_AsLong(ob->nrows),
+							   PyString_AsString(PyObject_Str(ob->rows)));
+#endif
+}
+
+static PyObject *
+PLy_result_subscript(PyObject *arg, PyObject *item)
+{
+	PLyResultObject *ob = (PLyResultObject *) arg;
+
+	return PyObject_GetItem(ob->rows, item);
+}
+
+static int
+PLy_result_ass_subscript(PyObject *arg, PyObject *item, PyObject *value)
+{
+	PLyResultObject *ob = (PLyResultObject *) arg;
+
+	return PyObject_SetItem(ob->rows, item, value);
 }

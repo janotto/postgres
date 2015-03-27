@@ -12,7 +12,7 @@
  * postgresql.conf and recovery.conf.  An extension also has an installation
  * script file, containing SQL commands to create the extension's objects.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -27,6 +27,7 @@
 #include <limits.h>
 #include <unistd.h>
 
+#include "access/htup_details.h"
 #include "access/sysattr.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
@@ -45,6 +46,7 @@
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/fmgroids.h"
@@ -106,7 +108,7 @@ static void ApplyExtensionUpdates(Oid extensionOid,
 /*
  * get_extension_oid - given an extension name, look up the OID
  *
- * If missing_ok is false, throw an error if extension name not found.	If
+ * If missing_ok is false, throw an error if extension name not found.  If
  * true, just return InvalidOid.
  */
 Oid
@@ -126,7 +128,7 @@ get_extension_oid(const char *extname, bool missing_ok)
 				CStringGetDatum(extname));
 
 	scandesc = systable_beginscan(rel, ExtensionNameIndexId, true,
-								  SnapshotNow, 1, entry);
+								  NULL, 1, entry);
 
 	tuple = systable_getnext(scandesc);
 
@@ -171,7 +173,7 @@ get_extension_name(Oid ext_oid)
 				ObjectIdGetDatum(ext_oid));
 
 	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  SnapshotNow, 1, entry);
+								  NULL, 1, entry);
 
 	tuple = systable_getnext(scandesc);
 
@@ -210,7 +212,7 @@ get_extension_schema(Oid ext_oid)
 				ObjectIdGetDatum(ext_oid));
 
 	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  SnapshotNow, 1, entry);
+								  NULL, 1, entry);
 
 	tuple = systable_getnext(scandesc);
 
@@ -255,9 +257,9 @@ check_valid_extension_name(const char *extensionname)
 				 errdetail("Extension names must not contain \"--\".")));
 
 	/*
-	 * No leading or trailing dash either.	(We could probably allow this, but
+	 * No leading or trailing dash either.  (We could probably allow this, but
 	 * it would require much care in filename parsing and would make filenames
-	 * visually if not formally ambiguous.	Since there's no real-world use
+	 * visually if not formally ambiguous.  Since there's no real-world use
 	 * case, let's just forbid it.)
 	 */
 	if (extensionname[0] == '-' || extensionname[namelen - 1] == '-')
@@ -433,7 +435,7 @@ get_extension_script_filename(ExtensionControlFile *control,
 
 /*
  * Parse contents of primary or auxiliary control file, and fill in
- * fields of *control.	We parse primary file if version == NULL,
+ * fields of *control.  We parse primary file if version == NULL,
  * else the optional auxiliary file for that version.
  *
  * Control files are supposed to be very short, half a dozen lines,
@@ -633,7 +635,6 @@ read_extension_script_file(const ExtensionControlFile *control,
 						   const char *filename)
 {
 	int			src_encoding;
-	int			dest_encoding = GetDatabaseEncoding();
 	bytea	   *content;
 	char	   *src_str;
 	char	   *dest_str;
@@ -643,7 +644,7 @@ read_extension_script_file(const ExtensionControlFile *control,
 
 	/* use database encoding if not given */
 	if (control->encoding < 0)
-		src_encoding = dest_encoding;
+		src_encoding = GetDatabaseEncoding();
 	else
 		src_encoding = control->encoding;
 
@@ -653,10 +654,7 @@ read_extension_script_file(const ExtensionControlFile *control,
 	pg_verify_mbstr_len(src_encoding, src_str, len, false);
 
 	/* convert the encoding to the database encoding */
-	dest_str = (char *) pg_do_encoding_conversion((unsigned char *) src_str,
-												  len,
-												  src_encoding,
-												  dest_encoding);
+	dest_str = pg_any_to_server(src_str, len, src_encoding);
 
 	/* if no conversion happened, we have to arrange for null termination */
 	if (dest_str == src_str)
@@ -675,7 +673,7 @@ read_extension_script_file(const ExtensionControlFile *control,
  * filename is used only to report errors.
  *
  * Note: it's tempting to just use SPI to execute the string, but that does
- * not work very well.	The really serious problem is that SPI will parse,
+ * not work very well.  The really serious problem is that SPI will parse,
  * analyze, and plan the whole string before executing any of it; of course
  * this fails if there are any plannable statements referring to objects
  * created earlier in the script.  A lesser annoyance is that SPI insists
@@ -748,8 +746,8 @@ execute_sql_string(const char *sql, const char *filename)
 			{
 				ProcessUtility(stmt,
 							   sql,
+							   PROCESS_UTILITY_QUERY,
 							   NULL,
-							   false,	/* not top level */
 							   dest,
 							   NULL);
 			}
@@ -816,11 +814,11 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 	if (client_min_messages < WARNING)
 		(void) set_config_option("client_min_messages", "warning",
 								 PGC_USERSET, PGC_S_SESSION,
-								 GUC_ACTION_SAVE, true, 0);
+								 GUC_ACTION_SAVE, true, 0, false);
 	if (log_min_messages < WARNING)
 		(void) set_config_option("log_min_messages", "warning",
 								 PGC_SUSET, PGC_S_SESSION,
-								 GUC_ACTION_SAVE, true, 0);
+								 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
 	 * Set up the search path to contain the target schema, then the schemas
@@ -845,12 +843,12 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 
 	(void) set_config_option("search_path", pathbuf.data,
 							 PGC_USERSET, PGC_S_SESSION,
-							 GUC_ACTION_SAVE, true, 0);
+							 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
 	 * Set creating_extension and related variables so that
 	 * recordDependencyOnCurrentExtension and other functions do the right
-	 * things.	On failure, ensure we reset these variables.
+	 * things.  On failure, ensure we reset these variables.
 	 */
 	creating_extension = true;
 	CurrentExtensionObject = extensionOid;
@@ -899,8 +897,8 @@ execute_extension_script(Oid extensionOid, ExtensionControlFile *control,
 		{
 			t_sql = DirectFunctionCall3(replace_text,
 										t_sql,
-										CStringGetTextDatum("MODULE_PATHNAME"),
-							CStringGetTextDatum(control->module_pathname));
+									  CStringGetTextDatum("MODULE_PATHNAME"),
+							  CStringGetTextDatum(control->module_pathname));
 		}
 
 		/* And now back to C string */
@@ -1094,7 +1092,7 @@ identify_update_path(ExtensionControlFile *control,
  * is still good.
  *
  * Result is a List of names of versions to transition through (the initial
- * version is *not* included).	Returns NIL if no such path.
+ * version is *not* included).  Returns NIL if no such path.
  */
 static List *
 find_update_path(List *evi_list,
@@ -1172,7 +1170,7 @@ find_update_path(List *evi_list,
 /*
  * CREATE EXTENSION
  */
-void
+ObjectAddress
 CreateExtension(CreateExtensionStmt *stmt)
 {
 	DefElem    *d_schema = NULL;
@@ -1190,12 +1188,13 @@ CreateExtension(CreateExtensionStmt *stmt)
 	List	   *requiredSchemas;
 	Oid			extensionOid;
 	ListCell   *lc;
+	ObjectAddress address;
 
 	/* Check extension name validity before any filesystem access */
 	check_valid_extension_name(stmt->extname);
 
 	/*
-	 * Check for duplicate extension name.	The unique index on
+	 * Check for duplicate extension name.  The unique index on
 	 * pg_extension.extname would catch this anyway, and serves as a backstop
 	 * in case of race conditions; but this is a friendlier error message, and
 	 * besides we need a check to support IF NOT EXISTS.
@@ -1208,7 +1207,7 @@ CreateExtension(CreateExtensionStmt *stmt)
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("extension \"%s\" already exists, skipping",
 							stmt->extname)));
-			return;
+			return InvalidObjectAddress;
 		}
 		else
 			ereport(ERROR,
@@ -1362,7 +1361,7 @@ CreateExtension(CreateExtensionStmt *stmt)
 	{
 		/*
 		 * The extension is not relocatable and the author gave us a schema
-		 * for it.	We create the schema here if it does not already exist.
+		 * for it.  We create the schema here if it does not already exist.
 		 */
 		schemaName = control->schema;
 		schemaOid = get_namespace_oid(schemaName, true);
@@ -1372,8 +1371,9 @@ CreateExtension(CreateExtensionStmt *stmt)
 			CreateSchemaStmt *csstmt = makeNode(CreateSchemaStmt);
 
 			csstmt->schemaname = schemaName;
-			csstmt->authid = NULL;		/* will be created by current user */
+			csstmt->authrole = NULL;	/* will be created by current user */
 			csstmt->schemaElts = NIL;
+			csstmt->if_not_exists = false;
 			CreateSchemaCommand(csstmt, NULL);
 
 			/*
@@ -1391,12 +1391,16 @@ CreateExtension(CreateExtensionStmt *stmt)
 		 */
 		List	   *search_path = fetch_search_path(false);
 
-		if (search_path == NIL) /* probably can't happen */
-			elog(ERROR, "there is no default creation target");
+		if (search_path == NIL) /* nothing valid in search_path? */
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_SCHEMA),
+					 errmsg("no schema has been selected to create in")));
 		schemaOid = linitial_oid(search_path);
 		schemaName = get_namespace_name(schemaOid);
 		if (schemaName == NULL) /* recently-deleted namespace? */
-			elog(ERROR, "there is no default creation target");
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_SCHEMA),
+					 errmsg("no schema has been selected to create in")));
 
 		list_free(search_path);
 	}
@@ -1440,12 +1444,13 @@ CreateExtension(CreateExtensionStmt *stmt)
 	/*
 	 * Insert new tuple into pg_extension, and create dependency entries.
 	 */
-	extensionOid = InsertExtensionTuple(control->name, extowner,
-										schemaOid, control->relocatable,
-										versionName,
-										PointerGetDatum(NULL),
-										PointerGetDatum(NULL),
-										requiredExtensions);
+	address = InsertExtensionTuple(control->name, extowner,
+								   schemaOid, control->relocatable,
+								   versionName,
+								   PointerGetDatum(NULL),
+								   PointerGetDatum(NULL),
+								   requiredExtensions);
+	extensionOid = address.objectId;
 
 	/*
 	 * Apply any control-file comment on extension
@@ -1467,6 +1472,8 @@ CreateExtension(CreateExtensionStmt *stmt)
 	 */
 	ApplyExtensionUpdates(extensionOid, pcontrol,
 						  versionName, updateVersions);
+
+	return address;
 }
 
 /*
@@ -1482,7 +1489,7 @@ CreateExtension(CreateExtensionStmt *stmt)
  * extConfig and extCondition should be arrays or PointerGetDatum(NULL).
  * We declare them as plain Datum to avoid needing array.h in extension.h.
  */
-Oid
+ObjectAddress
 InsertExtensionTuple(const char *extName, Oid extOwner,
 					 Oid schemaOid, bool relocatable, const char *extVersion,
 					 Datum extConfig, Datum extCondition,
@@ -1557,10 +1564,9 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 		recordDependencyOn(&myself, &otherext, DEPENDENCY_NORMAL);
 	}
 	/* Post creation hook for new extension */
-	InvokeObjectAccessHook(OAT_POST_CREATE,
-						   ExtensionRelationId, extensionOid, 0);
+	InvokeObjectPostCreateHook(ExtensionRelationId, extensionOid, 0);
 
-	return extensionOid;
+	return myself;
 }
 
 /*
@@ -1591,8 +1597,8 @@ RemoveExtensionById(Oid extId)
 	if (extId == CurrentExtensionObject)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("cannot drop extension \"%s\" because it is being modified",
-						get_extension_name(extId))));
+		  errmsg("cannot drop extension \"%s\" because it is being modified",
+				 get_extension_name(extId))));
 
 	rel = heap_open(ExtensionRelationId, RowExclusiveLock);
 
@@ -1601,7 +1607,7 @@ RemoveExtensionById(Oid extId)
 				BTEqualStrategyNumber, F_OIDEQ,
 				ObjectIdGetDatum(extId));
 	scandesc = systable_beginscan(rel, ExtensionOidIndexId, true,
-								  SnapshotNow, 1, entry);
+								  NULL, 1, entry);
 
 	tuple = systable_getnext(scandesc);
 
@@ -1616,7 +1622,7 @@ RemoveExtensionById(Oid extId)
 
 /*
  * This function lists the available extensions (one row per primary control
- * file in the control directory).	We parse each control file and report the
+ * file in the control directory).  We parse each control file and report the
  * interesting fields.
  *
  * The system view pg_available_extensions provides a user interface to this
@@ -1725,7 +1731,7 @@ pg_available_extensions(PG_FUNCTION_ARGS)
 
 /*
  * This function lists the available extension versions (one row per
- * extension installation script).	For each version, we parse the related
+ * extension installation script).  For each version, we parse the related
  * control file(s) and report the interesting fields.
  *
  * The system view pg_available_extension_versions provides a user interface
@@ -2047,6 +2053,7 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 	HeapTuple	extTup;
 	Datum		arrayDatum;
 	Datum		elementDatum;
+	int			arrayLength;
 	int			arrayIndex;
 	bool		isnull;
 	Datum		repl_val[Natts_pg_extension];
@@ -2066,8 +2073,8 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 
 	/*
 	 * Check that the table exists and is a member of the extension being
-	 * created.  This ensures that we don't need to register a dependency to
-	 * protect the extconfig entry.
+	 * created.  This ensures that we don't need to register an additional
+	 * dependency to protect the extconfig entry.
 	 */
 	tablename = get_rel_name(tableoid);
 	if (tablename == NULL)
@@ -2084,6 +2091,9 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 	/*
 	 * Add the table OID and WHERE condition to the extension's extconfig and
 	 * extcondition arrays.
+	 *
+	 * If the table is already in extconfig, treat this as an update of the
+	 * WHERE condition.
 	 */
 
 	/* Find the pg_extension tuple */
@@ -2095,7 +2105,7 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 				ObjectIdGetDatum(CurrentExtensionObject));
 
 	extScan = systable_beginscan(extRel, ExtensionOidIndexId, true,
-								 SnapshotNow, 1, key);
+								 NULL, 1, key);
 
 	extTup = systable_getnext(extScan);
 
@@ -2114,18 +2124,41 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 							  RelationGetDescr(extRel), &isnull);
 	if (isnull)
 	{
+		/* Previously empty extconfig, so build 1-element array */
+		arrayLength = 0;
+		arrayIndex = 1;
+
 		a = construct_array(&elementDatum, 1,
 							OIDOID,
 							sizeof(Oid), true, 'i');
 	}
 	else
 	{
-		a = DatumGetArrayTypeP(arrayDatum);
-		Assert(ARR_ELEMTYPE(a) == OIDOID);
-		Assert(ARR_NDIM(a) == 1);
-		Assert(ARR_LBOUND(a)[0] == 1);
+		/* Modify or extend existing extconfig array */
+		Oid		   *arrayData;
+		int			i;
 
-		arrayIndex = ARR_DIMS(a)[0] + 1;		/* add after end */
+		a = DatumGetArrayTypeP(arrayDatum);
+
+		arrayLength = ARR_DIMS(a)[0];
+		if (ARR_NDIM(a) != 1 ||
+			ARR_LBOUND(a)[0] != 1 ||
+			arrayLength < 0 ||
+			ARR_HASNULL(a) ||
+			ARR_ELEMTYPE(a) != OIDOID)
+			elog(ERROR, "extconfig is not a 1-D Oid array");
+		arrayData = (Oid *) ARR_DATA_PTR(a);
+
+		arrayIndex = arrayLength + 1;	/* set up to add after end */
+
+		for (i = 0; i < arrayLength; i++)
+		{
+			if (arrayData[i] == tableoid)
+			{
+				arrayIndex = i + 1;		/* replace this element instead */
+				break;
+			}
+		}
 
 		a = array_set(a, 1, &arrayIndex,
 					  elementDatum,
@@ -2145,6 +2178,9 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 							  RelationGetDescr(extRel), &isnull);
 	if (isnull)
 	{
+		if (arrayLength != 0)
+			elog(ERROR, "extconfig and extcondition arrays do not match");
+
 		a = construct_array(&elementDatum, 1,
 							TEXTOID,
 							-1, false, 'i');
@@ -2152,12 +2188,16 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 	else
 	{
 		a = DatumGetArrayTypeP(arrayDatum);
-		Assert(ARR_ELEMTYPE(a) == TEXTOID);
-		Assert(ARR_NDIM(a) == 1);
-		Assert(ARR_LBOUND(a)[0] == 1);
 
-		arrayIndex = ARR_DIMS(a)[0] + 1;		/* add after end */
+		if (ARR_NDIM(a) != 1 ||
+			ARR_LBOUND(a)[0] != 1 ||
+			ARR_HASNULL(a) ||
+			ARR_ELEMTYPE(a) != TEXTOID)
+			elog(ERROR, "extcondition is not a 1-D text array");
+		if (ARR_DIMS(a)[0] != arrayLength)
+			elog(ERROR, "extconfig and extcondition arrays do not match");
 
+		/* Add or replace at same index as in extconfig */
 		a = array_set(a, 1, &arrayIndex,
 					  elementDatum,
 					  false,
@@ -2183,10 +2223,186 @@ pg_extension_config_dump(PG_FUNCTION_ARGS)
 }
 
 /*
+ * extension_config_remove
+ *
+ * Remove the specified table OID from extension's extconfig, if present.
+ * This is not currently exposed as a function, but it could be;
+ * for now, we just invoke it from ALTER EXTENSION DROP.
+ */
+static void
+extension_config_remove(Oid extensionoid, Oid tableoid)
+{
+	Relation	extRel;
+	ScanKeyData key[1];
+	SysScanDesc extScan;
+	HeapTuple	extTup;
+	Datum		arrayDatum;
+	int			arrayLength;
+	int			arrayIndex;
+	bool		isnull;
+	Datum		repl_val[Natts_pg_extension];
+	bool		repl_null[Natts_pg_extension];
+	bool		repl_repl[Natts_pg_extension];
+	ArrayType  *a;
+
+	/* Find the pg_extension tuple */
+	extRel = heap_open(ExtensionRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				ObjectIdAttributeNumber,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(extensionoid));
+
+	extScan = systable_beginscan(extRel, ExtensionOidIndexId, true,
+								 NULL, 1, key);
+
+	extTup = systable_getnext(extScan);
+
+	if (!HeapTupleIsValid(extTup))		/* should not happen */
+		elog(ERROR, "extension with oid %u does not exist",
+			 extensionoid);
+
+	/* Search extconfig for the tableoid */
+	arrayDatum = heap_getattr(extTup, Anum_pg_extension_extconfig,
+							  RelationGetDescr(extRel), &isnull);
+	if (isnull)
+	{
+		/* nothing to do */
+		a = NULL;
+		arrayLength = 0;
+		arrayIndex = -1;
+	}
+	else
+	{
+		Oid		   *arrayData;
+		int			i;
+
+		a = DatumGetArrayTypeP(arrayDatum);
+
+		arrayLength = ARR_DIMS(a)[0];
+		if (ARR_NDIM(a) != 1 ||
+			ARR_LBOUND(a)[0] != 1 ||
+			arrayLength < 0 ||
+			ARR_HASNULL(a) ||
+			ARR_ELEMTYPE(a) != OIDOID)
+			elog(ERROR, "extconfig is not a 1-D Oid array");
+		arrayData = (Oid *) ARR_DATA_PTR(a);
+
+		arrayIndex = -1;		/* flag for no deletion needed */
+
+		for (i = 0; i < arrayLength; i++)
+		{
+			if (arrayData[i] == tableoid)
+			{
+				arrayIndex = i; /* index to remove */
+				break;
+			}
+		}
+	}
+
+	/* If tableoid is not in extconfig, nothing to do */
+	if (arrayIndex < 0)
+	{
+		systable_endscan(extScan);
+		heap_close(extRel, RowExclusiveLock);
+		return;
+	}
+
+	/* Modify or delete the extconfig value */
+	memset(repl_val, 0, sizeof(repl_val));
+	memset(repl_null, false, sizeof(repl_null));
+	memset(repl_repl, false, sizeof(repl_repl));
+
+	if (arrayLength <= 1)
+	{
+		/* removing only element, just set array to null */
+		repl_null[Anum_pg_extension_extconfig - 1] = true;
+	}
+	else
+	{
+		/* squeeze out the target element */
+		Datum	   *dvalues;
+		bool	   *dnulls;
+		int			nelems;
+		int			i;
+
+		deconstruct_array(a, OIDOID, sizeof(Oid), true, 'i',
+						  &dvalues, &dnulls, &nelems);
+
+		/* We already checked there are no nulls, so ignore dnulls */
+		for (i = arrayIndex; i < arrayLength - 1; i++)
+			dvalues[i] = dvalues[i + 1];
+
+		a = construct_array(dvalues, arrayLength - 1,
+							OIDOID, sizeof(Oid), true, 'i');
+
+		repl_val[Anum_pg_extension_extconfig - 1] = PointerGetDatum(a);
+	}
+	repl_repl[Anum_pg_extension_extconfig - 1] = true;
+
+	/* Modify or delete the extcondition value */
+	arrayDatum = heap_getattr(extTup, Anum_pg_extension_extcondition,
+							  RelationGetDescr(extRel), &isnull);
+	if (isnull)
+	{
+		elog(ERROR, "extconfig and extcondition arrays do not match");
+	}
+	else
+	{
+		a = DatumGetArrayTypeP(arrayDatum);
+
+		if (ARR_NDIM(a) != 1 ||
+			ARR_LBOUND(a)[0] != 1 ||
+			ARR_HASNULL(a) ||
+			ARR_ELEMTYPE(a) != TEXTOID)
+			elog(ERROR, "extcondition is not a 1-D text array");
+		if (ARR_DIMS(a)[0] != arrayLength)
+			elog(ERROR, "extconfig and extcondition arrays do not match");
+	}
+
+	if (arrayLength <= 1)
+	{
+		/* removing only element, just set array to null */
+		repl_null[Anum_pg_extension_extcondition - 1] = true;
+	}
+	else
+	{
+		/* squeeze out the target element */
+		Datum	   *dvalues;
+		bool	   *dnulls;
+		int			nelems;
+		int			i;
+
+		deconstruct_array(a, TEXTOID, -1, false, 'i',
+						  &dvalues, &dnulls, &nelems);
+
+		/* We already checked there are no nulls, so ignore dnulls */
+		for (i = arrayIndex; i < arrayLength - 1; i++)
+			dvalues[i] = dvalues[i + 1];
+
+		a = construct_array(dvalues, arrayLength - 1,
+							TEXTOID, -1, false, 'i');
+
+		repl_val[Anum_pg_extension_extcondition - 1] = PointerGetDatum(a);
+	}
+	repl_repl[Anum_pg_extension_extcondition - 1] = true;
+
+	extTup = heap_modify_tuple(extTup, RelationGetDescr(extRel),
+							   repl_val, repl_null, repl_repl);
+
+	simple_heap_update(extRel, &extTup->t_self, extTup);
+	CatalogUpdateIndexes(extRel, extTup);
+
+	systable_endscan(extScan);
+
+	heap_close(extRel, RowExclusiveLock);
+}
+
+/*
  * Execute ALTER EXTENSION SET SCHEMA
  */
-void
-AlterExtensionNamespace(List *names, const char *newschema)
+ObjectAddress
+AlterExtensionNamespace(List *names, const char *newschema, Oid *oldschema)
 {
 	char	   *extensionName;
 	Oid			extensionOid;
@@ -2201,6 +2417,8 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	Relation	depRel;
 	SysScanDesc depScan;
 	HeapTuple	depTup;
+	ObjectAddresses *objsMoved;
+	ObjectAddress extAddr;
 
 	if (list_length(names) != 1)
 		ereport(ERROR,
@@ -2225,6 +2443,17 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, ACL_KIND_NAMESPACE, newschema);
 
+	/*
+	 * If the schema is currently a member of the extension, disallow moving
+	 * the extension into the schema.  That would create a dependency loop.
+	 */
+	if (getExtensionOfObject(NamespaceRelationId, nspOid) == extensionOid)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot move extension \"%s\" into schema \"%s\" "
+						"because the extension contains the schema",
+						extensionName, newschema)));
+
 	/* Locate the pg_extension tuple */
 	extRel = heap_open(ExtensionRelationId, RowExclusiveLock);
 
@@ -2234,7 +2463,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 				ObjectIdGetDatum(extensionOid));
 
 	extScan = systable_beginscan(extRel, ExtensionOidIndexId, true,
-								 SnapshotNow, 1, key);
+								 NULL, 1, key);
 
 	extTup = systable_getnext(extScan);
 
@@ -2254,7 +2483,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	if (extForm->extnamespace == nspOid)
 	{
 		heap_close(extRel, RowExclusiveLock);
-		return;
+		return InvalidObjectAddress;
 	}
 
 	/* Check extension is supposed to be relocatable */
@@ -2263,6 +2492,8 @@ AlterExtensionNamespace(List *names, const char *newschema)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("extension \"%s\" does not support SET SCHEMA",
 						NameStr(extForm->extname))));
+
+	objsMoved = new_object_addresses();
 
 	/*
 	 * Scan pg_depend to find objects that depend directly on the extension,
@@ -2280,7 +2511,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 				ObjectIdGetDatum(extensionOid));
 
 	depScan = systable_beginscan(depRel, DependReferenceIndexId, true,
-								 SnapshotNow, 2, key);
+								 NULL, 2, key);
 
 	while (HeapTupleIsValid(depTup = systable_getnext(depScan)))
 	{
@@ -2289,7 +2520,7 @@ AlterExtensionNamespace(List *names, const char *newschema)
 		Oid			dep_oldNspOid;
 
 		/*
-		 * Ignore non-membership dependencies.	(Currently, the only other
+		 * Ignore non-membership dependencies.  (Currently, the only other
 		 * case we could see here is a normal dependency from another
 		 * extension.)
 		 */
@@ -2303,9 +2534,11 @@ AlterExtensionNamespace(List *names, const char *newschema)
 		if (dep.objectSubId != 0)		/* should not happen */
 			elog(ERROR, "extension should not have a sub-object dependency");
 
+		/* Relocate the object */
 		dep_oldNspOid = AlterObjectNamespace_oid(dep.classId,
 												 dep.objectId,
-												 nspOid);
+												 nspOid,
+												 objsMoved);
 
 		/*
 		 * Remember previous namespace of first object that has one
@@ -2327,6 +2560,10 @@ AlterExtensionNamespace(List *names, const char *newschema)
 							   get_namespace_name(oldNspOid))));
 	}
 
+	/* report old schema, if caller wants it */
+	if (oldschema)
+		*oldschema = oldNspOid;
+
 	systable_endscan(depScan);
 
 	relation_close(depRel, AccessShareLock);
@@ -2342,12 +2579,18 @@ AlterExtensionNamespace(List *names, const char *newschema)
 	/* update dependencies to point to the new schema */
 	changeDependencyFor(ExtensionRelationId, extensionOid,
 						NamespaceRelationId, oldNspOid, nspOid);
+
+	InvokeObjectPostAlterHook(ExtensionRelationId, extensionOid, 0);
+
+	ObjectAddressSet(extAddr, ExtensionRelationId, extensionOid);
+
+	return extAddr;
 }
 
 /*
  * Execute ALTER EXTENSION UPDATE
  */
-void
+ObjectAddress
 ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 {
 	DefElem    *d_new_version = NULL;
@@ -2363,6 +2606,7 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 	Datum		datum;
 	bool		isnull;
 	ListCell   *lc;
+	ObjectAddress address;
 
 	/*
 	 * We use global variables to track the extension being created, so we can
@@ -2384,7 +2628,7 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 				CStringGetDatum(stmt->extname));
 
 	extScan = systable_beginscan(extRel, ExtensionNameIndexId, true,
-								 SnapshotNow, 1, key);
+								 NULL, 1, key);
 
 	extTup = systable_getnext(extScan);
 
@@ -2464,7 +2708,7 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 		ereport(NOTICE,
 		   (errmsg("version \"%s\" of extension \"%s\" is already installed",
 				   versionName, stmt->extname)));
-		return;
+		return InvalidObjectAddress;
 	}
 
 	/*
@@ -2480,6 +2724,10 @@ ExecAlterExtensionStmt(AlterExtensionStmt *stmt)
 	 */
 	ApplyExtensionUpdates(extensionOid, control,
 						  oldVersionName, updateVersions);
+
+	ObjectAddressSet(address, ExtensionRelationId, extensionOid);
+
+	return address;
 }
 
 /*
@@ -2532,7 +2780,7 @@ ApplyExtensionUpdates(Oid extensionOid,
 					ObjectIdGetDatum(extensionOid));
 
 		extScan = systable_beginscan(extRel, ExtensionOidIndexId, true,
-									 SnapshotNow, 1, key);
+									 NULL, 1, key);
 
 		extTup = systable_getnext(extScan);
 
@@ -2622,6 +2870,8 @@ ApplyExtensionUpdates(Oid extensionOid,
 			recordDependencyOn(&myself, &otherext, DEPENDENCY_NORMAL);
 		}
 
+		InvokeObjectPostAlterHook(ExtensionRelationId, extensionOid, 0);
+
 		/*
 		 * Finally, execute the update script file
 		 */
@@ -2641,9 +2891,15 @@ ApplyExtensionUpdates(Oid extensionOid,
 
 /*
  * Execute ALTER EXTENSION ADD/DROP
+ *
+ * Return value is the address of the altered extension.
+ *
+ * objAddr is an output argument which, if not NULL, is set to the address of
+ * the added/dropped object.
  */
-void
-ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
+ObjectAddress
+ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt,
+							   ObjectAddress *objAddr)
 {
 	ObjectAddress extension;
 	ObjectAddress object;
@@ -2668,6 +2924,10 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 	object = get_object_address(stmt->objtype, stmt->objname, stmt->objargs,
 								&relation, ShareUpdateExclusiveLock, false);
 
+	Assert(object.objectSubId == 0);
+	if (objAddr)
+		*objAddr = object;
+
 	/* Permission check: must own target object, too */
 	check_object_ownership(GetUserId(), stmt->objtype, object,
 						   stmt->objname, stmt->objargs, relation);
@@ -2688,6 +2948,19 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 					 errmsg("%s is already a member of extension \"%s\"",
 							getObjectDescription(&object),
 							get_extension_name(oldExtension))));
+
+		/*
+		 * Prevent a schema from being added to an extension if the schema
+		 * contains the extension.  That would create a dependency loop.
+		 */
+		if (object.classId == NamespaceRelationId &&
+			object.objectId == get_extension_schema(extension.objectId))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("cannot add schema \"%s\" to extension \"%s\" "
+							"because the schema contains the extension",
+							get_namespace_name(object.objectId),
+							stmt->extname)));
 
 		/*
 		 * OK, add the dependency.
@@ -2713,7 +2986,16 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 											ExtensionRelationId,
 											DEPENDENCY_EXTENSION) != 1)
 			elog(ERROR, "unexpected number of extension dependency records");
+
+		/*
+		 * If it's a relation, it might have an entry in the extension's
+		 * extconfig array, which we must remove.
+		 */
+		if (object.classId == RelationRelationId)
+			extension_config_remove(extension.objectId, object.objectId);
 	}
+
+	InvokeObjectPostAlterHook(ExtensionRelationId, extension.objectId, 0);
 
 	/*
 	 * If get_object_address() opened the relation for us, we close it to keep
@@ -2723,4 +3005,6 @@ ExecAlterExtensionContentsStmt(AlterExtensionContentsStmt *stmt)
 	 */
 	if (relation != NULL)
 		relation_close(relation, NoLock);
+
+	return extension;
 }

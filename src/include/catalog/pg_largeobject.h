@@ -5,7 +5,7 @@
  *	  along with the relation's initial contents.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/catalog/pg_largeobject.h
@@ -22,7 +22,7 @@
 #include "catalog/genbki.h"
 
 /* ----------------
- *		pg_largeobject definition.	cpp turns this into
+ *		pg_largeobject definition.  cpp turns this into
  *		typedef struct FormData_pg_largeobject
  * ----------------
  */
@@ -31,9 +31,10 @@
 CATALOG(pg_largeobject,2613) BKI_WITHOUT_OIDS
 {
 	Oid			loid;			/* Identifier of large object */
-	int4		pageno;			/* Page number (starting from 0) */
+	int32		pageno;			/* Page number (starting from 0) */
+
 	/* data has variable length, but we allow direct access; see inv_api.c */
-	bytea		data;			/* Data for page (may be zero-length) */
+	bytea		data BKI_FORCE_NOT_NULL; /* Data for page (may be zero-length) */
 } FormData_pg_largeobject;
 
 /* ----------------
@@ -54,7 +55,6 @@ typedef FormData_pg_largeobject *Form_pg_largeobject;
 
 extern Oid	LargeObjectCreate(Oid loid);
 extern void LargeObjectDrop(Oid loid);
-extern void LargeObjectAlterOwner(Oid loid, Oid newOwnerId);
 extern bool LargeObjectExists(Oid loid);
 
 #endif   /* PG_LARGEOBJECT_H */

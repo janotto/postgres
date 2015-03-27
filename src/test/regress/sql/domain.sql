@@ -487,6 +487,33 @@ select array_elem_check(-1);
 
 drop function array_elem_check(int);
 
+--
+-- Check enforcement of changing constraints in plpgsql
+--
+
+create domain di as int;
+
+create function dom_check(int) returns di as $$
+declare d di;
+begin
+  d := $1;
+  return d;
+end
+$$ language plpgsql immutable;
+
+select dom_check(0);
+
+alter domain di add constraint pos check (value > 0);
+
+select dom_check(0); -- fail
+
+alter domain di drop constraint pos;
+
+select dom_check(0);
+
+drop function dom_check(int);
+
+drop domain di;
 
 --
 -- Renaming
@@ -496,3 +523,13 @@ create domain testdomain1 as int;
 alter domain testdomain1 rename to testdomain2;
 alter type testdomain2 rename to testdomain3;  -- alter type also works
 drop domain testdomain3;
+
+
+--
+-- Renaming domain constraints
+--
+
+create domain testdomain1 as int constraint unsigned check (value > 0);
+alter domain testdomain1 rename constraint unsigned to unsigned_foo;
+alter domain testdomain1 drop constraint unsigned_foo;
+drop domain testdomain1;

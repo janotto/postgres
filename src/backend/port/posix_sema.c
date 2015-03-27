@@ -7,7 +7,7 @@
  * sem_init).  We can cope with the kind made with sem_open, however.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -138,7 +138,7 @@ PosixSemaphoreKill(sem_t * sem)
  *
  * This is called during postmaster start or shared memory reinitialization.
  * It should do whatever is needed to be able to support up to maxSemas
- * subsequent PGSemaphoreCreate calls.	Also, if any system resources
+ * subsequent PGSemaphoreCreate calls.  Also, if any system resources
  * are acquired here or in PGSemaphoreCreate, register an on_shmem_exit
  * callback to release them.
  *
@@ -236,22 +236,14 @@ PGSemaphoreReset(PGSemaphore sema)
  * Lock a semaphore (decrement count), blocking if count would be < 0
  */
 void
-PGSemaphoreLock(PGSemaphore sema, bool interruptOK)
+PGSemaphoreLock(PGSemaphore sema)
 {
 	int			errStatus;
 
-	/*
-	 * See notes in sysv_sema.c's implementation of PGSemaphoreLock. Just as
-	 * that code does for semop(), we handle both the case where sem_wait()
-	 * returns errno == EINTR after a signal, and the case where it just keeps
-	 * waiting.
-	 */
+	/* See notes in sysv_sema.c's implementation of PGSemaphoreLock. */
 	do
 	{
-		ImmediateInterruptOK = interruptOK;
-		CHECK_FOR_INTERRUPTS();
 		errStatus = sem_wait(PG_SEM_REF(sema));
-		ImmediateInterruptOK = false;
 	} while (errStatus < 0 && errno == EINTR);
 
 	if (errStatus < 0)

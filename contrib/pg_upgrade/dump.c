@@ -3,99 +3,137 @@
  *
  *	dump functions
  *
- *	Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2015, PostgreSQL Global Development Group
  *	contrib/pg_upgrade/dump.c
  */
 
-#include "postgres.h"
+#include "postgres_fe.h"
 
 #include "pg_upgrade.h"
+
+#include <sys/types.h>
+#include "catalog/binary_upgrade.h"
 
 
 void
 generate_old_dump(void)
 {
-	/* run new pg_dumpall binary */
-	prep_status("Creating catalog dump");
+	int			dbnum;
+	mode_t		old_umask;
+
+	prep_status("Creating dump of global objects");
+
+	/* run new pg_dumpall binary for globals */
+	exec_prog(UTILITY_LOG_FILE, NULL, true,
+			  "\"%s/pg_dumpall\" %s --globals-only --quote-all-identifiers "
+			  "--binary-upgrade %s -f %s",
+			  new_cluster.bindir, cluster_conn_opts(&old_cluster),
+			  log_opts.verbose ? "--verbose" : "",
+			  GLOBALS_DUMP_FILE);
+	check_ok();
+
+	prep_status("Creating dump of database schemas\n");
 
 	/*
-	 * --binary-upgrade records the width of dropped columns in pg_class, and
-	 * restores the frozenid's for databases and relations.
+	 * Set umask for this function, all functions it calls, and all
+	 * subprocesses/threads it creates.  We can't use fopen_priv() as Windows
+	 * uses threads and umask is process-global.
 	 */
-	exec_prog(true,
-			  SYSTEMQUOTE "\"%s/pg_dumpall\" --port %d --username \"%s\" "
-			  "--schema-only --binary-upgrade > \"%s/" ALL_DUMP_FILE "\""
-			  SYSTEMQUOTE, new_cluster.bindir, old_cluster.port, os_info.user, os_info.cwd);
+	old_umask = umask(S_IRWXG | S_IRWXO);
+
+	/* create per-db dump files */
+	for (dbnum = 0; dbnum < old_cluster.dbarr.ndbs; dbnum++)
+	{
+		char		sql_file_name[MAXPGPATH],
+					log_file_name[MAXPGPATH];
+		DbInfo	   *old_db = &old_cluster.dbarr.dbs[dbnum];
+
+		pg_log(PG_STATUS, "%s", old_db->db_name);
+		snprintf(sql_file_name, sizeof(sql_file_name), DB_DUMP_FILE_MASK, old_db->db_oid);
+		snprintf(log_file_name, sizeof(log_file_name), DB_DUMP_LOG_FILE_MASK, old_db->db_oid);
+
+		parallel_exec_prog(log_file_name, NULL,
+				   "\"%s/pg_dump\" %s --schema-only --quote-all-identifiers "
+				  "--binary-upgrade --format=custom %s --file=\"%s\" \"%s\"",
+						 new_cluster.bindir, cluster_conn_opts(&old_cluster),
+						   log_opts.verbose ? "--verbose" : "",
+						   sql_file_name, old_db->db_name);
+	}
+
+	/* reap all children */
+	while (reap_child(true) == true)
+		;
+
+	umask(old_umask);
+
+	end_progress_output();
 	check_ok();
 }
 
 
 /*
- *	split_old_dump
+ * It is possible for there to be a mismatch in the need for TOAST tables
+ * between the old and new servers, e.g. some pre-9.1 tables didn't need
+ * TOAST tables but will need them in 9.1+.  (There are also opposite cases,
+ * but these are handled by setting binary_upgrade_next_toast_pg_class_oid.)
  *
- *	This function splits pg_dumpall output into global values and
- *	database creation, and per-db schemas.	This allows us to create
- *	the support functions between restoring these two parts of the
- *	dump.  We split on the first "\connect " after a CREATE ROLE
- *	username match;  this is where the per-db restore starts.
+ * We can't allow the TOAST table to be created by pg_dump with a
+ * pg_dump-assigned oid because it might conflict with a later table that
+ * uses that oid, causing a "file exists" error for pg_class conflicts, and
+ * a "duplicate oid" error for pg_type conflicts.  (TOAST tables need pg_type
+ * entries.)
  *
- *	We suppress recreation of our own username so we don't generate
- *	an error during restore
+ * Therefore, a backend in binary-upgrade mode will not create a TOAST
+ * table unless an OID as passed in via pg_upgrade_support functions.
+ * This function is called after the restore and uses ALTER TABLE to
+ * auto-create any needed TOAST tables which will not conflict with
+ * restored oids.
  */
 void
-split_old_dump(void)
+optionally_create_toast_tables(void)
 {
-	FILE	   *all_dump,
-			   *globals_dump,
-			   *db_dump;
-	FILE	   *current_output;
-	char		line[LINE_ALLOC];
-	bool		start_of_line = true;
-	char		create_role_str[MAX_STRING];
-	char		create_role_str_quote[MAX_STRING];
-	char		filename[MAXPGPATH];
-	bool		suppressed_username = false;
+	int			dbnum;
 
-	snprintf(filename, sizeof(filename), "%s/%s", os_info.cwd, ALL_DUMP_FILE);
-	if ((all_dump = fopen(filename, "r")) == NULL)
-		pg_log(PG_FATAL, "Could not open dump file \"%s\": %s\n", filename, getErrorText(errno));
-	snprintf(filename, sizeof(filename), "%s/%s", os_info.cwd, GLOBALS_DUMP_FILE);
-	if ((globals_dump = fopen(filename, "w")) == NULL)
-		pg_log(PG_FATAL, "Could not write to dump file \"%s\": %s\n", filename, getErrorText(errno));
-	snprintf(filename, sizeof(filename), "%s/%s", os_info.cwd, DB_DUMP_FILE);
-	if ((db_dump = fopen(filename, "w")) == NULL)
-		pg_log(PG_FATAL, "Could not write to dump file \"%s\": %s\n", filename, getErrorText(errno));
-	current_output = globals_dump;
+	prep_status("Creating newly-required TOAST tables");
 
-	/* patterns used to prevent our own username from being recreated */
-	snprintf(create_role_str, sizeof(create_role_str),
-			 "CREATE ROLE %s;", os_info.user);
-	snprintf(create_role_str_quote, sizeof(create_role_str_quote),
-			 "CREATE ROLE %s;", quote_identifier(os_info.user));
-
-	while (fgets(line, sizeof(line), all_dump) != NULL)
+	for (dbnum = 0; dbnum < new_cluster.dbarr.ndbs; dbnum++)
 	{
-		/* switch to db_dump file output? */
-		if (current_output == globals_dump && start_of_line &&
-			suppressed_username &&
-			strncmp(line, "\\connect ", strlen("\\connect ")) == 0)
-			current_output = db_dump;
+		PGresult   *res;
+		int			ntups;
+		int			rowno;
+		int			i_nspname,
+					i_relname;
+		DbInfo	   *active_db = &new_cluster.dbarr.dbs[dbnum];
+		PGconn	   *conn = connectToServer(&new_cluster, active_db->db_name);
 
-		/* output unless we are recreating our own username */
-		if (current_output != globals_dump || !start_of_line ||
-			(strncmp(line, create_role_str, strlen(create_role_str)) != 0 &&
-			 strncmp(line, create_role_str_quote, strlen(create_role_str_quote)) != 0))
-			fputs(line, current_output);
-		else
-			suppressed_username = true;
+		res = executeQueryOrDie(conn,
+								"SELECT n.nspname, c.relname "
+								"FROM	pg_catalog.pg_class c, "
+								"		pg_catalog.pg_namespace n "
+								"WHERE	c.relnamespace = n.oid AND "
+							  "		n.nspname NOT IN ('pg_catalog', 'information_schema') AND "
+								"c.relkind IN ('r', 'm') AND "
+								"c.reltoastrelid = 0");
 
-		if (strlen(line) > 0 && line[strlen(line) - 1] == '\n')
-			start_of_line = true;
-		else
-			start_of_line = false;
+		ntups = PQntuples(res);
+		i_nspname = PQfnumber(res, "nspname");
+		i_relname = PQfnumber(res, "relname");
+		for (rowno = 0; rowno < ntups; rowno++)
+		{
+			/* enable auto-oid-numbered TOAST creation if needed */
+			PQclear(executeQueryOrDie(conn, "SELECT binary_upgrade.set_next_toast_pg_class_oid('%d'::pg_catalog.oid);",
+					OPTIONALLY_CREATE_TOAST_OID));
+
+			/* dummy command that also triggers check for required TOAST table */
+			PQclear(executeQueryOrDie(conn, "ALTER TABLE %s.%s RESET (binary_upgrade_dummy_option);",
+					quote_identifier(PQgetvalue(res, rowno, i_nspname)),
+					quote_identifier(PQgetvalue(res, rowno, i_relname))));
+		}
+
+		PQclear(res);
+
+		PQfinish(conn);
 	}
 
-	fclose(all_dump);
-	fclose(globals_dump);
-	fclose(db_dump);
+	check_ok();
 }

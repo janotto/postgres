@@ -3,7 +3,7 @@
  * pl_funcs.c		- Misc functions for the PL/pgSQL
  *			  procedural language
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -25,7 +25,7 @@
  * list or "chain" (from the youngest item to the root) is accessible from
  * any one plpgsql statement.  During initial parsing of a function, ns_top
  * points to the youngest item accessible from the block currently being
- * parsed.	We store the entire tree, however, since at runtime we will need
+ * parsed.  We store the entire tree, however, since at runtime we will need
  * to access the chain that's relevant to any one statement.
  *
  * Block boundaries in the namespace chain are marked by PLPGSQL_NSTYPE_LABEL
@@ -97,7 +97,7 @@ plpgsql_ns_additem(int itemtype, int itemno, const char *name)
 	/* first item added must be a label */
 	Assert(ns_top != NULL || itemtype == PLPGSQL_NSTYPE_LABEL);
 
-	nse = palloc(sizeof(PLpgSQL_nsitem) + strlen(name));
+	nse = palloc(offsetof(PLpgSQL_nsitem, name) +strlen(name) + 1);
 	nse->itemtype = itemtype;
 	nse->itemno = itemno;
 	nse->prev = ns_top;
@@ -113,7 +113,7 @@ plpgsql_ns_additem(int itemtype, int itemno, const char *name)
  *
  * If localmode is TRUE, only the topmost block level is searched.
  *
- * name1 must be non-NULL.	Pass NULL for name2 and/or name3 if parsing a name
+ * name1 must be non-NULL.  Pass NULL for name2 and/or name3 if parsing a name
  * with fewer than three components.
  *
  * If names_used isn't NULL, *names_used receives the number of names
@@ -244,6 +244,8 @@ plpgsql_stmt_typename(PLpgSQL_stmt *stmt)
 			return "RETURN QUERY";
 		case PLPGSQL_STMT_RAISE:
 			return "RAISE";
+		case PLPGSQL_STMT_ASSERT:
+			return "ASSERT";
 		case PLPGSQL_STMT_EXECSQL:
 			return _("SQL statement");
 		case PLPGSQL_STMT_DYNEXECUTE:
@@ -277,6 +279,8 @@ plpgsql_getdiag_kindname(int kind)
 			return "ROW_COUNT";
 		case PLPGSQL_GETDIAG_RESULT_OID:
 			return "RESULT_OID";
+		case PLPGSQL_GETDIAG_CONTEXT:
+			return "PG_CONTEXT";
 		case PLPGSQL_GETDIAG_ERROR_CONTEXT:
 			return "PG_EXCEPTION_CONTEXT";
 		case PLPGSQL_GETDIAG_ERROR_DETAIL:
@@ -285,8 +289,18 @@ plpgsql_getdiag_kindname(int kind)
 			return "PG_EXCEPTION_HINT";
 		case PLPGSQL_GETDIAG_RETURNED_SQLSTATE:
 			return "RETURNED_SQLSTATE";
+		case PLPGSQL_GETDIAG_COLUMN_NAME:
+			return "COLUMN_NAME";
+		case PLPGSQL_GETDIAG_CONSTRAINT_NAME:
+			return "CONSTRAINT_NAME";
+		case PLPGSQL_GETDIAG_DATATYPE_NAME:
+			return "PG_DATATYPE_NAME";
 		case PLPGSQL_GETDIAG_MESSAGE_TEXT:
 			return "MESSAGE_TEXT";
+		case PLPGSQL_GETDIAG_TABLE_NAME:
+			return "TABLE_NAME";
+		case PLPGSQL_GETDIAG_SCHEMA_NAME:
+			return "SCHEMA_NAME";
 	}
 
 	return "unknown";
@@ -318,6 +332,7 @@ static void free_return(PLpgSQL_stmt_return *stmt);
 static void free_return_next(PLpgSQL_stmt_return_next *stmt);
 static void free_return_query(PLpgSQL_stmt_return_query *stmt);
 static void free_raise(PLpgSQL_stmt_raise *stmt);
+static void free_assert(PLpgSQL_stmt_assert *stmt);
 static void free_execsql(PLpgSQL_stmt_execsql *stmt);
 static void free_dynexecute(PLpgSQL_stmt_dynexecute *stmt);
 static void free_dynfors(PLpgSQL_stmt_dynfors *stmt);
@@ -378,6 +393,9 @@ free_stmt(PLpgSQL_stmt *stmt)
 			break;
 		case PLPGSQL_STMT_RAISE:
 			free_raise((PLpgSQL_stmt_raise *) stmt);
+			break;
+		case PLPGSQL_STMT_ASSERT:
+			free_assert((PLpgSQL_stmt_assert *) stmt);
 			break;
 		case PLPGSQL_STMT_EXECSQL:
 			free_execsql((PLpgSQL_stmt_execsql *) stmt);
@@ -599,6 +617,13 @@ free_raise(PLpgSQL_stmt_raise *stmt)
 }
 
 static void
+free_assert(PLpgSQL_stmt_assert *stmt)
+{
+	free_expr(stmt->cond);
+	free_expr(stmt->message);
+}
+
+static void
 free_execsql(PLpgSQL_stmt_execsql *stmt)
 {
 	free_expr(stmt->sqlstmt);
@@ -720,6 +745,7 @@ static void dump_return(PLpgSQL_stmt_return *stmt);
 static void dump_return_next(PLpgSQL_stmt_return_next *stmt);
 static void dump_return_query(PLpgSQL_stmt_return_query *stmt);
 static void dump_raise(PLpgSQL_stmt_raise *stmt);
+static void dump_assert(PLpgSQL_stmt_assert *stmt);
 static void dump_execsql(PLpgSQL_stmt_execsql *stmt);
 static void dump_dynexecute(PLpgSQL_stmt_dynexecute *stmt);
 static void dump_dynfors(PLpgSQL_stmt_dynfors *stmt);
@@ -791,6 +817,9 @@ dump_stmt(PLpgSQL_stmt *stmt)
 			break;
 		case PLPGSQL_STMT_RAISE:
 			dump_raise((PLpgSQL_stmt_raise *) stmt);
+			break;
+		case PLPGSQL_STMT_ASSERT:
+			dump_assert((PLpgSQL_stmt_assert *) stmt);
 			break;
 		case PLPGSQL_STMT_EXECSQL:
 			dump_execsql((PLpgSQL_stmt_execsql *) stmt);
@@ -1317,11 +1346,45 @@ dump_raise(PLpgSQL_stmt_raise *stmt)
 				case PLPGSQL_RAISEOPTION_HINT:
 					printf("    HINT = ");
 					break;
+				case PLPGSQL_RAISEOPTION_COLUMN:
+					printf("    COLUMN = ");
+					break;
+				case PLPGSQL_RAISEOPTION_CONSTRAINT:
+					printf("    CONSTRAINT = ");
+					break;
+				case PLPGSQL_RAISEOPTION_DATATYPE:
+					printf("    DATATYPE = ");
+					break;
+				case PLPGSQL_RAISEOPTION_TABLE:
+					printf("    TABLE = ");
+					break;
+				case PLPGSQL_RAISEOPTION_SCHEMA:
+					printf("    SCHEMA = ");
+					break;
 			}
 			dump_expr(opt->expr);
 			printf("\n");
 		}
 		dump_indent -= 2;
+	}
+	dump_indent -= 2;
+}
+
+static void
+dump_assert(PLpgSQL_stmt_assert *stmt)
+{
+	dump_ind();
+	printf("ASSERT ");
+	dump_expr(stmt->cond);
+	printf("\n");
+
+	dump_indent += 2;
+	if (stmt->message != NULL)
+	{
+		dump_ind();
+		printf("    MESSAGE = ");
+		dump_expr(stmt->message);
+		printf("\n");
 	}
 	dump_indent -= 2;
 }

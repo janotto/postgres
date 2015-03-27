@@ -6,11 +6,11 @@
  * PostgreSQL requires counting semaphores (the kind that keep track of
  * multiple unlock operations, and will allow an equal number of subsequent
  * lock operations before blocking).  The underlying implementation is
- * not the same on every platform.	This file defines the API that must
+ * not the same on every platform.  This file defines the API that must
  * be provided by each port.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/storage/pg_sema.h
@@ -72,7 +72,7 @@ extern void PGSemaphoreCreate(PGSemaphore sema);
 extern void PGSemaphoreReset(PGSemaphore sema);
 
 /* Lock a semaphore (decrement count), blocking if count would be < 0 */
-extern void PGSemaphoreLock(PGSemaphore sema, bool interruptOK);
+extern void PGSemaphoreLock(PGSemaphore sema);
 
 /* Unlock a semaphore (increment count) */
 extern void PGSemaphoreUnlock(PGSemaphore sema);

@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-CREATEINDEX">
+ <indexterm zone="sql-createindex">
+  <primary>CREATE INDEX</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>CREATE INDEX</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,16 +19,12 @@ PostgreSQL documentation
   <refpurpose>define a new index</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-createindex">
-  <primary>CREATE INDEX</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
-CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</replaceable> ] ON <replaceable class="parameter">table</replaceable> [ USING <replaceable class="parameter">method</replaceable> ]
-    ( { <replaceable class="parameter">column</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [, ...] )
+CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] <replaceable class="parameter">name</replaceable> ] ON <replaceable class="parameter">table_name</replaceable> [ USING <replaceable class="parameter">method</replaceable> ]
+    ( { <replaceable class="parameter">column_name</replaceable> | ( <replaceable class="parameter">expression</replaceable> ) } [ COLLATE <replaceable class="parameter">collation</replaceable> ] [ <replaceable class="parameter">opclass</replaceable> ] [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [, ...] )
     [ WITH ( <replaceable class="PARAMETER">storage_parameter</replaceable> = <replaceable class="PARAMETER">value</replaceable> [, ... ] ) ]
-    [ TABLESPACE <replaceable class="parameter">tablespace</replaceable> ]
+    [ TABLESPACE <replaceable class="parameter">tablespace_name</replaceable> ]
     [ WHERE <replaceable class="parameter">predicate</replaceable> ]
 </synopsis>
  </refsynopsisdiv>
@@ -33,8 +33,8 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
   <title>Description</title>
 
   <para>
-   <command>CREATE INDEX</command> constructs an index
-   on the specified column(s) of the specified table.
+   <command>CREATE INDEX</command> constructs an index on the specified column(s)
+   of the specified relation, which can be a table or a materialized view.
    Indexes are primarily used to enhance database performance (though
    inappropriate use can result in slower performance).
   </para>
@@ -57,8 +57,8 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
 
   <para>
    <productname>PostgreSQL</productname> provides the index methods
-   B-tree, hash, GiST, SP-GiST, and GIN.  Users can also define their own index
-   methods, but that is fairly complicated.
+   B-tree, hash, GiST, SP-GiST, GIN, and BRIN.  Users can also define their own
+   index methods, but that is fairly complicated.
   </para>
 
   <para>
@@ -127,6 +127,18 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
      </varlistentry>
 
      <varlistentry>
+      <term><literal>IF NOT EXISTS</literal></term>
+      <listitem>
+       <para>
+        Do not throw an error if a relation with the same name already exists.
+        A notice is issued in this case. Note that there is no guarantee that
+        the existing index is anything like the one that would have been created.
+        Index name is required when <literal>IF NOT EXISTS</literal> is specified.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><replaceable class="parameter">name</replaceable></term>
       <listitem>
        <para>
@@ -140,7 +152,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
      </varlistentry>
 
      <varlistentry>
-      <term><replaceable class="parameter">table</replaceable></term>
+      <term><replaceable class="parameter">table_name</replaceable></term>
       <listitem>
        <para>
         The name (possibly schema-qualified) of the table to be indexed.
@@ -154,14 +166,15 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
        <para>
         The name of the index method to be used.  Choices are
         <literal>btree</literal>, <literal>hash</literal>,
-        <literal>gist</literal>, <literal>spgist</> and <literal>gin</>.
+        <literal>gist</literal>, <literal>spgist</>, <literal>gin</>, and
+        <literal>brin</>.
         The default method is <literal>btree</literal>.
        </para>
       </listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><replaceable class="parameter">column</replaceable></term>
+      <term><replaceable class="parameter">column_name</replaceable></term>
       <listitem>
        <para>
         The name of a column of the table.
@@ -253,7 +266,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
      </varlistentry>
 
      <varlistentry>
-      <term><replaceable class="parameter">tablespace</replaceable></term>
+      <term><replaceable class="parameter">tablespace_name</replaceable></term>
       <listitem>
        <para>
         The tablespace in which to create the index.  If not specified,
@@ -287,7 +300,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
 
    <variablelist>
    <varlistentry>
-    <term><literal>FILLFACTOR</></term>
+    <term><literal>fillfactor</></term>
     <listitem>
      <para>
       The fillfactor for an index is a percentage that determines how full
@@ -314,7 +327,7 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
 
    <variablelist>
    <varlistentry>
-    <term><literal>BUFFERING</></term>
+    <term><literal>buffering</></term>
     <listitem>
     <para>
      Determines whether the buffering build technique described in
@@ -328,12 +341,12 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
    </variablelist>
 
    <para>
-    GIN indexes accept a different parameter:
+    GIN indexes accept different parameters:
    </para>
 
    <variablelist>
    <varlistentry>
-    <term><literal>FASTUPDATE</></term>
+    <term><literal>fastupdate</></term>
     <listitem>
     <para>
      This setting controls usage of the fast update technique described in
@@ -346,13 +359,41 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
 
     <note>
      <para>
-      Turning <literal>FASTUPDATE</> off via <command>ALTER INDEX</> prevents
+      Turning <literal>fastupdate</> off via <command>ALTER INDEX</> prevents
       future insertions from going into the list of pending index entries,
       but does not in itself flush previous entries.  You might want to
       <command>VACUUM</> the table afterward to ensure the pending list is
       emptied.
      </para>
     </note>
+    </listitem>
+   </varlistentry>
+   </variablelist>
+   <variablelist>
+   <varlistentry>
+    <term><literal>gin_pending_list_limit</></term>
+    <listitem>
+    <para>
+     Custom <xref linkend="guc-gin-pending-list-limit"> parameter.
+     This value is specified in kilobytes.
+    </para>
+    </listitem>
+   </varlistentry>
+   </variablelist>
+
+   <para>
+    <acronym>BRIN</> indexes accept a different parameter:
+   </para>
+
+   <variablelist>
+   <varlistentry>
+    <term><literal>pages_per_range</></term>
+    <listitem>
+    <para>
+     Defines the number of table blocks that make up one block range for
+     each entry of a <acronym>BRIN</> index (see <xref linkend="brin-intro">
+     for more details).  The default is <literal>128</>.
+    </para>
     </listitem>
    </varlistentry>
    </variablelist>
@@ -394,19 +435,18 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ <replaceable class="parameter">name</
    </para>
 
    <para>
-    In a concurrent index build, the index is actually entered into the
-    system catalogs in one transaction, then the two table scans occur in a
-    second and third transaction.  All active transactions at the time the
-    second table scan starts, not just ones that already involve the table,
-    have the potential to block the concurrent index creation until they
-    finish.  When checking for transactions that could still use the original
-    index, concurrent index creation advances through potentially interfering
-    older transactions one at a time, obtaining shared locks on their virtual
-    transaction identifiers to wait for them to complete.
+    In a concurrent index build, the index is actually entered into
+    the system catalogs in one transaction, then two table scans occur in
+    two more transactions.  Any transaction active when the second table
+    scan starts can block concurrent index creation until it completes,
+    even transactions that only reference the table after the second table
+    scan starts.   Concurrent index creation serially waits for each old
+    transaction to complete using the method outlined in section <xref
+    linkend="view-pg-locks">.
    </para>
 
    <para>
-    If a problem arises while scanning the table, such as a
+    If a problem arises while scanning the table, such as a deadlock or a
     uniqueness violation in a unique index, the <command>CREATE INDEX</>
     command will fail but leave behind an <quote>invalid</> index. This index
     will be ignored for querying purposes because it might be incomplete;
@@ -467,8 +507,21 @@ Indexes:
    they can be useful.
   </para>
 
+  <caution>
+   <para>
+    Hash index operations are not presently WAL-logged,
+    so hash indexes might need to be rebuilt with <command>REINDEX</>
+    after a database crash if there were unwritten changes.
+    Also, changes to hash indexes are not replicated over streaming or
+    file-based replication after the initial base backup, so they
+    give wrong answers to queries that subsequently use them.
+    Hash indexes are also not properly restored during point-in-time
+    recovery.  For these reasons, hash index use is presently discouraged.
+   </para>
+  </caution>
+
   <para>
-   Currently, only the B-tree, GiST and GIN index methods support
+   Currently, only the B-tree, GiST, GIN, and BRIN index methods support
    multicolumn indexes. Up to 32 fields can be specified by default.
    (This limit can be altered when building
    <productname>PostgreSQL</productname>.)  Only B-tree currently

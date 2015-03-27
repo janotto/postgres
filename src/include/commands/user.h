@@ -11,6 +11,7 @@
 #ifndef USER_H
 #define USER_H
 
+#include "catalog/objectaddress.h"
 #include "nodes/parsenodes.h"
 
 
@@ -22,13 +23,14 @@ typedef void (*check_password_hook_type) (const char *username, const char *pass
 
 extern PGDLLIMPORT check_password_hook_type check_password_hook;
 
-extern void CreateRole(CreateRoleStmt *stmt);
-extern void AlterRole(AlterRoleStmt *stmt);
-extern void AlterRoleSet(AlterRoleSetStmt *stmt);
+extern Oid	CreateRole(CreateRoleStmt *stmt);
+extern Oid	AlterRole(AlterRoleStmt *stmt);
+extern Oid	AlterRoleSet(AlterRoleSetStmt *stmt);
 extern void DropRole(DropRoleStmt *stmt);
 extern void GrantRole(GrantRoleStmt *stmt);
-extern void RenameRole(const char *oldname, const char *newname);
+extern ObjectAddress RenameRole(const char *oldname, const char *newname);
 extern void DropOwnedObjects(DropOwnedStmt *stmt);
 extern void ReassignOwnedObjects(ReassignOwnedStmt *stmt);
+extern List *roleSpecsToIds(List *memberNames);
 
 #endif   /* USER_H */

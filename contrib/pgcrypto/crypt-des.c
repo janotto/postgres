@@ -29,7 +29,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.	IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
@@ -670,7 +670,8 @@ px_crypt_des(const char *key, const char *setting)
 	q = (uint8 *) keybuf;
 	while (q - (uint8 *) keybuf - 8)
 	{
-		if ((*q++ = *key << 1))
+		*q++ = *key << 1;
+		if (*key != '\0')
 			key++;
 	}
 	if (des_setkey((char *) keybuf))
@@ -707,15 +708,14 @@ px_crypt_des(const char *key, const char *setting)
 			if (des_setkey((char *) keybuf))
 				return (NULL);
 		}
-		strncpy(output, setting, 9);
+		StrNCpy(output, setting, 10);
 
 		/*
 		 * Double check that we weren't given a short setting. If we were, the
-		 * above code will probably have created wierd values for count and
+		 * above code will probably have created weird values for count and
 		 * salt, but we don't really care. Just make sure the output string
 		 * doesn't have an extra NUL in it.
 		 */
-		output[9] = '\0';
 		p = output + strlen(output);
 	}
 	else

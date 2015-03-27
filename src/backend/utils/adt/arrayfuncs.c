@@ -3,7 +3,7 @@
  * arrayfuncs.c
  *	  Support functions for arrays.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,7 +15,13 @@
 #include "postgres.h"
 
 #include <ctype.h>
+#ifdef _MSC_VER
+#include <float.h>				/* for _isnan */
+#endif
+#include <math.h>
 
+#include "access/htup_details.h"
+#include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "libpq/pqformat.h"
 #include "utils/array.h"
@@ -124,6 +130,20 @@ static ArrayType *create_array_envelope(int ndims, int *dimv, int *lbv, int nbyt
 static ArrayType *array_fill_internal(ArrayType *dims, ArrayType *lbs,
 					Datum value, bool isnull, Oid elmtype,
 					FunctionCallInfo fcinfo);
+static ArrayType *array_replace_internal(ArrayType *array,
+					   Datum search, bool search_isnull,
+					   Datum replace, bool replace_isnull,
+					   bool remove, Oid collation,
+					   FunctionCallInfo fcinfo);
+static int	width_bucket_array_float8(Datum operand, ArrayType *thresholds);
+static int width_bucket_array_fixed(Datum operand,
+						 ArrayType *thresholds,
+						 Oid collation,
+						 TypeCacheEntry *typentry);
+static int width_bucket_array_variable(Datum operand,
+							ArrayType *thresholds,
+							Oid collation,
+							TypeCacheEntry *typentry);
 
 
 /*
@@ -227,11 +247,13 @@ array_in(PG_FUNCTION_ARGS)
 					 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
 							ndim + 1, MAXDIM)));
 
-		for (q = p; isdigit((unsigned char) *q) || (*q == '-') || (*q == '+'); q++);
+		for (q = p; isdigit((unsigned char) *q) || (*q == '-') || (*q == '+'); q++)
+			 /* skip */ ;
 		if (q == p)				/* no digits? */
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("missing dimension value")));
+					 errmsg("malformed array literal: \"%s\"", string),
+					 errdetail("\"[\" must introduce explicitly-specified array dimensions.")));
 
 		if (*q == ':')
 		{
@@ -239,11 +261,13 @@ array_in(PG_FUNCTION_ARGS)
 			*q = '\0';
 			lBound[ndim] = atoi(p);
 			p = q + 1;
-			for (q = p; isdigit((unsigned char) *q) || (*q == '-') || (*q == '+'); q++);
+			for (q = p; isdigit((unsigned char) *q) || (*q == '-') || (*q == '+'); q++)
+				 /* skip */ ;
 			if (q == p)			/* no digits? */
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-						 errmsg("missing dimension value")));
+						 errmsg("malformed array literal: \"%s\"", string),
+						 errdetail("Missing array dimension value.")));
 		}
 		else
 		{
@@ -253,7 +277,9 @@ array_in(PG_FUNCTION_ARGS)
 		if (*q != ']')
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("missing \"]\" in array dimensions")));
+					 errmsg("malformed array literal: \"%s\"", string),
+					 errdetail("Missing \"%s\" after array dimensions.",
+							   "]")));
 
 		*q = '\0';
 		ub = atoi(p);
@@ -273,7 +299,8 @@ array_in(PG_FUNCTION_ARGS)
 		if (*p != '{')
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("array value must start with \"{\" or dimension information")));
+					 errmsg("malformed array literal: \"%s\"", string),
+					 errdetail("Array value must start with \"{\" or dimension information.")));
 		ndim = ArrayCount(p, dim, typdelim);
 		for (i = 0; i < ndim; i++)
 			lBound[i] = 1;
@@ -287,7 +314,9 @@ array_in(PG_FUNCTION_ARGS)
 		if (strncmp(p, ASSGN, strlen(ASSGN)) != 0)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("missing assignment operator")));
+					 errmsg("malformed array literal: \"%s\"", string),
+					 errdetail("Missing \"%s\" after array dimensions.",
+							   ASSGN)));
 		p += strlen(ASSGN);
 		while (array_isspace(*p))
 			p++;
@@ -299,18 +328,21 @@ array_in(PG_FUNCTION_ARGS)
 		if (*p != '{')
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("array value must start with \"{\" or dimension information")));
+					 errmsg("malformed array literal: \"%s\"", string),
+					 errdetail("Array contents must start with \"{\".")));
 		ndim_braces = ArrayCount(p, dim_braces, typdelim);
 		if (ndim_braces != ndim)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				errmsg("array dimensions incompatible with array literal")));
+					 errmsg("malformed array literal: \"%s\"", string),
+					 errdetail("Specified array dimensions do not match array contents.")));
 		for (i = 0; i < ndim; ++i)
 		{
 			if (dim[i] != dim_braces[i])
 				ereport(ERROR,
 						(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-				errmsg("array dimensions incompatible with array literal")));
+						 errmsg("malformed array literal: \"%s\"", string),
+						 errdetail("Specified array dimensions do not match array contents.")));
 		}
 	}
 
@@ -419,8 +451,8 @@ ArrayCount(const char *str, int *dim, char typdelim)
 
 	for (i = 0; i < MAXDIM; ++i)
 	{
-		temp[i] = dim[i] = 0;
-		nelems_last[i] = nelems[i] = 1;
+		temp[i] = dim[i] = nelems_last[i] = 0;
+		nelems[i] = 1;
 	}
 
 	ptr = str;
@@ -440,7 +472,8 @@ ArrayCount(const char *str, int *dim, char typdelim)
 					/* Signal a premature end of the string */
 					ereport(ERROR,
 							(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							 errmsg("malformed array literal: \"%s\"", str)));
+							 errmsg("malformed array literal: \"%s\"", str),
+							 errdetail("Unexpected end of input.")));
 					break;
 				case '\\':
 
@@ -455,7 +488,9 @@ ArrayCount(const char *str, int *dim, char typdelim)
 						parse_state != ARRAY_ELEM_DELIMITED)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("malformed array literal: \"%s\"", str)));
+							  errmsg("malformed array literal: \"%s\"", str),
+								 errdetail("Unexpected \"%c\" character.",
+										   '\\')));
 					if (parse_state != ARRAY_QUOTED_ELEM_STARTED)
 						parse_state = ARRAY_ELEM_STARTED;
 					/* skip the escaped character */
@@ -464,7 +499,8 @@ ArrayCount(const char *str, int *dim, char typdelim)
 					else
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("malformed array literal: \"%s\"", str)));
+							  errmsg("malformed array literal: \"%s\"", str),
+								 errdetail("Unexpected end of input.")));
 					break;
 				case '\"':
 
@@ -478,7 +514,8 @@ ArrayCount(const char *str, int *dim, char typdelim)
 						parse_state != ARRAY_ELEM_DELIMITED)
 						ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("malformed array literal: \"%s\"", str)));
+							  errmsg("malformed array literal: \"%s\"", str),
+								 errdetail("Unexpected array element.")));
 					in_quotes = !in_quotes;
 					if (in_quotes)
 						parse_state = ARRAY_QUOTED_ELEM_STARTED;
@@ -498,7 +535,9 @@ ArrayCount(const char *str, int *dim, char typdelim)
 							parse_state != ARRAY_LEVEL_DELIMITED)
 							ereport(ERROR,
 							   (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("malformed array literal: \"%s\"", str)));
+							  errmsg("malformed array literal: \"%s\"", str),
+								errdetail("Unexpected \"%c\" character.",
+										  '{')));
 						parse_state = ARRAY_LEVEL_STARTED;
 						if (nest_level >= MAXDIM)
 							ereport(ERROR,
@@ -526,21 +565,25 @@ ArrayCount(const char *str, int *dim, char typdelim)
 							!(nest_level == 1 && parse_state == ARRAY_LEVEL_STARTED))
 							ereport(ERROR,
 							   (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("malformed array literal: \"%s\"", str)));
+							  errmsg("malformed array literal: \"%s\"", str),
+								errdetail("Unexpected \"%c\" character.",
+										  '}')));
 						parse_state = ARRAY_LEVEL_COMPLETED;
 						if (nest_level == 0)
 							ereport(ERROR,
 							   (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-							errmsg("malformed array literal: \"%s\"", str)));
+							  errmsg("malformed array literal: \"%s\"", str),
+							 errdetail("Unmatched \"%c\" character.", '}')));
 						nest_level--;
 
-						if ((nelems_last[nest_level] != 1) &&
-							(nelems[nest_level] != nelems_last[nest_level]))
+						if (nelems_last[nest_level] != 0 &&
+							nelems[nest_level] != nelems_last[nest_level])
 							ereport(ERROR,
 							   (errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-								errmsg("multidimensional arrays must have "
-									   "array expressions with matching "
-									   "dimensions")));
+							  errmsg("malformed array literal: \"%s\"", str),
+								errdetail("Multidimensional arrays must have "
+										  "sub-arrays with matching "
+										  "dimensions.")));
 						nelems_last[nest_level] = nelems[nest_level];
 						nelems[nest_level] = 1;
 						if (nest_level == 0)
@@ -571,7 +614,9 @@ ArrayCount(const char *str, int *dim, char typdelim)
 								parse_state != ARRAY_LEVEL_COMPLETED)
 								ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-								 errmsg("malformed array literal: \"%s\"", str)));
+								 errmsg("malformed array literal: \"%s\"", str),
+								 errdetail("Unexpected \"%c\" character.",
+										   typdelim)));
 							if (parse_state == ARRAY_LEVEL_COMPLETED)
 								parse_state = ARRAY_LEVEL_DELIMITED;
 							else
@@ -592,7 +637,8 @@ ArrayCount(const char *str, int *dim, char typdelim)
 								parse_state != ARRAY_ELEM_DELIMITED)
 								ereport(ERROR,
 								(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-								 errmsg("malformed array literal: \"%s\"", str)));
+								 errmsg("malformed array literal: \"%s\"", str),
+								 errdetail("Unexpected array element.")));
 							parse_state = ARRAY_ELEM_STARTED;
 						}
 					}
@@ -611,7 +657,8 @@ ArrayCount(const char *str, int *dim, char typdelim)
 		if (!array_isspace(*ptr++))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_TEXT_REPRESENTATION),
-					 errmsg("malformed array literal: \"%s\"", str)));
+					 errmsg("malformed array literal: \"%s\"", str),
+					 errdetail("Junk after closing right brace.")));
 	}
 
 	/* special case for an empty array */
@@ -688,7 +735,7 @@ ReadArrayStr(char *arrayStr,
 
 	/*
 	 * We have to remove " and \ characters to create a clean item value to
-	 * pass to the datatype input routine.	We overwrite each item value
+	 * pass to the datatype input routine.  We overwrite each item value
 	 * in-place within arrayStr to do this.  srcptr is the current scan point,
 	 * and dstptr is where we are copying to.
 	 *
@@ -698,7 +745,8 @@ ReadArrayStr(char *arrayStr,
 	 * character.
 	 *
 	 * The error checking in this routine is mostly pro-forma, since we expect
-	 * that ArrayCount() already validated the string.
+	 * that ArrayCount() already validated the string.  So we don't bother
+	 * with errdetail messages.
 	 */
 	srcptr = arrayStr;
 	while (!eoArray)
@@ -888,7 +936,7 @@ ReadArrayStr(char *arrayStr,
  * referenced by Datums after copying them.
  *
  * If the input data is of varlena type, the caller must have ensured that
- * the values are not toasted.	(Doing it here doesn't work since the
+ * the values are not toasted.  (Doing it here doesn't work since the
  * caller has already allocated space for the array...)
  */
 static void
@@ -1734,15 +1782,28 @@ array_length(PG_FUNCTION_ARGS)
 }
 
 /*
- * array_ref :
- *	  This routine takes an array pointer and a subscript array and returns
+ * array_cardinality:
+ *		returns the total number of elements in an array
+ */
+Datum
+array_cardinality(PG_FUNCTION_ARGS)
+{
+	ArrayType  *v = PG_GETARG_ARRAYTYPE_P(0);
+
+	PG_RETURN_INT32(ArrayGetNItems(ARR_NDIM(v), ARR_DIMS(v)));
+}
+
+
+/*
+ * array_get_element :
+ *	  This routine takes an array datum and a subscript array and returns
  *	  the referenced item as a Datum.  Note that for a pass-by-reference
  *	  datatype, the returned Datum is a pointer into the array object.
  *
  * This handles both ordinary varlena arrays and fixed-length arrays.
  *
  * Inputs:
- *	array: the array object (mustn't be NULL)
+ *	arraydatum: the array object (mustn't be NULL)
  *	nSubscripts: number of subscripts supplied
  *	indx[]: the subscript values
  *	arraytyplen: pg_type.typlen for the array type
@@ -1755,15 +1816,16 @@ array_length(PG_FUNCTION_ARGS)
  *	*isNull is set to indicate whether the element is NULL.
  */
 Datum
-array_ref(ArrayType *array,
-		  int nSubscripts,
-		  int *indx,
-		  int arraytyplen,
-		  int elmlen,
-		  bool elmbyval,
-		  char elmalign,
-		  bool *isNull)
+array_get_element(Datum arraydatum,
+				  int nSubscripts,
+				  int *indx,
+				  int arraytyplen,
+				  int elmlen,
+				  bool elmbyval,
+				  char elmalign,
+				  bool *isNull)
 {
+	ArrayType  *array;
 	int			i,
 				ndim,
 			   *dim,
@@ -1785,13 +1847,13 @@ array_ref(ArrayType *array,
 		fixedLb[0] = 0;
 		dim = fixedDim;
 		lb = fixedLb;
-		arraydataptr = (char *) array;
+		arraydataptr = (char *) DatumGetPointer(arraydatum);
 		arraynullsptr = NULL;
 	}
 	else
 	{
 		/* detoast input array if necessary */
-		array = DatumGetArrayTypeP(PointerGetDatum(array));
+		array = DatumGetArrayTypeP(arraydatum);
 
 		ndim = ARR_NDIM(array);
 		dim = ARR_DIMS(array);
@@ -1849,7 +1911,7 @@ array_ref(ArrayType *array,
  * This handles both ordinary varlena arrays and fixed-length arrays.
  *
  * Inputs:
- *	array: the array object (mustn't be NULL)
+ *	arraydatum: the array object (mustn't be NULL)
  *	nSubscripts: number of subscripts supplied (must be same for upper/lower)
  *	upperIndx[]: the upper subscript values
  *	lowerIndx[]: the lower subscript values
@@ -1864,8 +1926,8 @@ array_ref(ArrayType *array,
  * NOTE: we assume it is OK to scribble on the provided subscript arrays
  * lowerIndx[] and upperIndx[].  These are generally just temporaries.
  */
-ArrayType *
-array_get_slice(ArrayType *array,
+Datum
+array_get_slice(Datum arraydatum,
 				int nSubscripts,
 				int *upperIndx,
 				int *lowerIndx,
@@ -1874,6 +1936,7 @@ array_get_slice(ArrayType *array,
 				bool elmbyval,
 				char elmalign)
 {
+	ArrayType  *array;
 	ArrayType  *newarray;
 	int			i,
 				ndim,
@@ -1912,13 +1975,13 @@ array_get_slice(ArrayType *array,
 		dim = fixedDim;
 		lb = fixedLb;
 		elemtype = InvalidOid;	/* XXX */
-		arraydataptr = (char *) array;
+		arraydataptr = (char *) DatumGetPointer(arraydatum);
 		arraynullsptr = NULL;
 	}
 	else
 	{
 		/* detoast input array if necessary */
-		array = DatumGetArrayTypeP(PointerGetDatum(array));
+		array = DatumGetArrayTypeP(arraydatum);
 
 		ndim = ARR_NDIM(array);
 		dim = ARR_DIMS(array);
@@ -1934,7 +1997,7 @@ array_get_slice(ArrayType *array,
 	 * slice, return an empty array.
 	 */
 	if (ndim < nSubscripts || ndim <= 0 || ndim > MAXDIM)
-		return construct_empty_array(elemtype);
+		return PointerGetDatum(construct_empty_array(elemtype));
 
 	for (i = 0; i < nSubscripts; i++)
 	{
@@ -1943,7 +2006,7 @@ array_get_slice(ArrayType *array,
 		if (upperIndx[i] >= (dim[i] + lb[i]))
 			upperIndx[i] = dim[i] + lb[i] - 1;
 		if (lowerIndx[i] > upperIndx[i])
-			return construct_empty_array(elemtype);
+			return PointerGetDatum(construct_empty_array(elemtype));
 	}
 	/* fill any missing subscript positions with full array range */
 	for (; i < ndim; i++)
@@ -1951,7 +2014,7 @@ array_get_slice(ArrayType *array,
 		lowerIndx[i] = lb[i];
 		upperIndx[i] = dim[i] + lb[i] - 1;
 		if (lowerIndx[i] > upperIndx[i])
-			return construct_empty_array(elemtype);
+			return PointerGetDatum(construct_empty_array(elemtype));
 	}
 
 	mda_get_range(ndim, span, lowerIndx, upperIndx);
@@ -1984,7 +2047,7 @@ array_get_slice(ArrayType *array,
 	memcpy(ARR_DIMS(newarray), span, ndim * sizeof(int));
 
 	/*
-	 * Lower bounds of the new array are set to 1.	Formerly (before 7.3) we
+	 * Lower bounds of the new array are set to 1.  Formerly (before 7.3) we
 	 * copied the given lowerIndx values ... but that seems confusing.
 	 */
 	newlb = ARR_LBOUND(newarray);
@@ -1997,18 +2060,18 @@ array_get_slice(ArrayType *array,
 						lowerIndx, upperIndx,
 						elmlen, elmbyval, elmalign);
 
-	return newarray;
+	return PointerGetDatum(newarray);
 }
 
 /*
- * array_set :
- *		  This routine sets the value of an array element (specified by
+ * array_set_element :
+ *		  This routine sets the value of one array element (specified by
  *		  a subscript array) to a new value specified by "dataValue".
  *
  * This handles both ordinary varlena arrays and fixed-length arrays.
  *
  * Inputs:
- *	array: the initial array object (mustn't be NULL)
+ *	arraydatum: the initial array object (mustn't be NULL)
  *	nSubscripts: number of subscripts supplied
  *	indx[]: the subscript values
  *	dataValue: the datum to be inserted at the given position
@@ -2030,17 +2093,18 @@ array_get_slice(ArrayType *array,
  * NOTE: For assignments, we throw an error for invalid subscripts etc,
  * rather than returning a NULL as the fetch operations do.
  */
-ArrayType *
-array_set(ArrayType *array,
-		  int nSubscripts,
-		  int *indx,
-		  Datum dataValue,
-		  bool isNull,
-		  int arraytyplen,
-		  int elmlen,
-		  bool elmbyval,
-		  char elmalign)
+Datum
+array_set_element(Datum arraydatum,
+				  int nSubscripts,
+				  int *indx,
+				  Datum dataValue,
+				  bool isNull,
+				  int arraytyplen,
+				  int elmlen,
+				  bool elmbyval,
+				  char elmalign)
 {
+	ArrayType  *array;
 	ArrayType  *newarray;
 	int			i,
 				ndim,
@@ -2069,6 +2133,8 @@ array_set(ArrayType *array,
 		 * fixed-length arrays -- these are assumed to be 1-d, 0-based. We
 		 * cannot extend them, either.
 		 */
+		char	   *resultarray;
+
 		if (nSubscripts != 1)
 			ereport(ERROR,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
@@ -2084,11 +2150,11 @@ array_set(ArrayType *array,
 					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 					 errmsg("cannot assign null value to an element of a fixed-length array")));
 
-		newarray = (ArrayType *) palloc(arraytyplen);
-		memcpy(newarray, array, arraytyplen);
-		elt_ptr = (char *) newarray + indx[0] * elmlen;
+		resultarray = (char *) palloc(arraytyplen);
+		memcpy(resultarray, DatumGetPointer(arraydatum), arraytyplen);
+		elt_ptr = (char *) resultarray + indx[0] * elmlen;
 		ArrayCastAndSet(dataValue, elmlen, elmbyval, elmalign, elt_ptr);
-		return newarray;
+		return PointerGetDatum(resultarray);
 	}
 
 	if (nSubscripts <= 0 || nSubscripts > MAXDIM)
@@ -2101,7 +2167,7 @@ array_set(ArrayType *array,
 		dataValue = PointerGetDatum(PG_DETOAST_DATUM(dataValue));
 
 	/* detoast input array if necessary */
-	array = DatumGetArrayTypeP(PointerGetDatum(array));
+	array = DatumGetArrayTypeP(arraydatum);
 
 	ndim = ARR_NDIM(array);
 
@@ -2120,9 +2186,10 @@ array_set(ArrayType *array,
 			lb[i] = indx[i];
 		}
 
-		return construct_md_array(&dataValue, &isNull, nSubscripts,
-								  dim, lb, elmtype,
-								  elmlen, elmbyval, elmalign);
+		return PointerGetDatum(construct_md_array(&dataValue, &isNull,
+												  nSubscripts, dim, lb,
+												  elmtype,
+												elmlen, elmbyval, elmalign));
 	}
 
 	if (ndim != nSubscripts)
@@ -2284,7 +2351,7 @@ array_set(ArrayType *array,
 		}
 	}
 
-	return newarray;
+	return PointerGetDatum(newarray);
 }
 
 /*
@@ -2296,12 +2363,12 @@ array_set(ArrayType *array,
  * This handles both ordinary varlena arrays and fixed-length arrays.
  *
  * Inputs:
- *	array: the initial array object (mustn't be NULL)
+ *	arraydatum: the initial array object (mustn't be NULL)
  *	nSubscripts: number of subscripts supplied (must be same for upper/lower)
  *	upperIndx[]: the upper subscript values
  *	lowerIndx[]: the lower subscript values
- *	srcArray: the source for the inserted values
- *	isNull: indicates whether srcArray is NULL
+ *	srcArrayDatum: the source for the inserted values
+ *	isNull: indicates whether srcArrayDatum is NULL
  *	arraytyplen: pg_type.typlen for the array type
  *	elmlen: pg_type.typlen for the array's element type
  *	elmbyval: pg_type.typbyval for the array's element type
@@ -2322,18 +2389,20 @@ array_set(ArrayType *array,
  * NOTE: For assignments, we throw an error for silly subscripts etc,
  * rather than returning a NULL or empty array as the fetch operations do.
  */
-ArrayType *
-array_set_slice(ArrayType *array,
+Datum
+array_set_slice(Datum arraydatum,
 				int nSubscripts,
 				int *upperIndx,
 				int *lowerIndx,
-				ArrayType *srcArray,
+				Datum srcArrayDatum,
 				bool isNull,
 				int arraytyplen,
 				int elmlen,
 				bool elmbyval,
 				char elmalign)
 {
+	ArrayType  *array;
+	ArrayType  *srcArray;
 	ArrayType  *newarray;
 	int			i,
 				ndim,
@@ -2359,7 +2428,7 @@ array_set_slice(ArrayType *array,
 
 	/* Currently, assignment from a NULL source array is a no-op */
 	if (isNull)
-		return array;
+		return arraydatum;
 
 	if (arraytyplen > 0)
 	{
@@ -2372,8 +2441,8 @@ array_set_slice(ArrayType *array,
 	}
 
 	/* detoast arrays if necessary */
-	array = DatumGetArrayTypeP(PointerGetDatum(array));
-	srcArray = DatumGetArrayTypeP(PointerGetDatum(srcArray));
+	array = DatumGetArrayTypeP(arraydatum);
+	srcArray = DatumGetArrayTypeP(srcArrayDatum);
 
 	/* note: we assume srcArray contains no toasted elements */
 
@@ -2406,9 +2475,9 @@ array_set_slice(ArrayType *array,
 					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
 					 errmsg("source array too small")));
 
-		return construct_md_array(dvalues, dnulls, nSubscripts,
-								  dim, lb, elmtype,
-								  elmlen, elmbyval, elmalign);
+		return PointerGetDatum(construct_md_array(dvalues, dnulls, nSubscripts,
+												  dim, lb, elmtype,
+												elmlen, elmbyval, elmalign));
 	}
 
 	if (ndim < nSubscripts || ndim <= 0 || ndim > MAXDIM)
@@ -2610,13 +2679,49 @@ array_set_slice(ArrayType *array,
 		}
 	}
 
-	return newarray;
+	return PointerGetDatum(newarray);
+}
+
+/*
+ * array_ref : backwards compatibility wrapper for array_get_element
+ *
+ * This only works for detoasted/flattened varlena arrays, since the array
+ * argument is declared as "ArrayType *".  However there's enough code like
+ * that to justify preserving this API.
+ */
+Datum
+array_ref(ArrayType *array, int nSubscripts, int *indx,
+		  int arraytyplen, int elmlen, bool elmbyval, char elmalign,
+		  bool *isNull)
+{
+	return array_get_element(PointerGetDatum(array), nSubscripts, indx,
+							 arraytyplen, elmlen, elmbyval, elmalign,
+							 isNull);
+}
+
+/*
+ * array_set : backwards compatibility wrapper for array_set_element
+ *
+ * This only works for detoasted/flattened varlena arrays, since the array
+ * argument and result are declared as "ArrayType *".  However there's enough
+ * code like that to justify preserving this API.
+ */
+ArrayType *
+array_set(ArrayType *array, int nSubscripts, int *indx,
+		  Datum dataValue, bool isNull,
+		  int arraytyplen, int elmlen, bool elmbyval, char elmalign)
+{
+	return DatumGetArrayTypeP(array_set_element(PointerGetDatum(array),
+												nSubscripts, indx,
+												dataValue, isNull,
+												arraytyplen,
+												elmlen, elmbyval, elmalign));
 }
 
 /*
  * array_map()
  *
- * Map an array through an arbitrary function.	Return a new array with
+ * Map an array through an arbitrary function.  Return a new array with
  * same dimensions and each source element transformed by fn().  Each
  * source element is passed as the first argument to fn(); additional
  * arguments to be passed to fn() can be specified by the caller.
@@ -2631,9 +2736,9 @@ array_set_slice(ArrayType *array,
  *	 first argument position initially holds the input array value.
  * * inpType: OID of element type of input array.  This must be the same as,
  *	 or binary-compatible with, the first argument type of fn().
- * * retType: OID of element type of output array.	This must be the same as,
+ * * retType: OID of element type of output array.  This must be the same as,
  *	 or binary-compatible with, the result type of fn().
- * * amstate: workspace for array_map.	Must be zeroed by caller before
+ * * amstate: workspace for array_map.  Must be zeroed by caller before
  *	 first call, and not touched after that.
  *
  * It is legitimate to pass a freshly-zeroed ArrayMapState on each call,
@@ -3487,7 +3592,7 @@ array_cmp(FunctionCallInfo fcinfo)
 
 	/*
 	 * If arrays contain same data (up to end of shorter one), apply
-	 * additional rules to sort by dimensionality.	The relative significance
+	 * additional rules to sort by dimensionality.  The relative significance
 	 * of the different bits of information is historical; mainly we just care
 	 * that we don't say "equal" for arrays of different dimensionality.
 	 */
@@ -3749,7 +3854,7 @@ array_contain_compare(ArrayType *array1, ArrayType *array2, Oid collation,
 
 		/*
 		 * We assume that the comparison operator is strict, so a NULL can't
-		 * match anything.	XXX this diverges from the "NULL=NULL" behavior of
+		 * match anything.  XXX this diverges from the "NULL=NULL" behavior of
 		 * array_eq, should we act like that?
 		 */
 		if (isnull1)
@@ -3884,7 +3989,7 @@ arraycontained(PG_FUNCTION_ARGS)
  * The passed-in array must remain valid for the lifetime of the iterator.
  */
 ArrayIterator
-array_create_iterator(ArrayType *arr, int slice_ndim)
+array_create_iterator(ArrayType *arr, int slice_ndim, ArrayMetaState *mstate)
 {
 	ArrayIterator iterator = palloc0(sizeof(ArrayIteratorData));
 
@@ -3901,10 +4006,20 @@ array_create_iterator(ArrayType *arr, int slice_ndim)
 	iterator->arr = arr;
 	iterator->nullbitmap = ARR_NULLBITMAP(arr);
 	iterator->nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
-	get_typlenbyvalalign(ARR_ELEMTYPE(arr),
-						 &iterator->typlen,
-						 &iterator->typbyval,
-						 &iterator->typalign);
+
+	if (mstate != NULL)
+	{
+		Assert(mstate->element_type == ARR_ELEMTYPE(arr));
+
+		iterator->typlen = mstate->typlen;
+		iterator->typbyval = mstate->typbyval;
+		iterator->typalign = mstate->typalign;
+	}
+	else
+		get_typlenbyvalalign(ARR_ELEMTYPE(arr),
+							 &iterator->typlen,
+							 &iterator->typbyval,
+							 &iterator->typalign);
 
 	/*
 	 * Remember the slicing parameters.
@@ -4240,7 +4355,7 @@ array_copy(char *destptr, int nitems,
  *
  * Note: this could certainly be optimized using standard bitblt methods.
  * However, it's not clear that the typical Postgres array has enough elements
- * to make it worth worrying too much.	For the moment, KISS.
+ * to make it worth worrying too much.  For the moment, KISS.
  */
 void
 array_bitmap_copy(bits8 *destbitmap, int destoffset,
@@ -4437,7 +4552,7 @@ array_extract_slice(ArrayType *newarray,
  * Insert a slice into an array.
  *
  * ndim/dim[]/lb[] are dimensions of the original array.  A new array with
- * those same dimensions is to be constructed.	destArray must already
+ * those same dimensions is to be constructed.  destArray must already
  * have been allocated and its header initialized.
  *
  * st[]/endp[] identify the slice to be replaced.  Elements within the slice
@@ -4541,9 +4656,73 @@ array_insert_slice(ArrayType *destArray,
 }
 
 /*
+ * initArrayResult - initialize an empty ArrayBuildState
+ *
+ *	element_type is the array element type (must be a valid array element type)
+ *	rcontext is where to keep working state
+ *	subcontext is a flag determining whether to use a separate memory context
+ *
+ * Note: there are two common schemes for using accumArrayResult().
+ * In the older scheme, you start with a NULL ArrayBuildState pointer, and
+ * call accumArrayResult once per element.  In this scheme you end up with
+ * a NULL pointer if there were no elements, which you need to special-case.
+ * In the newer scheme, call initArrayResult and then call accumArrayResult
+ * once per element.  In this scheme you always end with a non-NULL pointer
+ * that you can pass to makeArrayResult; you get an empty array if there
+ * were no elements.  This is preferred if an empty array is what you want.
+ *
+ * It's possible to choose whether to create a separate memory context for the
+ * array build state, or whether to allocate it directly within rcontext.
+ *
+ * When there are many concurrent small states (e.g. array_agg() using hash
+ * aggregation of many small groups), using a separate memory context for each
+ * one may result in severe memory bloat. In such cases, use the same memory
+ * context to initialize all such array build states, and pass
+ * subcontext=false.
+ *
+ * In cases when the array build states have different lifetimes, using a
+ * single memory context is impractical. Instead, pass subcontext=true so that
+ * the array build states can be freed individually.
+ */
+ArrayBuildState *
+initArrayResult(Oid element_type, MemoryContext rcontext, bool subcontext)
+{
+	ArrayBuildState *astate;
+	MemoryContext arr_context = rcontext;
+
+	/* Make a temporary context to hold all the junk */
+	if (subcontext)
+		arr_context = AllocSetContextCreate(rcontext,
+											"accumArrayResult",
+											ALLOCSET_DEFAULT_MINSIZE,
+											ALLOCSET_DEFAULT_INITSIZE,
+											ALLOCSET_DEFAULT_MAXSIZE);
+
+	astate = (ArrayBuildState *)
+		MemoryContextAlloc(arr_context, sizeof(ArrayBuildState));
+	astate->mcontext = arr_context;
+	astate->private_cxt = subcontext;
+	astate->alen = (subcontext ? 64 : 8);	/* arbitrary starting array size */
+	astate->dvalues = (Datum *)
+		MemoryContextAlloc(arr_context, astate->alen * sizeof(Datum));
+	astate->dnulls = (bool *)
+		MemoryContextAlloc(arr_context, astate->alen * sizeof(bool));
+	astate->nelems = 0;
+	astate->element_type = element_type;
+	get_typlenbyvalalign(element_type,
+						 &astate->typlen,
+						 &astate->typbyval,
+						 &astate->typalign);
+
+	return astate;
+}
+
+/*
  * accumArrayResult - accumulate one (more) Datum for an array result
  *
- *	astate is working state (NULL on first call)
+ *	astate is working state (can be NULL on first call)
+ *	dvalue/disnull represent the new Datum to append to the array
+ *	element_type is the Datum's type (must be a valid array element type)
  *	rcontext is where to keep working state
  */
 ArrayBuildState *
@@ -4552,45 +4731,28 @@ accumArrayResult(ArrayBuildState *astate,
 				 Oid element_type,
 				 MemoryContext rcontext)
 {
-	MemoryContext arr_context,
-				oldcontext;
+	MemoryContext oldcontext;
 
 	if (astate == NULL)
 	{
 		/* First time through --- initialize */
-
-		/* Make a temporary context to hold all the junk */
-		arr_context = AllocSetContextCreate(rcontext,
-											"accumArrayResult",
-											ALLOCSET_DEFAULT_MINSIZE,
-											ALLOCSET_DEFAULT_INITSIZE,
-											ALLOCSET_DEFAULT_MAXSIZE);
-		oldcontext = MemoryContextSwitchTo(arr_context);
-		astate = (ArrayBuildState *) palloc(sizeof(ArrayBuildState));
-		astate->mcontext = arr_context;
-		astate->alen = 64;		/* arbitrary starting array size */
-		astate->dvalues = (Datum *) palloc(astate->alen * sizeof(Datum));
-		astate->dnulls = (bool *) palloc(astate->alen * sizeof(bool));
-		astate->nelems = 0;
-		astate->element_type = element_type;
-		get_typlenbyvalalign(element_type,
-							 &astate->typlen,
-							 &astate->typbyval,
-							 &astate->typalign);
+		astate = initArrayResult(element_type, rcontext, true);
 	}
 	else
 	{
-		oldcontext = MemoryContextSwitchTo(astate->mcontext);
 		Assert(astate->element_type == element_type);
-		/* enlarge dvalues[]/dnulls[] if needed */
-		if (astate->nelems >= astate->alen)
-		{
-			astate->alen *= 2;
-			astate->dvalues = (Datum *)
-				repalloc(astate->dvalues, astate->alen * sizeof(Datum));
-			astate->dnulls = (bool *)
-				repalloc(astate->dnulls, astate->alen * sizeof(bool));
-		}
+	}
+
+	oldcontext = MemoryContextSwitchTo(astate->mcontext);
+
+	/* enlarge dvalues[]/dnulls[] if needed */
+	if (astate->nelems >= astate->alen)
+	{
+		astate->alen *= 2;
+		astate->dvalues = (Datum *)
+			repalloc(astate->dvalues, astate->alen * sizeof(Datum));
+		astate->dnulls = (bool *)
+			repalloc(astate->dnulls, astate->alen * sizeof(bool));
 	}
 
 	/*
@@ -4621,20 +4783,27 @@ accumArrayResult(ArrayBuildState *astate,
 /*
  * makeArrayResult - produce 1-D final result of accumArrayResult
  *
- *	astate is working state (not NULL)
+ * Note: only releases astate if it was initialized within a separate memory
+ * context (i.e. using subcontext=true when calling initArrayResult).
+ *
+ *	astate is working state (must not be NULL)
  *	rcontext is where to construct result
  */
 Datum
 makeArrayResult(ArrayBuildState *astate,
 				MemoryContext rcontext)
 {
+	int			ndims;
 	int			dims[1];
 	int			lbs[1];
 
+	/* If no elements were presented, we want to create an empty array */
+	ndims = (astate->nelems > 0) ? 1 : 0;
 	dims[0] = astate->nelems;
 	lbs[0] = 1;
 
-	return makeMdArrayResult(astate, 1, dims, lbs, rcontext, true);
+	return makeMdArrayResult(astate, ndims, dims, lbs, rcontext,
+							 astate->private_cxt);
 }
 
 /*
@@ -4643,7 +4812,12 @@ makeArrayResult(ArrayBuildState *astate,
  * beware: no check that specified dimensions match the number of values
  * accumulated.
  *
- *	astate is working state (not NULL)
+ * Note: if the astate was not initialized within a separate memory context
+ * (that is, initArrayResult was called with subcontext=false), then using
+ * release=true is illegal. Instead, release astate along with the rest of its
+ * context when appropriate.
+ *
+ *	astate is working state (must not be NULL)
  *	rcontext is where to construct result
  *	release is true if okay to release working state
  */
@@ -4675,10 +4849,412 @@ makeMdArrayResult(ArrayBuildState *astate,
 
 	/* Clean up all the junk */
 	if (release)
+	{
+		Assert(astate->private_cxt);
 		MemoryContextDelete(astate->mcontext);
+	}
 
 	return PointerGetDatum(result);
 }
+
+/*
+ * The following three functions provide essentially the same API as
+ * initArrayResult/accumArrayResult/makeArrayResult, but instead of accepting
+ * inputs that are array elements, they accept inputs that are arrays and
+ * produce an output array having N+1 dimensions.  The inputs must all have
+ * identical dimensionality as well as element type.
+ */
+
+/*
+ * initArrayResultArr - initialize an empty ArrayBuildStateArr
+ *
+ *	array_type is the array type (must be a valid varlena array type)
+ *	element_type is the type of the array's elements (lookup if InvalidOid)
+ *	rcontext is where to keep working state
+ *	subcontext is a flag determining whether to use a separate memory context
+ */
+ArrayBuildStateArr *
+initArrayResultArr(Oid array_type, Oid element_type, MemoryContext rcontext,
+				   bool subcontext)
+{
+	ArrayBuildStateArr *astate;
+	MemoryContext arr_context = rcontext;   /* by default use the parent ctx */
+
+	/* Lookup element type, unless element_type already provided */
+	if (! OidIsValid(element_type))
+	{
+		element_type = get_element_type(array_type);
+
+		if (!OidIsValid(element_type))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("data type %s is not an array type",
+							format_type_be(array_type))));
+	}
+
+	/* Make a temporary context to hold all the junk */
+	if (subcontext)
+		arr_context = AllocSetContextCreate(rcontext,
+											"accumArrayResultArr",
+											ALLOCSET_DEFAULT_MINSIZE,
+											ALLOCSET_DEFAULT_INITSIZE,
+											ALLOCSET_DEFAULT_MAXSIZE);
+
+	/* Note we initialize all fields to zero */
+	astate = (ArrayBuildStateArr *)
+		MemoryContextAllocZero(arr_context, sizeof(ArrayBuildStateArr));
+	astate->mcontext = arr_context;
+	astate->private_cxt = subcontext;
+
+	/* Save relevant datatype information */
+	astate->array_type = array_type;
+	astate->element_type = element_type;
+
+	return astate;
+}
+
+/*
+ * accumArrayResultArr - accumulate one (more) sub-array for an array result
+ *
+ *	astate is working state (can be NULL on first call)
+ *	dvalue/disnull represent the new sub-array to append to the array
+ *	array_type is the array type (must be a valid varlena array type)
+ *	rcontext is where to keep working state
+ */
+ArrayBuildStateArr *
+accumArrayResultArr(ArrayBuildStateArr *astate,
+					Datum dvalue, bool disnull,
+					Oid array_type,
+					MemoryContext rcontext)
+{
+	ArrayType  *arg;
+	MemoryContext oldcontext;
+	int		   *dims,
+			   *lbs,
+				ndims,
+				nitems,
+				ndatabytes;
+	char	   *data;
+	int			i;
+
+	/*
+	 * We disallow accumulating null subarrays.  Another plausible definition
+	 * is to ignore them, but callers that want that can just skip calling
+	 * this function.
+	 */
+	if (disnull)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("cannot accumulate null arrays")));
+
+	/* Detoast input array in caller's context */
+	arg = DatumGetArrayTypeP(dvalue);
+
+	if (astate == NULL)
+		astate = initArrayResultArr(array_type, InvalidOid, rcontext, true);
+	else
+		Assert(astate->array_type == array_type);
+
+	oldcontext = MemoryContextSwitchTo(astate->mcontext);
+
+	/* Collect this input's dimensions */
+	ndims = ARR_NDIM(arg);
+	dims = ARR_DIMS(arg);
+	lbs = ARR_LBOUND(arg);
+	data = ARR_DATA_PTR(arg);
+	nitems = ArrayGetNItems(ndims, dims);
+	ndatabytes = ARR_SIZE(arg) - ARR_DATA_OFFSET(arg);
+
+	if (astate->ndims == 0)
+	{
+		/* First input; check/save the dimensionality info */
+
+		/* Should we allow empty inputs and just produce an empty output? */
+		if (ndims == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+					 errmsg("cannot accumulate empty arrays")));
+		if (ndims + 1 > MAXDIM)
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("number of array dimensions (%d) exceeds the maximum allowed (%d)",
+							ndims + 1, MAXDIM)));
+
+		/*
+		 * The output array will have n+1 dimensions, with the ones after the
+		 * first matching the input's dimensions.
+		 */
+		astate->ndims = ndims + 1;
+		astate->dims[0] = 0;
+		memcpy(&astate->dims[1], dims, ndims * sizeof(int));
+		astate->lbs[0] = 1;
+		memcpy(&astate->lbs[1], lbs, ndims * sizeof(int));
+
+		/* Allocate at least enough data space for this item */
+		astate->abytes = 1024;
+		while (astate->abytes <= ndatabytes)
+			astate->abytes *= 2;
+		astate->data = (char *) palloc(astate->abytes);
+	}
+	else
+	{
+		/* Second or later input: must match first input's dimensionality */
+		if (astate->ndims != ndims + 1)
+			ereport(ERROR,
+					(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+			errmsg("cannot accumulate arrays of different dimensionality")));
+		for (i = 0; i < ndims; i++)
+		{
+			if (astate->dims[i + 1] != dims[i] || astate->lbs[i + 1] != lbs[i])
+				ereport(ERROR,
+						(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+						 errmsg("cannot accumulate arrays of different dimensionality")));
+		}
+
+		/* Enlarge data space if needed */
+		if (astate->nbytes + ndatabytes > astate->abytes)
+		{
+			astate->abytes = Max(astate->abytes * 2,
+								 astate->nbytes + ndatabytes);
+			astate->data = (char *) repalloc(astate->data, astate->abytes);
+		}
+	}
+
+	/*
+	 * Copy the data portion of the sub-array.  Note we assume that the
+	 * advertised data length of the sub-array is properly aligned.  We do not
+	 * have to worry about detoasting elements since whatever's in the
+	 * sub-array should be OK already.
+	 */
+	memcpy(astate->data + astate->nbytes, data, ndatabytes);
+	astate->nbytes += ndatabytes;
+
+	/* Deal with null bitmap if needed */
+	if (astate->nullbitmap || ARR_HASNULL(arg))
+	{
+		int			newnitems = astate->nitems + nitems;
+
+		if (astate->nullbitmap == NULL)
+		{
+			/*
+			 * First input with nulls; we must retrospectively handle any
+			 * previous inputs by marking all their items non-null.
+			 */
+			astate->aitems = 256;
+			while (astate->aitems <= newnitems)
+				astate->aitems *= 2;
+			astate->nullbitmap = (bits8 *) palloc((astate->aitems + 7) / 8);
+			array_bitmap_copy(astate->nullbitmap, 0,
+							  NULL, 0,
+							  astate->nitems);
+		}
+		else if (newnitems > astate->aitems)
+		{
+			astate->aitems = Max(astate->aitems * 2, newnitems);
+			astate->nullbitmap = (bits8 *)
+				repalloc(astate->nullbitmap, (astate->aitems + 7) / 8);
+		}
+		array_bitmap_copy(astate->nullbitmap, astate->nitems,
+						  ARR_NULLBITMAP(arg), 0,
+						  nitems);
+	}
+
+	astate->nitems += nitems;
+	astate->dims[0] += 1;
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Release detoasted copy if any */
+	if ((Pointer) arg != DatumGetPointer(dvalue))
+		pfree(arg);
+
+	return astate;
+}
+
+/*
+ * makeArrayResultArr - produce N+1-D final result of accumArrayResultArr
+ *
+ *	astate is working state (must not be NULL)
+ *	rcontext is where to construct result
+ *	release is true if okay to release working state
+ */
+Datum
+makeArrayResultArr(ArrayBuildStateArr *astate,
+				   MemoryContext rcontext,
+				   bool release)
+{
+	ArrayType  *result;
+	MemoryContext oldcontext;
+
+	/* Build the final array result in rcontext */
+	oldcontext = MemoryContextSwitchTo(rcontext);
+
+	if (astate->ndims == 0)
+	{
+		/* No inputs, return empty array */
+		result = construct_empty_array(astate->element_type);
+	}
+	else
+	{
+		int			dataoffset,
+					nbytes;
+
+		/* Compute required space */
+		nbytes = astate->nbytes;
+		if (astate->nullbitmap != NULL)
+		{
+			dataoffset = ARR_OVERHEAD_WITHNULLS(astate->ndims, astate->nitems);
+			nbytes += dataoffset;
+		}
+		else
+		{
+			dataoffset = 0;
+			nbytes += ARR_OVERHEAD_NONULLS(astate->ndims);
+		}
+
+		result = (ArrayType *) palloc0(nbytes);
+		SET_VARSIZE(result, nbytes);
+		result->ndim = astate->ndims;
+		result->dataoffset = dataoffset;
+		result->elemtype = astate->element_type;
+
+		memcpy(ARR_DIMS(result), astate->dims, astate->ndims * sizeof(int));
+		memcpy(ARR_LBOUND(result), astate->lbs, astate->ndims * sizeof(int));
+		memcpy(ARR_DATA_PTR(result), astate->data, astate->nbytes);
+
+		if (astate->nullbitmap != NULL)
+			array_bitmap_copy(ARR_NULLBITMAP(result), 0,
+							  astate->nullbitmap, 0,
+							  astate->nitems);
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+
+	/* Clean up all the junk */
+	if (release)
+	{
+		Assert(astate->private_cxt);
+		MemoryContextDelete(astate->mcontext);
+	}
+
+	return PointerGetDatum(result);
+}
+
+/*
+ * The following three functions provide essentially the same API as
+ * initArrayResult/accumArrayResult/makeArrayResult, but can accept either
+ * scalar or array inputs, invoking the appropriate set of functions above.
+ */
+
+/*
+ * initArrayResultAny - initialize an empty ArrayBuildStateAny
+ *
+ *	input_type is the input datatype (either element or array type)
+ *	rcontext is where to keep working state
+ *	subcontext is a flag determining whether to use a separate memory context
+ */
+ArrayBuildStateAny *
+initArrayResultAny(Oid input_type, MemoryContext rcontext, bool subcontext)
+{
+	ArrayBuildStateAny *astate;
+	Oid			element_type = get_element_type(input_type);
+
+	if (OidIsValid(element_type))
+	{
+		/* Array case */
+		ArrayBuildStateArr *arraystate;
+
+		arraystate = initArrayResultArr(input_type, InvalidOid, rcontext, subcontext);
+		astate = (ArrayBuildStateAny *)
+			MemoryContextAlloc(arraystate->mcontext,
+							   sizeof(ArrayBuildStateAny));
+		astate->scalarstate = NULL;
+		astate->arraystate = arraystate;
+	}
+	else
+	{
+		/* Scalar case */
+		ArrayBuildState *scalarstate;
+
+		/* Let's just check that we have a type that can be put into arrays */
+		Assert(OidIsValid(get_array_type(input_type)));
+
+		scalarstate = initArrayResult(input_type, rcontext, subcontext);
+		astate = (ArrayBuildStateAny *)
+			MemoryContextAlloc(scalarstate->mcontext,
+							   sizeof(ArrayBuildStateAny));
+		astate->scalarstate = scalarstate;
+		astate->arraystate = NULL;
+	}
+
+	return astate;
+}
+
+/*
+ * accumArrayResultAny - accumulate one (more) input for an array result
+ *
+ *	astate is working state (can be NULL on first call)
+ *	dvalue/disnull represent the new input to append to the array
+ *	input_type is the input datatype (either element or array type)
+ *	rcontext is where to keep working state
+ */
+ArrayBuildStateAny *
+accumArrayResultAny(ArrayBuildStateAny *astate,
+					Datum dvalue, bool disnull,
+					Oid input_type,
+					MemoryContext rcontext)
+{
+	if (astate == NULL)
+		astate = initArrayResultAny(input_type, rcontext, true);
+
+	if (astate->scalarstate)
+		(void) accumArrayResult(astate->scalarstate,
+								dvalue, disnull,
+								input_type, rcontext);
+	else
+		(void) accumArrayResultArr(astate->arraystate,
+								   dvalue, disnull,
+								   input_type, rcontext);
+
+	return astate;
+}
+
+/*
+ * makeArrayResultAny - produce final result of accumArrayResultAny
+ *
+ *	astate is working state (must not be NULL)
+ *	rcontext is where to construct result
+ *	release is true if okay to release working state
+ */
+Datum
+makeArrayResultAny(ArrayBuildStateAny *astate,
+				   MemoryContext rcontext, bool release)
+{
+	Datum		result;
+
+	if (astate->scalarstate)
+	{
+		/* Must use makeMdArrayResult to support "release" parameter */
+		int			ndims;
+		int			dims[1];
+		int			lbs[1];
+
+		/* If no elements were presented, we want to create an empty array */
+		ndims = (astate->scalarstate->nelems > 0) ? 1 : 0;
+		dims[0] = astate->scalarstate->nelems;
+		lbs[0] = 1;
+
+		result = makeMdArrayResult(astate->scalarstate, ndims, dims, lbs,
+								   rcontext, release);
+	}
+	else
+	{
+		result = makeArrayResultArr(astate->arraystate,
+									rcontext, release);
+	}
+	return result;
+}
+
 
 Datum
 array_larger(PG_FUNCTION_ARGS)
@@ -4713,8 +5289,8 @@ array_smaller(PG_FUNCTION_ARGS)
 
 typedef struct generate_subscripts_fctx
 {
-	int4		lower;
-	int4		upper;
+	int32		lower;
+	int32		upper;
 	bool		reverse;
 } generate_subscripts_fctx;
 
@@ -5105,7 +5681,7 @@ array_unnest(PG_FUNCTION_ARGS)
 		 * Get the array value and detoast if needed.  We can't do this
 		 * earlier because if we have to detoast, we want the detoasted copy
 		 * to be in multi_call_memory_ctx, so it will go away when we're done
-		 * and not before.	(If no detoast happens, we assume the originally
+		 * and not before.  (If no detoast happens, we assume the originally
 		 * passed array will stick around till then.)
 		 */
 		arr = PG_GETARG_ARRAYTYPE_P(0);
@@ -5173,4 +5749,545 @@ array_unnest(PG_FUNCTION_ARGS)
 		/* do when there is no more left */
 		SRF_RETURN_DONE(funcctx);
 	}
+}
+
+
+/*
+ * array_replace/array_remove support
+ *
+ * Find all array entries matching (not distinct from) search/search_isnull,
+ * and delete them if remove is true, else replace them with
+ * replace/replace_isnull.  Comparisons are done using the specified
+ * collation.  fcinfo is passed only for caching purposes.
+ */
+static ArrayType *
+array_replace_internal(ArrayType *array,
+					   Datum search, bool search_isnull,
+					   Datum replace, bool replace_isnull,
+					   bool remove, Oid collation,
+					   FunctionCallInfo fcinfo)
+{
+	ArrayType  *result;
+	Oid			element_type;
+	Datum	   *values;
+	bool	   *nulls;
+	int		   *dim;
+	int			ndim;
+	int			nitems,
+				nresult;
+	int			i;
+	int32		nbytes = 0;
+	int32		dataoffset;
+	bool		hasnulls;
+	int			typlen;
+	bool		typbyval;
+	char		typalign;
+	char	   *arraydataptr;
+	bits8	   *bitmap;
+	int			bitmask;
+	bool		changed = false;
+	TypeCacheEntry *typentry;
+	FunctionCallInfoData locfcinfo;
+
+	element_type = ARR_ELEMTYPE(array);
+	ndim = ARR_NDIM(array);
+	dim = ARR_DIMS(array);
+	nitems = ArrayGetNItems(ndim, dim);
+
+	/* Return input array unmodified if it is empty */
+	if (nitems <= 0)
+		return array;
+
+	/*
+	 * We can't remove elements from multi-dimensional arrays, since the
+	 * result might not be rectangular.
+	 */
+	if (remove && ndim > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("removing elements from multidimensional arrays is not supported")));
+
+	/*
+	 * We arrange to look up the equality function only once per series of
+	 * calls, assuming the element type doesn't change underneath us.
+	 */
+	typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
+	if (typentry == NULL ||
+		typentry->type_id != element_type)
+	{
+		typentry = lookup_type_cache(element_type,
+									 TYPECACHE_EQ_OPR_FINFO);
+		if (!OidIsValid(typentry->eq_opr_finfo.fn_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				errmsg("could not identify an equality operator for type %s",
+					   format_type_be(element_type))));
+		fcinfo->flinfo->fn_extra = (void *) typentry;
+	}
+	typlen = typentry->typlen;
+	typbyval = typentry->typbyval;
+	typalign = typentry->typalign;
+
+	/*
+	 * Detoast values if they are toasted.  The replacement value must be
+	 * detoasted for insertion into the result array, while detoasting the
+	 * search value only once saves cycles.
+	 */
+	if (typlen == -1)
+	{
+		if (!search_isnull)
+			search = PointerGetDatum(PG_DETOAST_DATUM(search));
+		if (!replace_isnull)
+			replace = PointerGetDatum(PG_DETOAST_DATUM(replace));
+	}
+
+	/* Prepare to apply the comparison operator */
+	InitFunctionCallInfoData(locfcinfo, &typentry->eq_opr_finfo, 2,
+							 collation, NULL, NULL);
+
+	/* Allocate temporary arrays for new values */
+	values = (Datum *) palloc(nitems * sizeof(Datum));
+	nulls = (bool *) palloc(nitems * sizeof(bool));
+
+	/* Loop over source data */
+	arraydataptr = ARR_DATA_PTR(array);
+	bitmap = ARR_NULLBITMAP(array);
+	bitmask = 1;
+	hasnulls = false;
+	nresult = 0;
+
+	for (i = 0; i < nitems; i++)
+	{
+		Datum		elt;
+		bool		isNull;
+		bool		oprresult;
+		bool		skip = false;
+
+		/* Get source element, checking for NULL */
+		if (bitmap && (*bitmap & bitmask) == 0)
+		{
+			isNull = true;
+			/* If searching for NULL, we have a match */
+			if (search_isnull)
+			{
+				if (remove)
+				{
+					skip = true;
+					changed = true;
+				}
+				else if (!replace_isnull)
+				{
+					values[nresult] = replace;
+					isNull = false;
+					changed = true;
+				}
+			}
+		}
+		else
+		{
+			isNull = false;
+			elt = fetch_att(arraydataptr, typbyval, typlen);
+			arraydataptr = att_addlength_datum(arraydataptr, typlen, elt);
+			arraydataptr = (char *) att_align_nominal(arraydataptr, typalign);
+
+			if (search_isnull)
+			{
+				/* no match possible, keep element */
+				values[nresult] = elt;
+			}
+			else
+			{
+				/*
+				 * Apply the operator to the element pair
+				 */
+				locfcinfo.arg[0] = elt;
+				locfcinfo.arg[1] = search;
+				locfcinfo.argnull[0] = false;
+				locfcinfo.argnull[1] = false;
+				locfcinfo.isnull = false;
+				oprresult = DatumGetBool(FunctionCallInvoke(&locfcinfo));
+				if (!oprresult)
+				{
+					/* no match, keep element */
+					values[nresult] = elt;
+				}
+				else
+				{
+					/* match, so replace or delete */
+					changed = true;
+					if (remove)
+						skip = true;
+					else
+					{
+						values[nresult] = replace;
+						isNull = replace_isnull;
+					}
+				}
+			}
+		}
+
+		if (!skip)
+		{
+			nulls[nresult] = isNull;
+			if (isNull)
+				hasnulls = true;
+			else
+			{
+				/* Update total result size */
+				nbytes = att_addlength_datum(nbytes, typlen, values[nresult]);
+				nbytes = att_align_nominal(nbytes, typalign);
+				/* check for overflow of total request */
+				if (!AllocSizeIsValid(nbytes))
+					ereport(ERROR,
+							(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("array size exceeds the maximum allowed (%d)",
+							   (int) MaxAllocSize)));
+			}
+			nresult++;
+		}
+
+		/* advance bitmap pointer if any */
+		if (bitmap)
+		{
+			bitmask <<= 1;
+			if (bitmask == 0x100)
+			{
+				bitmap++;
+				bitmask = 1;
+			}
+		}
+	}
+
+	/*
+	 * If not changed just return the original array
+	 */
+	if (!changed)
+	{
+		pfree(values);
+		pfree(nulls);
+		return array;
+	}
+
+	/* If all elements were removed return an empty array */
+	if (nresult == 0)
+	{
+		pfree(values);
+		pfree(nulls);
+		return construct_empty_array(element_type);
+	}
+
+	/* Allocate and initialize the result array */
+	if (hasnulls)
+	{
+		dataoffset = ARR_OVERHEAD_WITHNULLS(ndim, nresult);
+		nbytes += dataoffset;
+	}
+	else
+	{
+		dataoffset = 0;			/* marker for no null bitmap */
+		nbytes += ARR_OVERHEAD_NONULLS(ndim);
+	}
+	result = (ArrayType *) palloc0(nbytes);
+	SET_VARSIZE(result, nbytes);
+	result->ndim = ndim;
+	result->dataoffset = dataoffset;
+	result->elemtype = element_type;
+	memcpy(ARR_DIMS(result), ARR_DIMS(array), 2 * ndim * sizeof(int));
+
+	if (remove)
+	{
+		/* Adjust the result length */
+		ARR_DIMS(result)[0] = nresult;
+	}
+
+	/* Insert data into result array */
+	CopyArrayEls(result,
+				 values, nulls, nresult,
+				 typlen, typbyval, typalign,
+				 false);
+
+	pfree(values);
+	pfree(nulls);
+
+	return result;
+}
+
+/*
+ * Remove any occurrences of an element from an array
+ *
+ * If used on a multi-dimensional array this will raise an error.
+ */
+Datum
+array_remove(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array;
+	Datum		search = PG_GETARG_DATUM(1);
+	bool		search_isnull = PG_ARGISNULL(1);
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	array = PG_GETARG_ARRAYTYPE_P(0);
+
+	array = array_replace_internal(array,
+								   search, search_isnull,
+								   (Datum) 0, true,
+								   true, PG_GET_COLLATION(),
+								   fcinfo);
+	PG_RETURN_ARRAYTYPE_P(array);
+}
+
+/*
+ * Replace any occurrences of an element in an array
+ */
+Datum
+array_replace(PG_FUNCTION_ARGS)
+{
+	ArrayType  *array;
+	Datum		search = PG_GETARG_DATUM(1);
+	bool		search_isnull = PG_ARGISNULL(1);
+	Datum		replace = PG_GETARG_DATUM(2);
+	bool		replace_isnull = PG_ARGISNULL(2);
+
+	if (PG_ARGISNULL(0))
+		PG_RETURN_NULL();
+	array = PG_GETARG_ARRAYTYPE_P(0);
+
+	array = array_replace_internal(array,
+								   search, search_isnull,
+								   replace, replace_isnull,
+								   false, PG_GET_COLLATION(),
+								   fcinfo);
+	PG_RETURN_ARRAYTYPE_P(array);
+}
+
+/*
+ * Implements width_bucket(anyelement, anyarray).
+ *
+ * 'thresholds' is an array containing lower bound values for each bucket;
+ * these must be sorted from smallest to largest, or bogus results will be
+ * produced.  If N thresholds are supplied, the output is from 0 to N:
+ * 0 is for inputs < first threshold, N is for inputs >= last threshold.
+ */
+Datum
+width_bucket_array(PG_FUNCTION_ARGS)
+{
+	Datum		operand = PG_GETARG_DATUM(0);
+	ArrayType  *thresholds = PG_GETARG_ARRAYTYPE_P(1);
+	Oid			collation = PG_GET_COLLATION();
+	Oid			element_type = ARR_ELEMTYPE(thresholds);
+	int			result;
+
+	/* Check input */
+	if (ARR_NDIM(thresholds) > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("thresholds must be one-dimensional array")));
+
+	if (array_contains_nulls(thresholds))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("thresholds array must not contain NULLs")));
+
+	/* We have a dedicated implementation for float8 data */
+	if (element_type == FLOAT8OID)
+		result = width_bucket_array_float8(operand, thresholds);
+	else
+	{
+		TypeCacheEntry *typentry;
+
+		/* Cache information about the input type */
+		typentry = (TypeCacheEntry *) fcinfo->flinfo->fn_extra;
+		if (typentry == NULL ||
+			typentry->type_id != element_type)
+		{
+			typentry = lookup_type_cache(element_type,
+										 TYPECACHE_CMP_PROC_FINFO);
+			if (!OidIsValid(typentry->cmp_proc_finfo.fn_oid))
+				ereport(ERROR,
+						(errcode(ERRCODE_UNDEFINED_FUNCTION),
+				errmsg("could not identify a comparison function for type %s",
+					   format_type_be(element_type))));
+			fcinfo->flinfo->fn_extra = (void *) typentry;
+		}
+
+		/*
+		 * We have separate implementation paths for fixed- and variable-width
+		 * types, since indexing the array is a lot cheaper in the first case.
+		 */
+		if (typentry->typlen > 0)
+			result = width_bucket_array_fixed(operand, thresholds,
+											  collation, typentry);
+		else
+			result = width_bucket_array_variable(operand, thresholds,
+												 collation, typentry);
+	}
+
+	/* Avoid leaking memory when handed toasted input. */
+	PG_FREE_IF_COPY(thresholds, 1);
+
+	PG_RETURN_INT32(result);
+}
+
+/*
+ * width_bucket_array for float8 data.
+ */
+static int
+width_bucket_array_float8(Datum operand, ArrayType *thresholds)
+{
+	float8		op = DatumGetFloat8(operand);
+	float8	   *thresholds_data;
+	int			left;
+	int			right;
+
+	/*
+	 * Since we know the array contains no NULLs, we can just index it
+	 * directly.
+	 */
+	thresholds_data = (float8 *) ARR_DATA_PTR(thresholds);
+
+	left = 0;
+	right = ArrayGetNItems(ARR_NDIM(thresholds), ARR_DIMS(thresholds));
+
+	/*
+	 * If the probe value is a NaN, it's greater than or equal to all possible
+	 * threshold values (including other NaNs), so we need not search.  Note
+	 * that this would give the same result as searching even if the array
+	 * contains multiple NaNs (as long as they're correctly sorted), since the
+	 * loop logic will find the rightmost of multiple equal threshold values.
+	 */
+	if (isnan(op))
+		return right;
+
+	/* Find the bucket */
+	while (left < right)
+	{
+		int			mid = (left + right) / 2;
+
+		if (isnan(thresholds_data[mid]) || op < thresholds_data[mid])
+			right = mid;
+		else
+			left = mid + 1;
+	}
+
+	return left;
+}
+
+/*
+ * width_bucket_array for generic fixed-width data types.
+ */
+static int
+width_bucket_array_fixed(Datum operand,
+						 ArrayType *thresholds,
+						 Oid collation,
+						 TypeCacheEntry *typentry)
+{
+	char	   *thresholds_data;
+	int			typlen = typentry->typlen;
+	bool		typbyval = typentry->typbyval;
+	FunctionCallInfoData locfcinfo;
+	int			left;
+	int			right;
+
+	/*
+	 * Since we know the array contains no NULLs, we can just index it
+	 * directly.
+	 */
+	thresholds_data = (char *) ARR_DATA_PTR(thresholds);
+
+	InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2,
+							 collation, NULL, NULL);
+
+	/* Find the bucket */
+	left = 0;
+	right = ArrayGetNItems(ARR_NDIM(thresholds), ARR_DIMS(thresholds));
+	while (left < right)
+	{
+		int			mid = (left + right) / 2;
+		char	   *ptr;
+		int32		cmpresult;
+
+		ptr = thresholds_data + mid * typlen;
+
+		locfcinfo.arg[0] = operand;
+		locfcinfo.arg[1] = fetch_att(ptr, typbyval, typlen);
+		locfcinfo.argnull[0] = false;
+		locfcinfo.argnull[1] = false;
+		locfcinfo.isnull = false;
+
+		cmpresult = DatumGetInt32(FunctionCallInvoke(&locfcinfo));
+
+		if (cmpresult < 0)
+			right = mid;
+		else
+			left = mid + 1;
+	}
+
+	return left;
+}
+
+/*
+ * width_bucket_array for generic variable-width data types.
+ */
+static int
+width_bucket_array_variable(Datum operand,
+							ArrayType *thresholds,
+							Oid collation,
+							TypeCacheEntry *typentry)
+{
+	char	   *thresholds_data;
+	int			typlen = typentry->typlen;
+	bool		typbyval = typentry->typbyval;
+	char		typalign = typentry->typalign;
+	FunctionCallInfoData locfcinfo;
+	int			left;
+	int			right;
+
+	thresholds_data = (char *) ARR_DATA_PTR(thresholds);
+
+	InitFunctionCallInfoData(locfcinfo, &typentry->cmp_proc_finfo, 2,
+							 collation, NULL, NULL);
+
+	/* Find the bucket */
+	left = 0;
+	right = ArrayGetNItems(ARR_NDIM(thresholds), ARR_DIMS(thresholds));
+	while (left < right)
+	{
+		int			mid = (left + right) / 2;
+		char	   *ptr;
+		int			i;
+		int32		cmpresult;
+
+		/* Locate mid'th array element by advancing from left element */
+		ptr = thresholds_data;
+		for (i = left; i < mid; i++)
+		{
+			ptr = att_addlength_pointer(ptr, typlen, ptr);
+			ptr = (char *) att_align_nominal(ptr, typalign);
+		}
+
+		locfcinfo.arg[0] = operand;
+		locfcinfo.arg[1] = fetch_att(ptr, typbyval, typlen);
+		locfcinfo.argnull[0] = false;
+		locfcinfo.argnull[1] = false;
+		locfcinfo.isnull = false;
+
+		cmpresult = DatumGetInt32(FunctionCallInvoke(&locfcinfo));
+
+		if (cmpresult < 0)
+			right = mid;
+		else
+		{
+			left = mid + 1;
+
+			/*
+			 * Move the thresholds pointer to match new "left" index, so we
+			 * don't have to seek over those elements again.  This trick
+			 * ensures we do only O(N) array indexing work, not O(N^2).
+			 */
+			ptr = att_addlength_pointer(ptr, typlen, ptr);
+			thresholds_data = (char *) att_align_nominal(ptr, typalign);
+		}
+	}
+
+	return left;
 }

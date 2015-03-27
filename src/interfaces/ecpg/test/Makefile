@@ -1,5 +1,8 @@
 # src/interfaces/ecpg/test/Makefile
 
+PGFILEDESC = "ECPG Test - regression tests for ECPG"
+PGAPPICON = win32
+
 subdir = src/interfaces/ecpg/test
 top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
@@ -41,13 +44,13 @@ clean distclean maintainer-clean:
 	$(MAKE) -C compat_informix $@
 	$(MAKE) -C thread $@
 	rm -rf tmp_check results log
-	rm -f pg_regress regression.diffs regression.out pg_regress_ecpg.o
+	rm -f pg_regress regression.diffs regression.out pg_regress_ecpg.o $(WIN32RES)
 
 # Build regression test driver
 
 all: pg_regress$(X)
 
-pg_regress$(X): pg_regress_ecpg.o $(top_builddir)/src/test/regress/pg_regress.o
+pg_regress$(X): pg_regress_ecpg.o $(WIN32RES) $(top_builddir)/src/test/regress/pg_regress.o
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $^ $(LIBS) -o $@
 
 $(top_builddir)/src/test/regress/pg_regress.o:
@@ -75,13 +78,15 @@ $(remaining_files_build): $(abs_builddir)/%: $(srcdir)/%
 	ln -s $< $@
 endif
 
+# Common options for tests. Also pick up anything passed in EXTRA_REGRESS_OPTS
+REGRESS_OPTS = --dbname=regress1,connectdb --create-role=connectuser,connectdb $(EXTRA_REGRESS_OPTS)
 
 check: all
-	./pg_regress  --dbname=regress1,connectdb --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule --create-role=connectuser,connectdb
+	./pg_regress $(REGRESS_OPTS) --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule
 
 # the same options, but with --listen-on-tcp
 checktcp: all
-	./pg_regress  --dbname=regress1,connectdb --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule_tcp --create-role=connectuser,connectdb --host=localhost
+	./pg_regress $(REGRESS_OPTS) --top-builddir=$(top_builddir) --temp-install=./tmp_check $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule_tcp --host=localhost
 
 installcheck: all
-	./pg_regress  --psqldir='$(PSQLDIR)' --dbname=regress1,connectdb --top-builddir=$(top_builddir) $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule --create-role=connectuser,connectdb
+	./pg_regress $(REGRESS_OPTS) --psqldir='$(PSQLDIR)' --top-builddir=$(top_builddir) $(pg_regress_locale_flags) $(THREAD) --schedule=$(srcdir)/ecpg_schedule

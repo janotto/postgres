@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERCONVERSION">
+ <indexterm zone="sql-alterconversion">
+  <primary>ALTER CONVERSION</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ALTER CONVERSION</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,14 +19,10 @@ PostgreSQL documentation
   <refpurpose>change the definition of a conversion</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-alterconversion">
-  <primary>ALTER CONVERSION</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 ALTER CONVERSION <replaceable>name</replaceable> RENAME TO <replaceable>new_name</replaceable>
-ALTER CONVERSION <replaceable>name</replaceable> OWNER TO <replaceable>new_owner</replaceable>
+ALTER CONVERSION <replaceable>name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
 ALTER CONVERSION <replaceable>name</replaceable> SET SCHEMA <replaceable>new_schema</replaceable>
 </synopsis>
  </refsynopsisdiv>

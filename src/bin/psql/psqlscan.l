@@ -29,7 +29,7 @@
  * subroutine is responsible for looking back to the original string and
  * replacing FF's with the corresponding original bytes.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -166,7 +166,9 @@ static void escape_variable(bool as_ident);
  *  <xe> extended quoted strings (support backslash escape sequences)
  *  <xdolq> $foo$ quoted strings
  *  <xui> quoted identifier with Unicode escapes
+ *  <xuiend> end of a quoted identifier with Unicode escapes, UESCAPE can follow
  *  <xus> quoted string with Unicode escapes
+ *  <xusend> end of a quoted string with Unicode escapes, UESCAPE can follow
  *
  * Note: we intentionally don't mimic the backend's <xeu> state; we have
  * no need to distinguish it from <xe> state, and no good way to get out
@@ -182,7 +184,9 @@ static void escape_variable(bool as_ident);
 %x xq
 %x xdolq
 %x xui
+%x xuiend
 %x xus
+%x xusend
 /* Additional exclusive states for psql only: lex backslash commands */
 %x xslashcmd
 %x xslashargstart
@@ -307,17 +311,17 @@ xdinside		[^"]+
 /* Unicode escapes */
 uescape			[uU][eE][sS][cC][aA][pP][eE]{whitespace}*{quote}[^']{quote}
 /* error rule to avoid backup */
-uescapefail		("-"|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*"-"|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*{quote}[^']|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*{quote}|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*|[uU][eE][sS][cC][aA][pP]|[uU][eE][sS][cC][aA]|[uU][eE][sS][cC]|[uU][eE][sS]|[uU][eE]|[uU])
+uescapefail		[uU][eE][sS][cC][aA][pP][eE]{whitespace}*"-"|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*{quote}[^']|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*{quote}|[uU][eE][sS][cC][aA][pP][eE]{whitespace}*|[uU][eE][sS][cC][aA][pP]|[uU][eE][sS][cC][aA]|[uU][eE][sS][cC]|[uU][eE][sS]|[uU][eE]|[uU]
 
 /* Quoted identifier with Unicode escapes */
 xuistart		[uU]&{dquote}
-xuistop1		{dquote}{whitespace}*{uescapefail}?
-xuistop2		{dquote}{whitespace}*{uescape}
 
 /* Quoted string with Unicode escapes */
 xusstart		[uU]&{quote}
-xusstop1		{quote}{whitespace}*{uescapefail}?
-xusstop2		{quote}{whitespace}*{uescape}
+
+/* Optional UESCAPE after a quoted string or identifier with Unicode escapes. */
+xustop1		{uescapefail}?
+xustop2		{uescape}
 
 /* error rule to avoid backup */
 xufailed		[uU]&
@@ -351,9 +355,15 @@ ident_cont		[A-Za-z\200-\377_0-9\$]
 
 identifier		{ident_start}{ident_cont}*
 
+/* Assorted special-case operators and operator-like tokens */
 typecast		"::"
 dot_dot			\.\.
 colon_equals	":="
+equals_greater	"=>"
+less_equals		"<="
+greater_equals	">="
+less_greater	"<>"
+not_equals		"!="
 
 /*
  * "self" is the set of chars that should be returned as single-character
@@ -520,12 +530,22 @@ other			.
 					BEGIN(INITIAL);
 					ECHO;
 				}
-<xus>{xusstop1} {
+<xus>{quotestop} |
+<xus>{quotefail} {
 					yyless(1);
+					BEGIN(xusend);
+					ECHO;
+				}
+<xusend>{whitespace} {
+					ECHO;
+				}
+<xusend>{other} |
+<xusend>{xustop1} {
+					yyless(0);
 					BEGIN(INITIAL);
 					ECHO;
 				}
-<xus>{xusstop2} {
+<xusend>{xustop2} {
 					BEGIN(INITIAL);
 					ECHO;
 				}
@@ -612,12 +632,21 @@ other			.
 					BEGIN(INITIAL);
 					ECHO;
 				}
-<xui>{xuistop1}	{
+<xui>{dquote} {
 					yyless(1);
+					BEGIN(xuiend);
+					ECHO;
+				}
+<xuiend>{whitespace} {
+					ECHO;
+				}
+<xuiend>{other} |
+<xuiend>{xustop1} {
+					yyless(0);
 					BEGIN(INITIAL);
 					ECHO;
 				}
-<xui>{xuistop2}	{
+<xuiend>{xustop2}	{
 					BEGIN(INITIAL);
 					ECHO;
 				}
@@ -643,6 +672,26 @@ other			.
 				}
 
 {colon_equals}	{
+					ECHO;
+				}
+
+{equals_greater} {
+					ECHO;
+				}
+
+{less_equals}	{
+					ECHO;
+				}
+
+{greater_equals} {
+					ECHO;
+				}
+
+{less_greater}	{
+					ECHO;
+				}
+
+{not_equals}	{
 					ECHO;
 				}
 
@@ -1150,7 +1199,7 @@ psql_scan_create(void)
 {
 	PsqlScanState state;
 
-	state = (PsqlScanStateData *) pg_malloc_zero(sizeof(PsqlScanStateData));
+	state = (PsqlScanStateData *) pg_malloc0(sizeof(PsqlScanStateData));
 
 	psql_scan_reset(state);
 
@@ -1184,8 +1233,8 @@ psql_scan_setup(PsqlScanState state,
 				const char *line, int line_len)
 {
 	/* Mustn't be scanning already */
-	psql_assert(state->scanbufhandle == NULL);
-	psql_assert(state->buffer_stack == NULL);
+	Assert(state->scanbufhandle == NULL);
+	Assert(state->buffer_stack == NULL);
 
 	/* Do we need to hack the character set encoding? */
 	state->encoding = pset.encoding;
@@ -1245,7 +1294,7 @@ psql_scan(PsqlScanState state,
 	int			lexresult;
 
 	/* Must be scanning already */
-	psql_assert(state->scanbufhandle);
+	Assert(state->scanbufhandle != NULL);
 
 	/* Set up static variables that will be used by yylex */
 	cur_state = state;
@@ -1274,6 +1323,8 @@ psql_scan(PsqlScanState state,
 			{
 				/* This switch must cover all non-slash-command states. */
 				case INITIAL:
+				case xuiend:	/* we treat these like INITIAL */
+				case xusend:
 					if (state->paren_depth > 0)
 					{
 						result = PSCAN_INCOMPLETE;
@@ -1424,7 +1475,7 @@ psql_scan_slash_command(PsqlScanState state)
 	PQExpBufferData mybuf;
 
 	/* Must be scanning already */
-	psql_assert(state->scanbufhandle);
+	Assert(state->scanbufhandle != NULL);
 
 	/* Build a local buffer that we'll return the data of */
 	initPQExpBuffer(&mybuf);
@@ -1474,11 +1525,11 @@ psql_scan_slash_option(PsqlScanState state,
 					   bool semicolon)
 {
 	PQExpBufferData mybuf;
-	int			lexresult;
+	int			lexresult PG_USED_FOR_ASSERTS_ONLY;
 	char		local_quote;
 
 	/* Must be scanning already */
-	psql_assert(state->scanbufhandle);
+	Assert(state->scanbufhandle != NULL);
 
 	if (quote == NULL)
 		quote = &local_quote;
@@ -1512,7 +1563,7 @@ psql_scan_slash_option(PsqlScanState state,
 	 * or LEXRES_EOL (the latter indicating end of string).  If we were inside
 	 * a quoted string, as indicated by YY_START, EOL is an error.
 	 */
-	psql_assert(lexresult == LEXRES_EOL || lexresult == LEXRES_OK);
+	Assert(lexresult == LEXRES_EOL || lexresult == LEXRES_OK);
 
 	switch (YY_START)
 	{
@@ -1608,7 +1659,7 @@ void
 psql_scan_slash_command_end(PsqlScanState state)
 {
 	/* Must be scanning already */
-	psql_assert(state->scanbufhandle);
+	Assert(state->scanbufhandle != NULL);
 
 	/* Set up static variables that will be used by yylex */
 	cur_state = state;
@@ -1807,7 +1858,7 @@ prepare_buffer(const char *txt, int len, char **txtcopy)
 			/* first byte should always be okay... */
 			newtxt[i] = txt[i];
 			i++;
-			while (--thislen > 0)
+			while (--thislen > 0 && i < len)
 				newtxt[i++] = (char) 0xFF;
 		}
 	}

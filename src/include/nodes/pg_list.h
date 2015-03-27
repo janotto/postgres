@@ -27,7 +27,7 @@
  * always be so; try to be careful to maintain the distinction.)
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/pg_list.h
@@ -73,32 +73,32 @@ struct ListCell
  * them as macros, since we want to avoid double-evaluation of macro
  * arguments. Therefore, we implement them using static inline functions
  * if supported by the compiler, or as regular functions otherwise.
+ * See STATIC_IF_INLINE in c.h.
  */
-#ifdef USE_INLINE
-
-static inline ListCell *
+#ifndef PG_USE_INLINE
+extern ListCell *list_head(const List *l);
+extern ListCell *list_tail(List *l);
+extern int	list_length(const List *l);
+#endif   /* PG_USE_INLINE */
+#if defined(PG_USE_INLINE) || defined(PG_LIST_INCLUDE_DEFINITIONS)
+STATIC_IF_INLINE ListCell *
 list_head(const List *l)
 {
 	return l ? l->head : NULL;
 }
 
-static inline ListCell *
+STATIC_IF_INLINE ListCell *
 list_tail(List *l)
 {
 	return l ? l->tail : NULL;
 }
 
-static inline int
+STATIC_IF_INLINE int
 list_length(const List *l)
 {
 	return l ? l->length : 0;
 }
-#else
-
-extern ListCell *list_head(const List *l);
-extern ListCell *list_tail(List *l);
-extern int	list_length(const List *l);
-#endif   /* USE_INLINE */
+#endif   /*-- PG_USE_INLINE || PG_LIST_INCLUDE_DEFINITIONS */
 
 /*
  * NB: There is an unfortunate legacy from a previous incarnation of
@@ -206,6 +206,7 @@ extern List *lcons_oid(Oid datum, List *list);
 extern List *list_concat(List *list1, List *list2);
 extern List *list_truncate(List *list, int new_size);
 
+extern ListCell *list_nth_cell(const List *list, int n);
 extern void *list_nth(const List *list, int n);
 extern int	list_nth_int(const List *list, int n);
 extern Oid	list_nth_oid(const List *list, int n);

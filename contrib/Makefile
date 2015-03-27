@@ -16,7 +16,6 @@ SUBDIRS = \
 		dblink		\
 		dict_int	\
 		dict_xsyn	\
-		dummy_seclabel	\
 		earthdistance	\
 		file_fdw	\
 		fuzzystrmatch	\
@@ -32,9 +31,11 @@ SUBDIRS = \
 		pg_archivecleanup \
 		pg_buffercache	\
 		pg_freespacemap \
+		pg_prewarm	\
 		pg_standby	\
 		pg_stat_statements \
 		pg_test_fsync	\
+		pg_test_timing	\
 		pg_trgm		\
 		pg_upgrade	\
 		pg_upgrade_support \
@@ -42,11 +43,13 @@ SUBDIRS = \
 		pgcrypto	\
 		pgrowlocks	\
 		pgstattuple	\
+		pg_xlogdump	\
+		postgres_fdw	\
 		seg		\
 		spi		\
 		tablefunc	\
 		tcn		\
-		test_parser	\
+		test_decoding	\
 		tsearch2	\
 		unaccent	\
 		vacuumlo
@@ -57,7 +60,7 @@ else
 ALWAYS_SUBDIRS += sslinfo
 endif
 
-ifeq ($(with_ossp_uuid),yes)
+ifneq ($(with_uuid),no)
 SUBDIRS += uuid-ossp
 else
 ALWAYS_SUBDIRS += uuid-ossp

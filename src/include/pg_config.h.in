@@ -48,9 +48,6 @@
 /* Define to the default TCP port number as a string constant. */
 #undef DEF_PGPORT_STR
 
-/* Define to 1 to enable DTrace support. (--enable-dtrace) */
-#undef ENABLE_DTRACE
-
 /* Define to build with GSSAPI support. (--with-gssapi) */
 #undef ENABLE_GSS
 
@@ -77,9 +74,6 @@
    reference if 'false' */
 #undef FLOAT8PASSBYVAL
 
-/* Define to 1 if getpwuid_r() takes a 5th argument. */
-#undef GETPWUID_R_5ARG
-
 /* Define to 1 if gettimeofday() takes only 1 argument. */
 #undef GETTIMEOFDAY_1ARG
 
@@ -89,6 +83,12 @@
 
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
+
+/* Define to 1 if you want to use atomics if available. */
+#undef HAVE_ATOMICS
+
+/* Define to 1 if you have the <atomic.h> header file. */
+#undef HAVE_ATOMIC_H
 
 /* Define to 1 if you have the `cbrt' function. */
 #undef HAVE_CBRT
@@ -149,12 +149,6 @@
 /* Define to 1 if you have the <editline/readline.h> header file. */
 #undef HAVE_EDITLINE_READLINE_H
 
-/* Define to 1 if you have the `ERR_set_mark' function. */
-#undef HAVE_ERR_SET_MARK
-
-/* Define to 1 if you have the `fcvt' function. */
-#undef HAVE_FCVT
-
 /* Define to 1 if you have the `fdatasync' function. */
 #undef HAVE_FDATASYNC
 
@@ -182,8 +176,24 @@
 /* Define to 1 if your compiler understands __FUNCTION__. */
 #undef HAVE_FUNCNAME__FUNCTION
 
+/* Define to 1 if you have __atomic_compare_exchange_n(int *, int *, int). */
+#undef HAVE_GCC__ATOMIC_INT32_CAS
+
+/* Define to 1 if you have __atomic_compare_exchange_n(int64 *, int *, int64).
+   */
+#undef HAVE_GCC__ATOMIC_INT64_CAS
+
+/* Define to 1 if you have __sync_lock_test_and_set(char *) and friends. */
+#undef HAVE_GCC__SYNC_CHAR_TAS
+
+/* Define to 1 if you have __sync_compare_and_swap(int *, int, int). */
+#undef HAVE_GCC__SYNC_INT32_CAS
+
 /* Define to 1 if you have __sync_lock_test_and_set(int *) and friends. */
-#undef HAVE_GCC_INT_ATOMICS
+#undef HAVE_GCC__SYNC_INT32_TAS
+
+/* Define to 1 if you have __sync_compare_and_swap(int64 *, int64, int64). */
+#undef HAVE_GCC__SYNC_INT64_CAS
 
 /* Define to 1 if you have the `getaddrinfo' function. */
 #undef HAVE_GETADDRINFO
@@ -269,27 +279,6 @@
 /* Define to 1 if you have isinf(). */
 #undef HAVE_ISINF
 
-/* Define to 1 if you have the <kernel/image.h> header file. */
-#undef HAVE_KERNEL_IMAGE_H
-
-/* Define to 1 if you have the <kernel/OS.h> header file. */
-#undef HAVE_KERNEL_OS_H
-
-/* Define to 1 if `e_data' is member of `krb5_error'. */
-#undef HAVE_KRB5_ERROR_E_DATA
-
-/* Define to 1 if `text.data' is member of `krb5_error'. */
-#undef HAVE_KRB5_ERROR_TEXT_DATA
-
-/* Define to 1 if you have krb5_free_unparsed_name. */
-#undef HAVE_KRB5_FREE_UNPARSED_NAME
-
-/* Define to 1 if `client' is member of `krb5_ticket'. */
-#undef HAVE_KRB5_TICKET_CLIENT
-
-/* Define to 1 if `enc_part2' is member of `krb5_ticket'. */
-#undef HAVE_KRB5_TICKET_ENC_PART2
-
 /* Define to 1 if you have the <langinfo.h> header file. */
 #undef HAVE_LANGINFO_H
 
@@ -348,6 +337,12 @@
 /* Define to 1 if `long long int' works and is 64 bits. */
 #undef HAVE_LONG_LONG_INT_64
 
+/* Define to 1 if you have the <mbarrier.h> header file. */
+#undef HAVE_MBARRIER_H
+
+/* Define to 1 if you have the `mbstowcs_l' function. */
+#undef HAVE_MBSTOWCS_L
+
 /* Define to 1 if you have the `memmove' function. */
 #undef HAVE_MEMMOVE
 
@@ -356,6 +351,9 @@
 
 /* Define to 1 if the system has the type `MINIDUMP_TYPE'. */
 #undef HAVE_MINIDUMP_TYPE
+
+/* Define to 1 if you have the `mkdtemp' function. */
+#undef HAVE_MKDTEMP
 
 /* Define to 1 if you have the <netinet/in.h> header file. */
 #undef HAVE_NETINET_IN_H
@@ -393,8 +391,8 @@
 /* Define to 1 if the PS_STRINGS thing exists. */
 #undef HAVE_PS_STRINGS
 
-/* Define if you have POSIX threads libraries and header files. */
-#undef HAVE_PTHREAD
+/* Define to 1 if you have the `pthread_is_threaded_np' function. */
+#undef HAVE_PTHREAD_IS_THREADED_NP
 
 /* Define to 1 if you have the <pwd.h> header file. */
 #undef HAVE_PWD_H
@@ -436,6 +434,9 @@
 /* Define to 1 if you have the `setsid' function. */
 #undef HAVE_SETSID
 
+/* Define to 1 if you have the `shm_open' function. */
+#undef HAVE_SHM_OPEN
+
 /* Define to 1 if you have the `sigprocmask' function. */
 #undef HAVE_SIGPROCMASK
 
@@ -454,23 +455,20 @@
 /* Define to 1 if you have the `srandom' function. */
 #undef HAVE_SRANDOM
 
+/* Define to 1 if you have the `SSL_get_current_compression' function. */
+#undef HAVE_SSL_GET_CURRENT_COMPRESSION
+
 /* Define to 1 if you have the <stdint.h> header file. */
 #undef HAVE_STDINT_H
 
 /* Define to 1 if you have the <stdlib.h> header file. */
 #undef HAVE_STDLIB_H
 
-/* Define to 1 if you have the `strdup' function. */
-#undef HAVE_STRDUP
-
 /* Define to 1 if you have the `strerror' function. */
 #undef HAVE_STRERROR
 
 /* Define to 1 if you have the `strerror_r' function. */
 #undef HAVE_STRERROR_R
-
-/* Define to 1 if cpp supports the ANSI # stringizing operator. */
-#undef HAVE_STRINGIZE
 
 /* Define to 1 if you have the <strings.h> header file. */
 #undef HAVE_STRINGS_H
@@ -484,17 +482,11 @@
 /* Define to 1 if you have the `strlcpy' function. */
 #undef HAVE_STRLCPY
 
-/* Define to 1 if you have the `strtol' function. */
-#undef HAVE_STRTOL
-
 /* Define to 1 if you have the `strtoll' function. */
 #undef HAVE_STRTOLL
 
 /* Define to 1 if you have the `strtoq' function. */
 #undef HAVE_STRTOQ
-
-/* Define to 1 if you have the `strtoul' function. */
-#undef HAVE_STRTOUL
 
 /* Define to 1 if you have the `strtoull' function. */
 #undef HAVE_STRTOULL
@@ -511,38 +503,32 @@
 /* Define to 1 if the system has the type `struct option'. */
 #undef HAVE_STRUCT_OPTION
 
-/* Define to 1 if `sa_len' is member of `struct sockaddr'. */
+/* Define to 1 if `sa_len' is a member of `struct sockaddr'. */
 #undef HAVE_STRUCT_SOCKADDR_SA_LEN
 
 /* Define to 1 if the system has the type `struct sockaddr_storage'. */
 #undef HAVE_STRUCT_SOCKADDR_STORAGE
 
-/* Define to 1 if `ss_family' is member of `struct sockaddr_storage'. */
+/* Define to 1 if `ss_family' is a member of `struct sockaddr_storage'. */
 #undef HAVE_STRUCT_SOCKADDR_STORAGE_SS_FAMILY
 
-/* Define to 1 if `ss_len' is member of `struct sockaddr_storage'. */
+/* Define to 1 if `ss_len' is a member of `struct sockaddr_storage'. */
 #undef HAVE_STRUCT_SOCKADDR_STORAGE_SS_LEN
 
-/* Define to 1 if `__ss_family' is member of `struct sockaddr_storage'. */
+/* Define to 1 if `__ss_family' is a member of `struct sockaddr_storage'. */
 #undef HAVE_STRUCT_SOCKADDR_STORAGE___SS_FAMILY
 
-/* Define to 1 if `__ss_len' is member of `struct sockaddr_storage'. */
+/* Define to 1 if `__ss_len' is a member of `struct sockaddr_storage'. */
 #undef HAVE_STRUCT_SOCKADDR_STORAGE___SS_LEN
 
-/* Define to 1 if the system has the type `struct sockaddr_un'. */
-#undef HAVE_STRUCT_SOCKADDR_UN
-
-/* Define to 1 if `tm_zone' is member of `struct tm'. */
+/* Define to 1 if `tm_zone' is a member of `struct tm'. */
 #undef HAVE_STRUCT_TM_TM_ZONE
-
-/* Define to 1 if you have the <SupportDefs.h> header file. */
-#undef HAVE_SUPPORTDEFS_H
 
 /* Define to 1 if you have the `symlink' function. */
 #undef HAVE_SYMLINK
 
-/* Define to 1 if you have the `sysconf' function. */
-#undef HAVE_SYSCONF
+/* Define to 1 if you have the `sync_file_range' function. */
+#undef HAVE_SYNC_FILE_RANGE
 
 /* Define to 1 if you have the syslog interface. */
 #undef HAVE_SYSLOG
@@ -632,6 +618,9 @@
 /* Define to 1 if you have the `unsetenv' function. */
 #undef HAVE_UNSETENV
 
+/* Define to 1 if the system has the type `unsigned long long int'. */
+#undef HAVE_UNSIGNED_LONG_LONG_INT
+
 /* Define to 1 if you have the `utime' function. */
 #undef HAVE_UTIME
 
@@ -641,14 +630,23 @@
 /* Define to 1 if you have the <utime.h> header file. */
 #undef HAVE_UTIME_H
 
+/* Define to 1 if you have BSD UUID support. */
+#undef HAVE_UUID_BSD
+
+/* Define to 1 if you have E2FS UUID support. */
+#undef HAVE_UUID_E2FS
+
 /* Define to 1 if you have the <uuid.h> header file. */
 #undef HAVE_UUID_H
 
+/* Define to 1 if you have OSSP UUID support. */
+#undef HAVE_UUID_OSSP
+
+/* Define to 1 if you have the <uuid/uuid.h> header file. */
+#undef HAVE_UUID_UUID_H
+
 /* Define to 1 if you have the `vsnprintf' function. */
 #undef HAVE_VSNPRINTF
-
-/* Define to 1 if you have the `waitpid' function. */
-#undef HAVE_WAITPID
 
 /* Define to 1 if you have the <wchar.h> header file. */
 #undef HAVE_WCHAR_H
@@ -665,14 +663,26 @@
 /* Define to 1 if you have the <winldap.h> header file. */
 #undef HAVE_WINLDAP_H
 
-/* Define to 1 if your libxml has xmlStructuredErrorContext. */
-#undef HAVE_XMLSTRUCTUREDERRORCONTEXT
+/* Define to 1 if your compiler understands __builtin_bswap32. */
+#undef HAVE__BUILTIN_BSWAP32
 
-/* Define to the appropriate snprintf format for 64-bit ints. */
-#undef INT64_FORMAT
+/* Define to 1 if your compiler understands __builtin_constant_p. */
+#undef HAVE__BUILTIN_CONSTANT_P
 
-/* Define to build with Kerberos 5 support. (--with-krb5) */
-#undef KRB5
+/* Define to 1 if your compiler understands __builtin_types_compatible_p. */
+#undef HAVE__BUILTIN_TYPES_COMPATIBLE_P
+
+/* Define to 1 if your compiler understands __builtin_unreachable. */
+#undef HAVE__BUILTIN_UNREACHABLE
+
+/* Define to 1 if your compiler understands _Static_assert. */
+#undef HAVE__STATIC_ASSERT
+
+/* Define to 1 if your compiler understands __VA_ARGS__ in macros. */
+#undef HAVE__VA_ARGS
+
+/* Define to the appropriate snprintf length modifier for 64-bit ints. */
+#undef INT64_MODIFIER
 
 /* Define to 1 if `locale_t' requires <xlocale.h>. */
 #undef LOCALE_T_IN_XLOCALE
@@ -695,15 +705,31 @@
 /* Define to the one symbol short name of this package. */
 #undef PACKAGE_TARNAME
 
+/* Define to the home page for this package. */
+#undef PACKAGE_URL
+
 /* Define to the version of this package. */
 #undef PACKAGE_VERSION
 
-/* Define to the name of the default PostgreSQL service principal in Kerberos.
-   (--with-krb-srvnam=NAME) */
+/* Define to the name of a signed 128-bit integer type. */
+#undef PG_INT128_TYPE
+
+/* Define to the name of a signed 64-bit integer type. */
+#undef PG_INT64_TYPE
+
+/* Define to the name of the default PostgreSQL service principal in Kerberos
+   (GSSAPI). (--with-krb-srvnam=NAME) */
 #undef PG_KRB_SRVNAM
 
 /* PostgreSQL major version as a string */
 #undef PG_MAJORVERSION
+
+/* Define to gnu_printf if compiler supports it, else printf. */
+#undef PG_PRINTF_ATTRIBUTE
+
+/* Define to 1 if "static inline" works without unwanted warnings from
+   compilations where static inline functions are defined but not called. */
+#undef PG_USE_INLINE
 
 /* PostgreSQL version as a string */
 #undef PG_VERSION
@@ -717,10 +743,6 @@
 /* Define to 1 to allow profiling output to be saved separately for each
    process. */
 #undef PROFILE_PID_DIR
-
-/* Define to the necessary symbol if this constant uses a non-standard name on
-   your system. */
-#undef PTHREAD_CREATE_JOINABLE
 
 /* RELSEG_SIZE is the maximum number of blocks allowed in one disk file. Thus,
    the maximum size of a single file is RELSEG_SIZE * BLCKSZ; relations bigger
@@ -756,9 +778,6 @@
 /* Define to 1 if your <sys/time.h> declares `struct tm'. */
 #undef TM_IN_SYS_TIME
 
-/* Define to the appropriate snprintf format for unsigned 64-bit ints. */
-#undef UINT64_FORMAT
-
 /* Define to 1 to build with assertion checks. (--enable-cassert) */
 #undef USE_ASSERT_CHECKING
 
@@ -772,10 +791,6 @@
 /* Define to 1 if you want float8, int8, etc values to be passed by value.
    (--enable-float8-byval) */
 #undef USE_FLOAT8_BYVAL
-
-/* Define to 1 if "static inline" works without unwanted warnings from
-   compilations where static inline functions are defined but not called. */
-#undef USE_INLINE
 
 /* Define to 1 if you want 64-bit integer timestamp and interval support.
    (--enable-integer-datetimes) */
@@ -794,14 +809,14 @@
 /* Define to select named POSIX semaphores. */
 #undef USE_NAMED_POSIX_SEMAPHORES
 
+/* Define to build with OpenSSL support. (--with-openssl) */
+#undef USE_OPENSSL
+
 /* Define to 1 to build with PAM support. (--with-pam) */
 #undef USE_PAM
 
 /* Use replacement snprintf() functions. */
 #undef USE_REPL_SNPRINTF
-
-/* Define to build with (Open)SSL support. (--with-openssl) */
-#undef USE_SSL
 
 /* Define to select SysV-style semaphores. */
 #undef USE_SYSV_SEMAPHORES
@@ -842,6 +857,8 @@
    XLOG_BLCKSZ). Changing XLOG_SEG_SIZE requires an initdb. */
 #undef XLOG_SEG_SIZE
 
+
+
 /* Number of bits in a file offset, on hosts where this is settable. */
 #undef _FILE_OFFSET_BITS
 
@@ -850,9 +867,6 @@
 
 /* Define for large files, on AIX-style hosts. */
 #undef _LARGE_FILES
-
-/* Define to empty if `const' does not conform to ANSI C. */
-#undef const
 
 /* Define to `__inline__' or `__inline' if that's what the C compiler
    calls it, or to nothing if 'inline' is not supported under any name.  */
@@ -870,7 +884,3 @@
 /* Define to the type of an unsigned integer type wide enough to hold a
    pointer, if such a type exists, and if the system does not define it. */
 #undef uintptr_t
-
-/* Define to empty if the keyword `volatile' does not work. Warning: valid
-   code using `volatile' can become incorrect without. Disable with care. */
-#undef volatile

@@ -4,7 +4,7 @@
  *	  internal structures for hash joins
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/executor/hashjoin.h
@@ -41,7 +41,7 @@
  * If nbatch > 1 then tuples that don't belong in first batch get saved
  * into inner-batch temp files. The same statements apply for the
  * first scan of the outer relation, except we write tuples to outer-batch
- * temp files.	After finishing the first scan, we do the following for
+ * temp files.  After finishing the first scan, we do the following for
  * each remaining batch:
  *	1. Read tuples from inner batch file, load into hash buckets.
  *	2. Read tuples from outer batch file, match to hash buckets and output.
@@ -102,11 +102,34 @@ typedef struct HashSkewBucket
 #define SKEW_WORK_MEM_PERCENT  2
 #define SKEW_MIN_OUTER_FRACTION  0.01
 
+/*
+ * To reduce palloc overhead, the HashJoinTuples for the current batch are
+ * packed in 32kB buffers instead of pallocing each tuple individually.
+ */
+typedef struct HashMemoryChunkData
+{
+	int			ntuples;	/* number of tuples stored in this chunk */
+	size_t		maxlen;		/* size of the buffer holding the tuples */
+	size_t		used;		/* number of buffer bytes already used */
+
+	struct HashMemoryChunkData *next; /* pointer to the next chunk (linked list) */
+
+	char		data[FLEXIBLE_ARRAY_MEMBER];	/* buffer allocated at the end */
+} HashMemoryChunkData;
+
+typedef struct HashMemoryChunkData *HashMemoryChunk;
+
+#define HASH_CHUNK_SIZE			(32 * 1024L)
+#define HASH_CHUNK_THRESHOLD	(HASH_CHUNK_SIZE / 4)
 
 typedef struct HashJoinTableData
 {
 	int			nbuckets;		/* # buckets in the in-memory hash table */
 	int			log2_nbuckets;	/* its log2 (nbuckets must be a power of 2) */
+
+	int			nbuckets_original;	/* # buckets when starting the first hash */
+	int			nbuckets_optimal;	/* optimal # buckets (per batch) */
+	int			log2_nbuckets_optimal;	/* same as log2_nbuckets optimal */
 
 	/* buckets[i] is head of list of tuples in i'th in-memory bucket */
 	struct HashJoinTupleData **buckets;
@@ -129,10 +152,11 @@ typedef struct HashJoinTableData
 	bool		growEnabled;	/* flag to shut off nbatch increases */
 
 	double		totalTuples;	/* # tuples obtained from inner plan */
+	double		skewTuples;		/* # tuples inserted into skew tuples */
 
 	/*
 	 * These arrays are allocated for the life of the hash join, but only if
-	 * nbatch > 1.	A file is opened only when we first write a tuple into it
+	 * nbatch > 1.  A file is opened only when we first write a tuple into it
 	 * (otherwise its pointer remains NULL).  Note that the zero'th array
 	 * elements never get used, since we will process rather than dump out any
 	 * tuples of batch zero.
@@ -157,6 +181,9 @@ typedef struct HashJoinTableData
 
 	MemoryContext hashCxt;		/* context for whole-hash-join storage */
 	MemoryContext batchCxt;		/* context for this-batch-only storage */
+
+	/* used for dense allocation of tuples (into linked chunks) */
+	HashMemoryChunk chunks;		/*  one list for the whole batch */
 }	HashJoinTableData;
 
 #endif   /* HASHJOIN_H */

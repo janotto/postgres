@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="SQL-ALTERCOLLATION">
+ <indexterm zone="sql-altercollation">
+  <primary>ALTER COLLATION</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle>ALTER COLLATION</refentrytitle>
   <manvolnum>7</manvolnum>
@@ -15,14 +19,10 @@ PostgreSQL documentation
   <refpurpose>change the definition of a collation</refpurpose>
  </refnamediv>
 
- <indexterm zone="sql-altercollation">
-  <primary>ALTER COLLATION</primary>
- </indexterm>
-
  <refsynopsisdiv>
 <synopsis>
 ALTER COLLATION <replaceable>name</replaceable> RENAME TO <replaceable>new_name</replaceable>
-ALTER COLLATION <replaceable>name</replaceable> OWNER TO <replaceable>new_owner</replaceable>
+ALTER COLLATION <replaceable>name</replaceable> OWNER TO { <replaceable>new_owner</replaceable> | CURRENT_USER | SESSION_USER }
 ALTER COLLATION <replaceable>name</replaceable> SET SCHEMA <replaceable>new_schema</replaceable>
 </synopsis>
  </refsynopsisdiv>

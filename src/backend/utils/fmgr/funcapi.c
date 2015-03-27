@@ -4,7 +4,7 @@
  *	  Utility and convenience functions for fmgr functions that return
  *	  sets and/or composite types.
  *
- * Copyright (c) 2002-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2015, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *	  src/backend/utils/fmgr/funcapi.c
@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -135,7 +136,7 @@ per_MultiFuncCall(PG_FUNCTION_ARGS)
 	 * FuncCallContext is pointing to it), but in most usage patterns the
 	 * tuples stored in it will be in the function's per-tuple context. So at
 	 * the beginning of each call, the Slot will hold a dangling pointer to an
-	 * already-recycled tuple.	We clear it out here.
+	 * already-recycled tuple.  We clear it out here.
 	 *
 	 * Note: use of retval->slot is obsolete as of 8.0, and we expect that it
 	 * will always be NULL.  This is just here for backwards compatibility in
@@ -191,13 +192,13 @@ shutdown_MultiFuncCall(Datum arg)
  *		Given a function's call info record, determine the kind of datatype
  *		it is supposed to return.  If resultTypeId isn't NULL, *resultTypeId
  *		receives the actual datatype OID (this is mainly useful for scalar
- *		result types).	If resultTupleDesc isn't NULL, *resultTupleDesc
+ *		result types).  If resultTupleDesc isn't NULL, *resultTupleDesc
  *		receives a pointer to a TupleDesc when the result is of a composite
  *		type, or NULL when it's a scalar result.
  *
  * One hard case that this handles is resolution of actual rowtypes for
  * functions returning RECORD (from either the function's OUT parameter
- * list, or a ReturnSetInfo context node).	TYPEFUNC_RECORD is returned
+ * list, or a ReturnSetInfo context node).  TYPEFUNC_RECORD is returned
  * only when we couldn't resolve the actual rowtype for lack of information.
  *
  * The other hard case that this handles is resolution of polymorphism.
@@ -280,7 +281,7 @@ get_func_result_type(Oid functionId,
 /*
  * internal_get_result_type -- workhorse code implementing all the above
  *
- * funcid must always be supplied.	call_expr and rsinfo can be NULL if not
+ * funcid must always be supplied.  call_expr and rsinfo can be NULL if not
  * available.  We will return TYPEFUNC_RECORD, and store NULL into
  * *resultTupleDesc, if we cannot deduce the complete result rowtype from
  * the available information.
@@ -447,7 +448,7 @@ resolve_polymorphic_tupdesc(TupleDesc tupdesc, oidvector *declared_args,
 		return true;
 
 	/*
-	 * Otherwise, extract actual datatype(s) from input arguments.	(We assume
+	 * Otherwise, extract actual datatype(s) from input arguments.  (We assume
 	 * the parser already validated consistency of the arguments.)
 	 */
 	if (!call_expr)
@@ -490,9 +491,9 @@ resolve_polymorphic_tupdesc(TupleDesc tupdesc, oidvector *declared_args,
 												   ANYARRAYOID);
 		if (OidIsValid(anyrange_type))
 		{
-			Oid		subtype = resolve_generic_type(ANYELEMENTOID,
-												   anyrange_type,
-												   ANYRANGEOID);
+			Oid			subtype = resolve_generic_type(ANYELEMENTOID,
+													   anyrange_type,
+													   ANYRANGEOID);
 
 			/* check for inconsistent array and range results */
 			if (OidIsValid(anyelement_type) && anyelement_type != subtype)
@@ -524,8 +525,8 @@ resolve_polymorphic_tupdesc(TupleDesc tupdesc, oidvector *declared_args,
 	/*
 	 * Identify the collation to use for polymorphic OUT parameters. (It'll
 	 * necessarily be the same for both anyelement and anyarray.)  Note that
-	 * range types are not collatable, so any possible internal collation of
-	 * a range type is not considered here.
+	 * range types are not collatable, so any possible internal collation of a
+	 * range type is not considered here.
 	 */
 	if (OidIsValid(anyelement_type))
 		anycollation = get_typcollation(anyelement_type);
@@ -687,9 +688,9 @@ resolve_polymorphic_argtypes(int numargs, Oid *argtypes, char *argmodes,
 												   ANYARRAYOID);
 		if (OidIsValid(anyrange_type))
 		{
-			Oid		subtype = resolve_generic_type(ANYELEMENTOID,
-												   anyrange_type,
-												   ANYRANGEOID);
+			Oid			subtype = resolve_generic_type(ANYELEMENTOID,
+													   anyrange_type,
+													   ANYRANGEOID);
 
 			/* check for inconsistent array and range results */
 			if (OidIsValid(anyelement_type) && anyelement_type != subtype)
@@ -1204,8 +1205,7 @@ build_function_result_tupdesc_d(Datum proallargtypes,
 		if (pname == NULL || pname[0] == '\0')
 		{
 			/* Parameter is not named, so gin up a column name */
-			pname = (char *) palloc(32);
-			snprintf(pname, 32, "column%d", numoutargs + 1);
+			pname = psprintf("column%d", numoutargs + 1);
 		}
 		outargnames[numoutargs] = pname;
 		numoutargs++;

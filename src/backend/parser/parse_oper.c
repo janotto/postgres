@@ -3,7 +3,7 @@
  * parse_oper.c
  *		handle operator things for parser
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,6 +15,7 @@
 
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_type.h"
 #include "lib/stringinfo.h"
@@ -74,8 +75,9 @@ static const char *op_signature_string(List *op, char oprkind,
 static void op_error(ParseState *pstate, List *op, char oprkind,
 		 Oid arg1, Oid arg2,
 		 FuncDetailCode fdresult, int location);
-static bool make_oper_cache_key(OprCacheKey *key, List *opname,
-					Oid ltypeId, Oid rtypeId);
+static bool make_oper_cache_key(ParseState *pstate, OprCacheKey *key,
+					List *opname, Oid ltypeId, Oid rtypeId,
+					int location);
 static Oid	find_oper_cache_entry(OprCacheKey *key);
 static void make_oper_cache_entry(OprCacheKey *key, Oid opr_oid);
 static void InvalidateOprCacheCallBack(Datum arg, int cacheid, uint32 hashvalue);
@@ -147,12 +149,12 @@ LookupOperNameTypeNames(ParseState *pstate, List *opername,
 	if (oprleft == NULL)
 		leftoid = InvalidOid;
 	else
-		leftoid = typenameTypeId(pstate, oprleft);
+		leftoid = LookupTypeNameOid(pstate, oprleft, noError);
 
 	if (oprright == NULL)
 		rightoid = InvalidOid;
 	else
-		rightoid = typenameTypeId(pstate, oprright);
+		rightoid = LookupTypeNameOid(pstate, oprright, noError);
 
 	return LookupOperName(pstate, opername, leftoid, rightoid,
 						  noError, location);
@@ -382,7 +384,8 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 	/*
 	 * Try to find the mapping in the lookaside cache.
 	 */
-	key_ok = make_oper_cache_key(&key, opname, ltypeId, rtypeId);
+	key_ok = make_oper_cache_key(pstate, &key, opname, ltypeId, rtypeId, location);
+
 	if (key_ok)
 	{
 		operOid = find_oper_cache_entry(&key);
@@ -406,7 +409,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
 		FuncCandidateList clist;
 
 		/* Get binary operators of given name */
-		clist = OpernameGetCandidates(opname, 'b');
+		clist = OpernameGetCandidates(opname, 'b', false);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -446,7 +449,7 @@ oper(ParseState *pstate, List *opname, Oid ltypeId, Oid rtypeId,
  *
  *	This is tighter than oper() because it will not return an operator that
  *	requires coercion of the input datatypes (but binary-compatible operators
- *	are accepted).	Otherwise, the semantics are the same.
+ *	are accepted).  Otherwise, the semantics are the same.
  */
 Operator
 compatible_oper(ParseState *pstate, List *op, Oid arg1, Oid arg2,
@@ -528,7 +531,8 @@ right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 	/*
 	 * Try to find the mapping in the lookaside cache.
 	 */
-	key_ok = make_oper_cache_key(&key, op, arg, InvalidOid);
+	key_ok = make_oper_cache_key(pstate, &key, op, arg, InvalidOid, location);
+
 	if (key_ok)
 	{
 		operOid = find_oper_cache_entry(&key);
@@ -552,7 +556,7 @@ right_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		FuncCandidateList clist;
 
 		/* Get postfix operators of given name */
-		clist = OpernameGetCandidates(op, 'r');
+		clist = OpernameGetCandidates(op, 'r', false);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -606,7 +610,8 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 	/*
 	 * Try to find the mapping in the lookaside cache.
 	 */
-	key_ok = make_oper_cache_key(&key, op, InvalidOid, arg);
+	key_ok = make_oper_cache_key(pstate, &key, op, InvalidOid, arg, location);
+
 	if (key_ok)
 	{
 		operOid = find_oper_cache_entry(&key);
@@ -630,7 +635,7 @@ left_oper(ParseState *pstate, List *op, Oid arg, bool noError, int location)
 		FuncCandidateList clist;
 
 		/* Get prefix operators of given name */
-		clist = OpernameGetCandidates(op, 'l');
+		clist = OpernameGetCandidates(op, 'l', false);
 
 		/* No operators found? Then fail... */
 		if (clist != NULL)
@@ -979,7 +984,7 @@ make_scalar_array_op(ParseState *pstate, List *opname,
  * mapping is pretty expensive to compute, especially for ambiguous operators;
  * this is mainly because there are a *lot* of instances of popular operator
  * names such as "=", and we have to check each one to see which is the
- * best match.	So once we have identified the correct mapping, we save it
+ * best match.  So once we have identified the correct mapping, we save it
  * in a cache that need only be flushed on pg_operator or pg_cast change.
  * (pg_cast must be considered because changes in the set of implicit casts
  * affect the set of applicable operators for any given input datatype.)
@@ -1005,9 +1010,13 @@ static HTAB *OprCacheHash = NULL;
  *
  * Returns TRUE if successful, FALSE if the search_path overflowed
  * (hence no caching is possible).
+ *
+ * pstate/location are used only to report the error position; pass NULL/-1
+ * if not available.
  */
 static bool
-make_oper_cache_key(OprCacheKey *key, List *opname, Oid ltypeId, Oid rtypeId)
+make_oper_cache_key(ParseState *pstate, OprCacheKey *key, List *opname,
+					Oid ltypeId, Oid rtypeId, int location)
 {
 	char	   *schemaname;
 	char	   *opername;
@@ -1025,8 +1034,12 @@ make_oper_cache_key(OprCacheKey *key, List *opname, Oid ltypeId, Oid rtypeId)
 
 	if (schemaname)
 	{
+		ParseCallbackState pcbstate;
+
 		/* search only in exact schema given */
-		key->search_path[0] = LookupExplicitNamespace(schemaname);
+		setup_parser_errposition_callback(&pcbstate, pstate, location);
+		key->search_path[0] = LookupExplicitNamespace(schemaname, false);
+		cancel_parser_errposition_callback(&pcbstate);
 	}
 	else
 	{
@@ -1058,9 +1071,8 @@ find_oper_cache_entry(OprCacheKey *key)
 		MemSet(&ctl, 0, sizeof(ctl));
 		ctl.keysize = sizeof(OprCacheKey);
 		ctl.entrysize = sizeof(OprCacheEntry);
-		ctl.hash = tag_hash;
 		OprCacheHash = hash_create("Operator lookup cache", 256,
-								   &ctl, HASH_ELEM | HASH_FUNCTION);
+								   &ctl, HASH_ELEM | HASH_BLOBS);
 
 		/* Arrange to flush cache on pg_operator and pg_cast changes */
 		CacheRegisterSyscacheCallback(OPERNAMENSP,

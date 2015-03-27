@@ -4,7 +4,7 @@
  *	  Support for finding the values associated with Param nodes.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -27,7 +27,7 @@
  *
  * Note: the intent of this function is to make a static, self-contained
  * set of parameter values.  If dynamic parameter hooks are present, we
- * intentionally do not copy them into the result.	Rather, we forcibly
+ * intentionally do not copy them into the result.  Rather, we forcibly
  * instantiate all available parameter values and copy the datum values.
  */
 ParamListInfo
@@ -40,9 +40,8 @@ copyParamList(ParamListInfo from)
 	if (from == NULL || from->numParams <= 0)
 		return NULL;
 
-	/* sizeof(ParamListInfoData) includes the first array element */
-	size = sizeof(ParamListInfoData) +
-		(from->numParams - 1) * sizeof(ParamExternData);
+	size = offsetof(ParamListInfoData, params) +
+		from->numParams * sizeof(ParamExternData);
 
 	retval = (ParamListInfo) palloc(size);
 	retval->paramFetch = NULL;

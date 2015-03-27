@@ -3,7 +3,7 @@
  * misc.c
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -20,6 +20,7 @@
 #include <math.h>
 #include <unistd.h>
 
+#include "access/sysattr.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
@@ -28,12 +29,15 @@
 #include "miscadmin.h"
 #include "parser/keywords.h"
 #include "postmaster/syslogger.h"
+#include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/lsyscache.h"
+#include "utils/ruleutils.h"
 #include "tcop/tcopprot.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/timestamp.h"
 
@@ -73,59 +77,60 @@ current_query(PG_FUNCTION_ARGS)
 
 /*
  * Send a signal to another backend.
+ *
  * The signal is delivered if the user is either a superuser or the same
  * role as the backend being signaled. For "dangerous" signals, an explicit
  * check for superuser needs to be done prior to calling this function.
  *
- * Returns 0 on success, 1 on general failure, and 2 on permission error.
- * In the event of a general failure (returncode 1), a warning message will
+ * Returns 0 on success, 1 on general failure, 2 on normal permission error
+ * and 3 if the caller needs to be a superuser.
+ *
+ * In the event of a general failure (return code 1), a warning message will
  * be emitted. For permission errors, doing that is the responsibility of
  * the caller.
  */
 #define SIGNAL_BACKEND_SUCCESS 0
 #define SIGNAL_BACKEND_ERROR 1
 #define SIGNAL_BACKEND_NOPERMISSION 2
+#define SIGNAL_BACKEND_NOSUPERUSER 3
 static int
 pg_signal_backend(int pid, int sig)
 {
-	PGPROC	   *proc;
+	PGPROC	   *proc = BackendPidGetProc(pid);
 
-	if (!superuser())
-	{
-		/*
-		 * Since the user is not superuser, check for matching roles. Trust
-		 * that BackendPidGetProc will return NULL if the pid isn't valid,
-		 * even though the check for whether it's a backend process is below.
-		 * The IsBackendPid check can't be relied on as definitive even if it
-		 * was first. The process might end between successive checks
-		 * regardless of their order. There's no way to acquire a lock on an
-		 * arbitrary process to prevent that. But since so far all the callers
-		 * of this mechanism involve some request for ending the process
-		 * anyway, that it might end on its own first is not a problem.
-		 */
-		proc = BackendPidGetProc(pid);
-
-		if (proc == NULL || proc->roleId != GetUserId())
-			return SIGNAL_BACKEND_NOPERMISSION;
-	}
-
-	if (!IsBackendPid(pid))
+	/*
+	 * BackendPidGetProc returns NULL if the pid isn't valid; but by the time
+	 * we reach kill(), a process for which we get a valid proc here might
+	 * have terminated on its own.  There's no way to acquire a lock on an
+	 * arbitrary process to prevent that. But since so far all the callers of
+	 * this mechanism involve some request for ending the process anyway, that
+	 * it might end on its own first is not a problem.
+	 */
+	if (proc == NULL)
 	{
 		/*
 		 * This is just a warning so a loop-through-resultset will not abort
-		 * if one backend terminated on it's own during the run
+		 * if one backend terminated on its own during the run.
 		 */
 		ereport(WARNING,
 				(errmsg("PID %d is not a PostgreSQL server process", pid)));
 		return SIGNAL_BACKEND_ERROR;
 	}
 
+	/* Only allow superusers to signal superuser-owned backends. */
+	if (superuser_arg(proc->roleId) && !superuser())
+		return SIGNAL_BACKEND_NOSUPERUSER;
+
+	/* Users can signal backends they have role membership in. */
+	if (!has_privs_of_role(GetUserId(), proc->roleId))
+		return SIGNAL_BACKEND_NOPERMISSION;
+
 	/*
 	 * Can the process we just validated above end, followed by the pid being
 	 * recycled for a new process, before reaching here?  Then we'd be trying
 	 * to kill the wrong thing.  Seems near impossible when sequential pid
 	 * assignment and wraparound is used.  Perhaps it could happen on a system
-	 * where pid re-use is randomized.	That race condition possibility seems
+	 * where pid re-use is randomized.  That race condition possibility seems
 	 * too unlikely to worry about.
 	 */
 
@@ -145,35 +150,51 @@ pg_signal_backend(int pid, int sig)
 }
 
 /*
- * Signal to cancel a backend process.	This is allowed if you are superuser or
- * have the same role as the process being canceled.
+ * Signal to cancel a backend process.  This is allowed if you are a member of
+ * the role whose process is being canceled.
+ *
+ * Note that only superusers can signal superuser-owned processes.
  */
 Datum
 pg_cancel_backend(PG_FUNCTION_ARGS)
 {
 	int			r = pg_signal_backend(PG_GETARG_INT32(0), SIGINT);
 
+	if (r == SIGNAL_BACKEND_NOSUPERUSER)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("must be a superuser to cancel superuser query"))));
+
 	if (r == SIGNAL_BACKEND_NOPERMISSION)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 (errmsg("must be superuser or have the same role to cancel queries running in other server processes"))));
+				 (errmsg("must be a member of the role whose query is being cancelled"))));
 
 	PG_RETURN_BOOL(r == SIGNAL_BACKEND_SUCCESS);
 }
 
 /*
- * Signal to terminate a backend process.  Only allowed by superuser.
+ * Signal to terminate a backend process.  This is allowed if you are a member
+ * of the role whose process is being terminated.
+ *
+ * Note that only superusers can signal superuser-owned processes.
  */
 Datum
 pg_terminate_backend(PG_FUNCTION_ARGS)
 {
-	if (!superuser())
+	int			r = pg_signal_backend(PG_GETARG_INT32(0), SIGTERM);
+
+	if (r == SIGNAL_BACKEND_NOSUPERUSER)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-			 errmsg("must be superuser to terminate other server processes"),
-				 errhint("You can cancel your own processes with pg_cancel_backend().")));
+				 (errmsg("must be a superuser to terminate superuser process"))));
 
-	PG_RETURN_BOOL(pg_signal_backend(PG_GETARG_INT32(0), SIGTERM) == SIGNAL_BACKEND_SUCCESS);
+	if (r == SIGNAL_BACKEND_NOPERMISSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 (errmsg("must be a member of the role whose process is being terminated"))));
+
+	PG_RETURN_BOOL(r == SIGNAL_BACKEND_SUCCESS);
 }
 
 /*
@@ -245,11 +266,6 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 
 		fctx = palloc(sizeof(ts_db_fctx));
 
-		/*
-		 * size = tablespace dirname length + dir sep char + oid + terminator
-		 */
-		fctx->location = (char *) palloc(9 + 1 + OIDCHARS + 1 +
-								   strlen(TABLESPACE_VERSION_DIRECTORY) + 1);
 		if (tablespaceOid == GLOBALTABLESPACE_OID)
 		{
 			fctx->dirdesc = NULL;
@@ -259,10 +275,10 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 		else
 		{
 			if (tablespaceOid == DEFAULTTABLESPACE_OID)
-				sprintf(fctx->location, "base");
+				fctx->location = psprintf("base");
 			else
-				sprintf(fctx->location, "pg_tblspc/%u/%s", tablespaceOid,
-						TABLESPACE_VERSION_DIRECTORY);
+				fctx->location = psprintf("pg_tblspc/%u/%s", tablespaceOid,
+										  TABLESPACE_VERSION_DIRECTORY);
 
 			fctx->dirdesc = AllocateDir(fctx->location);
 
@@ -300,9 +316,7 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 
 		/* if database subdir is empty, don't report tablespace as used */
 
-		/* size = path length + dir sep char + file name + terminator */
-		subdir = palloc(strlen(fctx->location) + 1 + strlen(de->d_name) + 1);
-		sprintf(subdir, "%s/%s", fctx->location, de->d_name);
+		subdir = psprintf("%s/%s", fctx->location, de->d_name);
 		dirdesc = AllocateDir(subdir);
 		while ((de = ReadDir(dirdesc, subdir)) != NULL)
 		{
@@ -329,22 +343,31 @@ pg_tablespace_databases(PG_FUNCTION_ARGS)
 Datum
 pg_tablespace_location(PG_FUNCTION_ARGS)
 {
-	Oid		tablespaceOid = PG_GETARG_OID(0);
-	char	sourcepath[MAXPGPATH];
-	char	targetpath[MAXPGPATH];
-	int		rllen;
+	Oid			tablespaceOid = PG_GETARG_OID(0);
+	char		sourcepath[MAXPGPATH];
+	char		targetpath[MAXPGPATH];
+	int			rllen;
 
 	/*
-	 * Return empty string for our default tablespaces
+	 * It's useful to apply this function to pg_class.reltablespace, wherein
+	 * zero means "the database's default tablespace".  So, rather than
+	 * throwing an error for zero, we choose to assume that's what is meant.
+	 */
+	if (tablespaceOid == InvalidOid)
+		tablespaceOid = MyDatabaseTableSpace;
+
+	/*
+	 * Return empty string for the cluster's default tablespaces
 	 */
 	if (tablespaceOid == DEFAULTTABLESPACE_OID ||
 		tablespaceOid == GLOBALTABLESPACE_OID)
 		PG_RETURN_TEXT_P(cstring_to_text(""));
 
 #if defined(HAVE_READLINK) || defined(WIN32)
+
 	/*
-	 * Find the location of the tablespace by reading the symbolic link that is
-	 * in pg_tblspc/<oid>.
+	 * Find the location of the tablespace by reading the symbolic link that
+	 * is in pg_tblspc/<oid>.
 	 */
 	snprintf(sourcepath, sizeof(sourcepath), "pg_tblspc/%u", tablespaceOid);
 
@@ -378,16 +401,16 @@ pg_sleep(PG_FUNCTION_ARGS)
 	float8		endtime;
 
 	/*
-	 * We break the requested sleep into segments of no more than 1 second, to
-	 * put an upper bound on how long it will take us to respond to a cancel
-	 * or die interrupt.  (Note that pg_usleep is interruptible by signals on
-	 * some platforms but not others.)	Also, this method avoids exposing
-	 * pg_usleep's upper bound on allowed delays.
+	 * We sleep using WaitLatch, to ensure that we'll wake up promptly if an
+	 * important signal (such as SIGALRM or SIGINT) arrives.  Because
+	 * WaitLatch's upper limit of delay is INT_MAX milliseconds, and the user
+	 * might ask for more than that, we sleep for at most 10 minutes and then
+	 * loop.
 	 *
 	 * By computing the intended stop time initially, we avoid accumulation of
-	 * extra delay across multiple sleeps.	This also ensures we won't delay
-	 * less than the specified time if pg_usleep is interrupted by other
-	 * signals such as SIGHUP.
+	 * extra delay across multiple sleeps.  This also ensures we won't delay
+	 * less than the specified time when WaitLatch is terminated early by a
+	 * non-query-cancelling signal such as SIGHUP.
 	 */
 
 #ifdef HAVE_INT64_TIMESTAMP
@@ -401,15 +424,22 @@ pg_sleep(PG_FUNCTION_ARGS)
 	for (;;)
 	{
 		float8		delay;
+		long		delay_ms;
 
 		CHECK_FOR_INTERRUPTS();
+
 		delay = endtime - GetNowFloat();
-		if (delay >= 1.0)
-			pg_usleep(1000000L);
+		if (delay >= 600.0)
+			delay_ms = 600000;
 		else if (delay > 0.0)
-			pg_usleep((long) ceil(delay * 1000000.0));
+			delay_ms = (long) ceil(delay * 1000.0);
 		else
 			break;
+
+		(void) WaitLatch(MyLatch,
+						 WL_LATCH_SET | WL_TIMEOUT,
+						 delay_ms);
+		ResetLatch(MyLatch);
 	}
 
 	PG_RETURN_VOID();
@@ -502,8 +532,8 @@ pg_typeof(PG_FUNCTION_ARGS)
 Datum
 pg_collation_for(PG_FUNCTION_ARGS)
 {
-	Oid typeid;
-	Oid collid;
+	Oid			typeid;
+	Oid			collid;
 
 	typeid = get_fn_expr_argtype(fcinfo->flinfo, 0);
 	if (!typeid)
@@ -518,4 +548,51 @@ pg_collation_for(PG_FUNCTION_ARGS)
 	if (!collid)
 		PG_RETURN_NULL();
 	PG_RETURN_TEXT_P(cstring_to_text(generate_collation_name(collid)));
+}
+
+
+/*
+ * pg_relation_is_updatable - determine which update events the specified
+ * relation supports.
+ *
+ * This relies on relation_is_updatable() in rewriteHandler.c, which see
+ * for additional information.
+ */
+Datum
+pg_relation_is_updatable(PG_FUNCTION_ARGS)
+{
+	Oid			reloid = PG_GETARG_OID(0);
+	bool		include_triggers = PG_GETARG_BOOL(1);
+
+	PG_RETURN_INT32(relation_is_updatable(reloid, include_triggers, NULL));
+}
+
+/*
+ * pg_column_is_updatable - determine whether a column is updatable
+ *
+ * This function encapsulates the decision about just what
+ * information_schema.columns.is_updatable actually means.  It's not clear
+ * whether deletability of the column's relation should be required, so
+ * we want that decision in C code where we could change it without initdb.
+ */
+Datum
+pg_column_is_updatable(PG_FUNCTION_ARGS)
+{
+	Oid			reloid = PG_GETARG_OID(0);
+	AttrNumber	attnum = PG_GETARG_INT16(1);
+	AttrNumber	col = attnum - FirstLowInvalidHeapAttributeNumber;
+	bool		include_triggers = PG_GETARG_BOOL(2);
+	int			events;
+
+	/* System columns are never updatable */
+	if (attnum <= 0)
+		PG_RETURN_BOOL(false);
+
+	events = relation_is_updatable(reloid, include_triggers,
+								   bms_make_singleton(col));
+
+	/* We require both updatability and deletability of the relation */
+#define REQ_EVENTS ((1 << CMD_UPDATE) | (1 << CMD_DELETE))
+
+	PG_RETURN_BOOL((events & REQ_EVENTS) == REQ_EVENTS);
 }

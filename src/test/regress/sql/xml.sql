@@ -60,6 +60,8 @@ SELECT xmlelement(name foo, xmlattributes('infinity'::timestamp as bar));
 SELECT xmlelement(name foo, xmlattributes('<>&"''' as funny, xml 'b<a/>r' as funnier));
 
 
+SELECT xmlparse(content '');
+SELECT xmlparse(content '  ');
 SELECT xmlparse(content 'abc');
 SELECT xmlparse(content '<abc>x</abc>');
 SELECT xmlparse(content '<invalidentity>&</invalidentity>');
@@ -69,6 +71,8 @@ SELECT xmlparse(content '<relativens xmlns=''relative''/>');
 SELECT xmlparse(content '<twoerrors>&idontexist;</unbalanced>');
 SELECT xmlparse(content '<nosuchprefix:tag/>');
 
+SELECT xmlparse(document '');
+SELECT xmlparse(document '   ');
 SELECT xmlparse(document 'abc');
 SELECT xmlparse(document '<abc>x</abc>');
 SELECT xmlparse(document '<invalidentity>&</abc>');
@@ -174,6 +178,8 @@ SELECT xpath(NULL, NULL) IS NULL FROM xmltest;
 SELECT xpath('', '<!-- error -->');
 SELECT xpath('//text()', '<local:data xmlns:local="http://127.0.0.1"><local:piece id="1">number one</local:piece><local:piece id="2" /></local:data>');
 SELECT xpath('//loc:piece/@id', '<local:data xmlns:local="http://127.0.0.1"><local:piece id="1">number one</local:piece><local:piece id="2" /></local:data>', ARRAY[ARRAY['loc', 'http://127.0.0.1']]);
+SELECT xpath('//loc:piece', '<local:data xmlns:local="http://127.0.0.1"><local:piece id="1">number one</local:piece><local:piece id="2" /></local:data>', ARRAY[ARRAY['loc', 'http://127.0.0.1']]);
+SELECT xpath('//loc:piece', '<local:data xmlns:local="http://127.0.0.1" xmlns="http://127.0.0.2"><local:piece id="1"><internal>number one</internal><internal2/></local:piece><local:piece id="2" /></local:data>', ARRAY[ARRAY['loc', 'http://127.0.0.1']]);
 SELECT xpath('//b', '<a>one <b>two</b> three <b>etc</b></a>');
 SELECT xpath('//text()', '<root>&lt;</root>');
 SELECT xpath('//@value', '<root value="&lt;"/>');
@@ -259,3 +265,9 @@ SELECT xpath('/*', '<nosuchprefix:tag/>');
 -- XPath deprecates relative namespaces, but they're not supposed to
 -- throw an error, only a warning.
 SELECT xpath('/*', '<relativens xmlns=''relative''/>');
+
+-- External entity references should not leak filesystem information.
+SELECT XMLPARSE(DOCUMENT '<!DOCTYPE foo [<!ENTITY c SYSTEM "/etc/passwd">]><foo>&c;</foo>');
+SELECT XMLPARSE(DOCUMENT '<!DOCTYPE foo [<!ENTITY c SYSTEM "/etc/no.such.file">]><foo>&c;</foo>');
+-- This might or might not load the requested DTD, but it mustn't throw error.
+SELECT XMLPARSE(DOCUMENT '<!DOCTYPE chapter PUBLIC "-//OASIS//DTD DocBook XML V4.1.2//EN" "http://www.oasis-open.org/docbook/xml/4.1.2/docbookx.dtd"><chapter>&nbsp;</chapter>');

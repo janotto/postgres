@@ -4,7 +4,7 @@
  *	  prototypes for tablecmds.c.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/commands/tablecmds.h
@@ -15,12 +15,15 @@
 #define TABLECMDS_H
 
 #include "access/htup.h"
+#include "catalog/dependency.h"
+#include "catalog/objectaddress.h"
 #include "nodes/parsenodes.h"
 #include "storage/lock.h"
 #include "utils/relcache.h"
 
 
-extern Oid	DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId);
+extern ObjectAddress DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
+			   ObjectAddress *typaddress);
 
 extern void RemoveRelations(DropStmt *drop);
 
@@ -34,11 +37,18 @@ extern void ATExecChangeOwner(Oid relationOid, Oid newOwnerId, bool recursing, L
 
 extern void AlterTableInternal(Oid relid, List *cmds, bool recurse);
 
-extern void AlterTableNamespace(AlterObjectSchemaStmt *stmt);
+extern Oid	AlterTableMoveAll(AlterTableMoveAllStmt *stmt);
+
+extern ObjectAddress AlterTableNamespace(AlterObjectSchemaStmt *stmt,
+					Oid *oldschema);
+
+extern void AlterTableNamespaceInternal(Relation rel, Oid oldNspOid,
+							Oid nspOid, ObjectAddresses *objsMoved);
 
 extern void AlterRelationNamespaceInternal(Relation classRel, Oid relOid,
 							   Oid oldNspOid, Oid newNspOid,
-							   bool hasDependEntry);
+							   bool hasDependEntry,
+							   ObjectAddresses *objsMoved);
 
 extern void CheckTableNotInUse(Relation rel, const char *stmt);
 
@@ -46,22 +56,22 @@ extern void ExecuteTruncate(TruncateStmt *stmt);
 
 extern void SetRelationHasSubclass(Oid relationId, bool relhassubclass);
 
-extern void renameatt(RenameStmt *stmt);
+extern ObjectAddress renameatt(RenameStmt *stmt);
 
-extern void RenameRelation(RenameStmt *stmt);
+extern ObjectAddress renameatt_type(RenameStmt *stmt);
+
+extern ObjectAddress RenameConstraint(RenameStmt *stmt);
+
+extern ObjectAddress RenameRelation(RenameStmt *stmt);
 
 extern void RenameRelationInternal(Oid myrelid,
-					   const char *newrelname);
+					   const char *newrelname, bool is_internal);
 
 extern void find_composite_type_dependencies(Oid typeOid,
 								 Relation origRelation,
 								 const char *origTypeName);
 
 extern void check_of_type(HeapTuple typetuple);
-
-extern AttrNumber *varattnos_map(TupleDesc olddesc, TupleDesc newdesc);
-extern AttrNumber *varattnos_map_schema(TupleDesc old, List *schema);
-extern void change_varattnos_of_a_node(Node *node, const AttrNumber *newattno);
 
 extern void register_on_commit_action(Oid relid, OnCommitAction action);
 extern void remove_on_commit_action(Oid relid);
@@ -73,6 +83,8 @@ extern void AtEOSubXact_on_commit_actions(bool isCommit,
 							  SubTransactionId parentSubid);
 
 extern void RangeVarCallbackOwnsTable(const RangeVar *relation,
-									  Oid relId, Oid oldRelId, void *arg);
+						  Oid relId, Oid oldRelId, void *arg);
 
+extern void RangeVarCallbackOwnsRelation(const RangeVar *relation,
+							 Oid relId, Oid oldRelId, void *noCatalogs);
 #endif   /* TABLECMDS_H */

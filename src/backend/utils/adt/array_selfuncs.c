@@ -3,7 +3,7 @@
  * array_selfuncs.c
  *	  Functions for selectivity estimation of array operators
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,6 +16,7 @@
 
 #include <math.h>
 
+#include "access/htup_details.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_statistic.h"
@@ -67,11 +68,13 @@ static int	float_compare_desc(const void *key1, const void *key2);
  * scalararraysel_containment
  *		Estimate selectivity of ScalarArrayOpExpr via array containment.
  *
- * scalararraysel() has already verified that the operator of a
- * ScalarArrayOpExpr is the array element type's default equality or
- * inequality operator.  If we have const =/<> ANY/ALL (array_var)
- * then we can estimate the selectivity as though this were an array
- * containment operator, array_var op ARRAY[const].
+ * If we have const =/<> ANY/ALL (array_var) then we can estimate the
+ * selectivity as though this were an array containment operator,
+ * array_var op ARRAY[const].
+ *
+ * scalararraysel() has already verified that the ScalarArrayOpExpr's operator
+ * is the array element type's default equality or inequality operator, and
+ * has aggressively simplified both inputs to constants.
  *
  * Returns selectivity (0..1), or -1 if we fail to estimate selectivity.
  */
@@ -98,9 +101,8 @@ scalararraysel_containment(PlannerInfo *root,
 	}
 
 	/*
-	 * Aggressively reduce leftop to a constant, if possible.
+	 * leftop must be a constant, else punt.
 	 */
-	leftop = estimate_expression_value(root, leftop);
 	if (!IsA(leftop, Const))
 	{
 		ReleaseVariableStats(vardata);
@@ -172,7 +174,7 @@ scalararraysel_containment(PlannerInfo *root,
 				selec = mcelem_array_contain_overlap_selec(values, nvalues,
 														   numbers, nnumbers,
 														   &constval, 1,
-														   OID_ARRAY_CONTAINS_OP,
+													   OID_ARRAY_CONTAINS_OP,
 														   cmpfunc);
 			else
 				selec = mcelem_array_contained_selec(values, nvalues,
@@ -193,7 +195,7 @@ scalararraysel_containment(PlannerInfo *root,
 				selec = mcelem_array_contain_overlap_selec(NULL, 0,
 														   NULL, 0,
 														   &constval, 1,
-														   OID_ARRAY_CONTAINS_OP,
+													   OID_ARRAY_CONTAINS_OP,
 														   cmpfunc);
 			else
 				selec = mcelem_array_contained_selec(NULL, 0,
@@ -285,8 +287,8 @@ arraycontsel(PG_FUNCTION_ARGS)
 	}
 
 	/*
-	 * If var is on the right, commute the operator, so that we can assume
-	 * the var is on the left in what follows.
+	 * If var is on the right, commute the operator, so that we can assume the
+	 * var is on the left in what follows.
 	 */
 	if (!varonleft)
 	{
@@ -451,7 +453,7 @@ mcelem_array_selec(ArrayType *array, TypeCacheEntry *typentry,
 				   float4 *hist, int nhist,
 				   Oid operator, FmgrInfo *cmpfunc)
 {
-	Selectivity	selec;
+	Selectivity selec;
 	int			num_elems;
 	Datum	   *elem_values;
 	bool	   *elem_nulls;
@@ -500,7 +502,7 @@ mcelem_array_selec(ArrayType *array, TypeCacheEntry *typentry,
 	if (operator == OID_ARRAY_CONTAINS_OP || operator == OID_ARRAY_OVERLAP_OP)
 		selec = mcelem_array_contain_overlap_selec(mcelem, nmcelem,
 												   numbers, nnumbers,
-												   elem_values, nonnull_nitems,
+												 elem_values, nonnull_nitems,
 												   operator, cmpfunc);
 	else if (operator == OID_ARRAY_CONTAINED_OP)
 		selec = mcelem_array_contained_selec(mcelem, nmcelem,
@@ -522,7 +524,7 @@ mcelem_array_selec(ArrayType *array, TypeCacheEntry *typentry,
 
 /*
  * Estimate selectivity of "column @> const" and "column && const" based on
- * most common element statistics.	This estimation assumes element
+ * most common element statistics.  This estimation assumes element
  * occurrences are independent.
  *
  * mcelem (of length nmcelem) and numbers (of length nnumbers) are from
@@ -570,7 +572,7 @@ mcelem_array_contain_overlap_selec(Datum *mcelem, int nmcelem,
 	else
 	{
 		/* Without statistics make some default assumptions */
-		minfreq = 2 * DEFAULT_CONTAIN_SEL;
+		minfreq = 2 * (float4) DEFAULT_CONTAIN_SEL;
 	}
 
 	/* Decide whether it is faster to use binary search or not. */
@@ -626,7 +628,7 @@ mcelem_array_contain_overlap_selec(Datum *mcelem, int nmcelem,
 				else
 				{
 					if (cmp == 0)
-						match = true; /* mcelem is found */
+						match = true;	/* mcelem is found */
 					break;
 				}
 			}
@@ -806,7 +808,7 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
 			else
 			{
 				if (cmp == 0)
-					match = true; /* mcelem is found */
+					match = true;		/* mcelem is found */
 				break;
 			}
 		}
@@ -846,7 +848,7 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
 	/*
 	 * The presence of many distinct rare elements materially decreases
 	 * selectivity.  Use the Poisson distribution to estimate the probability
-	 * of a column value having zero occurrences of such elements.	See above
+	 * of a column value having zero occurrences of such elements.  See above
 	 * for the definition of "rest".
 	 */
 	mult *= exp(-rest);
@@ -879,8 +881,8 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
 		 * Use the quadratic formula to solve for largest allowable N.  We
 		 * have A = 1, B = nmcelem, C = - EFFORT * nmcelem.
 		 */
-		double	b = (double) nmcelem;
-		int		n;
+		double		b = (double) nmcelem;
+		int			n;
 
 		n = (int) ((sqrt(b * b + 4 * EFFORT * b) - b) / 2);
 
@@ -891,9 +893,9 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
 	}
 
 	/*
-	 * Calculate probabilities of each distinct element count for both
-	 * mcelems and constant elements.  At this point, assume independent
-	 * element occurrence.
+	 * Calculate probabilities of each distinct element count for both mcelems
+	 * and constant elements.  At this point, assume independent element
+	 * occurrence.
 	 */
 	dist = calc_distr(elem_selec, unique_nitems, unique_nitems, 0.0f);
 	mcelem_dist = calc_distr(numbers, nmcelem, unique_nitems, rest);
@@ -906,8 +908,8 @@ mcelem_array_contained_selec(Datum *mcelem, int nmcelem,
 	{
 		/*
 		 * mult * dist[i] / mcelem_dist[i] gives us probability of qual
-		 * matching from assumption of independent element occurrence with
-		 * the condition that distinct element count = i.
+		 * matching from assumption of independent element occurrence with the
+		 * condition that distinct element count = i.
 		 */
 		if (mcelem_dist[i] > 0)
 			selec += hist_part[i] * mult * dist[i] / mcelem_dist[i];
@@ -1019,7 +1021,7 @@ calc_hist(const float4 *hist, int nhist, int n)
  * included in p.
  *
  * Imagine matrix M of size (n + 1) x (m + 1).  Element M[i,j] denotes the
- * probability that exactly j of first i events occur.	Obviously M[0,0] = 1.
+ * probability that exactly j of first i events occur.  Obviously M[0,0] = 1.
  * For any constant j, each increment of i increases the probability iff the
  * event occurs.  So, by the law of total probability:
  *	M[i,j] = M[i - 1, j] * (1 - p[i]) + M[i - 1, j - 1] * p[i]
@@ -1141,7 +1143,7 @@ floor_log2(uint32 n)
 
 /*
  * find_next_mcelem binary-searches a most common elements array, starting
- * from *index, for the first member >= value.	It saves the position of the
+ * from *index, for the first member >= value.  It saves the position of the
  * match into *index and returns true if it's an exact match.  (Note: we
  * assume the mcelem elements are distinct so there can't be more than one
  * exact match.)

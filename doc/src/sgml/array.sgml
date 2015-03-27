@@ -338,6 +338,19 @@ SELECT array_length(schedule, 1) FROM sal_emp WHERE name = 'Carol';
             2
 (1 row)
 </programlisting>
+
+ <function>cardinality</function> returns the total number of elements in an
+ array across all dimensions.  It is effectively the number of rows a call to
+ <function>unnest</function> would yield:
+
+<programlisting>
+SELECT cardinality(schedule) FROM sal_emp WHERE name = 'Carol';
+
+ cardinality 
+-------------
+           4
+(1 row)
+</programlisting>
  </para>
  </sect2>
 
@@ -571,6 +584,39 @@ SELECT * FROM
 </programlisting>
 
   This function is described in <xref linkend="functions-srf-subscripts">.
+ </para>
+
+ <para>
+  You can also search an array using the <literal>&amp;&amp;</> operator,
+  which checks whether the left operand overlaps with the right operand.
+  For instance:
+
+<programlisting>
+SELECT * FROM sal_emp WHERE pay_by_quarter && ARRAY[10000];
+</programlisting>
+
+  This and other array operators are further described in
+  <xref linkend="functions-array">.  It can be accelerated by an appropriate
+  index, as described in <xref linkend="indexes-types">.
+ </para>
+
+ <para>
+  You can also search for specific values in an array using the <function>array_offset</>
+  and <function>array_offsets</> functions. The former returns the position of
+  the first occurrence of a value in an array; the latter returns an array with the
+  positions of all occurrences of the value in the array.  For example:
+
+<programlisting>
+SELECT array_offset(ARRAY['sun','mon','tue','wed','thu','fri','sat'], 'mon');
+ array_offset
+--------------
+ 2
+
+SELECT array_offsets(ARRAY[1, 4, 3, 1, 3, 4, 2, 1], 1);
+ array_offsets 
+---------------
+ {1,4,8}
+</programlisting>
  </para>
 
  <tip>

@@ -6,8 +6,8 @@
 #include "access/gist.h"
 #include "access/skey.h"
 #include "catalog/pg_type.h"
+#include "common/pg_crc.h"
 
-#include "crc32.h"
 #include "hstore.h"
 
 /* bigint defines */
@@ -40,15 +40,15 @@ typedef char *BITVECP;
 typedef struct
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
-	int4		flag;
-	char		data[1];
+	int32		flag;
+	char		data[FLEXIBLE_ARRAY_MEMBER];
 } GISTTYPE;
 
 #define ALLISTRUE		0x04
 
 #define ISALLTRUE(x)	( ((GISTTYPE*)x)->flag & ALLISTRUE )
 
-#define GTHDRSIZE		(VARHDRSZ + sizeof(int4))
+#define GTHDRSIZE		(VARHDRSZ + sizeof(int32))
 #define CALCGTSIZE(flag) ( GTHDRSIZE+(((flag) & ALLISTRUE) ? 0 : SIGLEN) )
 
 #define GETSIGN(x)		( (BITVECP)( (char*)x+GTHDRSIZE ) )
@@ -68,11 +68,22 @@ typedef struct
 
 #define WISH_F(a,b,c) (double)( -(double)(((a)-(b))*((a)-(b))*((a)-(b)))*(c) )
 
-PG_FUNCTION_INFO_V1(ghstore_in);
-Datum		ghstore_in(PG_FUNCTION_ARGS);
+/* shorthand for calculating CRC-32 of a single chunk of data. */
+static pg_crc32
+crc32_sz(char *buf, int size)
+{
+	pg_crc32 crc;
 
+	INIT_TRADITIONAL_CRC32(crc);
+	COMP_TRADITIONAL_CRC32(crc, buf, size);
+	FIN_TRADITIONAL_CRC32(crc);
+
+	return crc;
+}
+
+
+PG_FUNCTION_INFO_V1(ghstore_in);
 PG_FUNCTION_INFO_V1(ghstore_out);
-Datum		ghstore_out(PG_FUNCTION_ARGS);
 
 
 Datum
@@ -96,14 +107,6 @@ PG_FUNCTION_INFO_V1(ghstore_penalty);
 PG_FUNCTION_INFO_V1(ghstore_picksplit);
 PG_FUNCTION_INFO_V1(ghstore_union);
 PG_FUNCTION_INFO_V1(ghstore_same);
-
-Datum		ghstore_consistent(PG_FUNCTION_ARGS);
-Datum		ghstore_compress(PG_FUNCTION_ARGS);
-Datum		ghstore_decompress(PG_FUNCTION_ARGS);
-Datum		ghstore_penalty(PG_FUNCTION_ARGS);
-Datum		ghstore_picksplit(PG_FUNCTION_ARGS);
-Datum		ghstore_union(PG_FUNCTION_ARGS);
-Datum		ghstore_same(PG_FUNCTION_ARGS);
 
 Datum
 ghstore_compress(PG_FUNCTION_ARGS)
@@ -143,7 +146,7 @@ ghstore_compress(PG_FUNCTION_ARGS)
 	}
 	else if (!ISALLTRUE(DatumGetPointer(entry->key)))
 	{
-		int4		i;
+		int32		i;
 		GISTTYPE   *res;
 		BITVECP		sign = GETSIGN(DatumGetPointer(entry->key));
 
@@ -192,7 +195,7 @@ ghstore_same(PG_FUNCTION_ARGS)
 		*result = false;
 	else
 	{
-		int4		i;
+		int32		i;
 		BITVECP		sa = GETSIGN(a),
 					sb = GETSIGN(b);
 
@@ -209,10 +212,10 @@ ghstore_same(PG_FUNCTION_ARGS)
 	PG_RETURN_POINTER(result);
 }
 
-static int4
+static int32
 sizebitvec(BITVECP sign)
 {
-	int4		size = 0,
+	int32		size = 0,
 				i;
 
 	LOOPBYTE
@@ -253,10 +256,10 @@ hemdist(GISTTYPE *a, GISTTYPE *b)
 	return hemdistsign(GETSIGN(a), GETSIGN(b));
 }
 
-static int4
+static int32
 unionkey(BITVECP sbase, GISTTYPE *add)
 {
-	int4		i;
+	int32		i;
 	BITVECP		sadd = GETSIGN(add);
 
 	if (ISALLTRUE(add))
@@ -270,12 +273,12 @@ Datum
 ghstore_union(PG_FUNCTION_ARGS)
 {
 	GistEntryVector *entryvec = (GistEntryVector *) PG_GETARG_POINTER(0);
-	int4		len = entryvec->n;
+	int32		len = entryvec->n;
 
 	int		   *size = (int *) PG_GETARG_POINTER(1);
 	BITVEC		base;
-	int4		i;
-	int4		flag = 0;
+	int32		i;
+	int32		flag = 0;
 	GISTTYPE   *result;
 
 	MemSet((void *) base, 0, sizeof(BITVEC));
@@ -316,7 +319,7 @@ ghstore_penalty(PG_FUNCTION_ARGS)
 typedef struct
 {
 	OffsetNumber pos;
-	int4		cost;
+	int32		cost;
 } SPLITCOST;
 
 static int
@@ -339,11 +342,11 @@ ghstore_picksplit(PG_FUNCTION_ARGS)
 			   *datum_r;
 	BITVECP		union_l,
 				union_r;
-	int4		size_alpha,
+	int32		size_alpha,
 				size_beta;
-	int4		size_waste,
+	int32		size_waste,
 				waste = -1;
-	int4		nbytes;
+	int32		nbytes;
 	OffsetNumber seed_1 = 0,
 				seed_2 = 0;
 	OffsetNumber *left,

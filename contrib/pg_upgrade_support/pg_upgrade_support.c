@@ -5,12 +5,13 @@
  *	to control oid and relfilenode assignment, and do other special
  *	hacks needed for pg_upgrade.
  *
- *	Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ *	Copyright (c) 2010-2015, PostgreSQL Global Development Group
  *	contrib/pg_upgrade_support/pg_upgrade_support.c
  */
 
 #include "postgres.h"
 
+#include "catalog/binary_upgrade.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type.h"
 #include "commands/extension.h"
@@ -23,30 +24,6 @@
 #ifdef PG_MODULE_MAGIC
 PG_MODULE_MAGIC;
 #endif
-
-extern PGDLLIMPORT Oid binary_upgrade_next_pg_type_oid;
-extern PGDLLIMPORT Oid binary_upgrade_next_array_pg_type_oid;
-extern PGDLLIMPORT Oid binary_upgrade_next_toast_pg_type_oid;
-
-extern PGDLLIMPORT Oid binary_upgrade_next_heap_pg_class_oid;
-extern PGDLLIMPORT Oid binary_upgrade_next_index_pg_class_oid;
-extern PGDLLIMPORT Oid binary_upgrade_next_toast_pg_class_oid;
-
-extern PGDLLIMPORT Oid binary_upgrade_next_pg_enum_oid;
-extern PGDLLIMPORT Oid binary_upgrade_next_pg_authid_oid;
-
-Datum		set_next_pg_type_oid(PG_FUNCTION_ARGS);
-Datum		set_next_array_pg_type_oid(PG_FUNCTION_ARGS);
-Datum		set_next_toast_pg_type_oid(PG_FUNCTION_ARGS);
-
-Datum		set_next_heap_pg_class_oid(PG_FUNCTION_ARGS);
-Datum		set_next_index_pg_class_oid(PG_FUNCTION_ARGS);
-Datum		set_next_toast_pg_class_oid(PG_FUNCTION_ARGS);
-
-Datum		set_next_pg_enum_oid(PG_FUNCTION_ARGS);
-Datum		set_next_pg_authid_oid(PG_FUNCTION_ARGS);
-
-Datum		create_empty_extension(PG_FUNCTION_ARGS);
 
 PG_FUNCTION_INFO_V1(set_next_pg_type_oid);
 PG_FUNCTION_INFO_V1(set_next_array_pg_type_oid);
@@ -61,12 +38,20 @@ PG_FUNCTION_INFO_V1(set_next_pg_authid_oid);
 
 PG_FUNCTION_INFO_V1(create_empty_extension);
 
+#define CHECK_IS_BINARY_UPGRADE 								\
+do { 															\
+	if (!IsBinaryUpgrade)										\
+		ereport(ERROR,											\
+				(errcode(ERRCODE_CANT_CHANGE_RUNTIME_PARAM),	\
+				 (errmsg("function can only be called when server is in binary upgrade mode")))); \
+} while (0)
 
 Datum
 set_next_pg_type_oid(PG_FUNCTION_ARGS)
 {
 	Oid			typoid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_pg_type_oid = typoid;
 
 	PG_RETURN_VOID();
@@ -77,6 +62,7 @@ set_next_array_pg_type_oid(PG_FUNCTION_ARGS)
 {
 	Oid			typoid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_array_pg_type_oid = typoid;
 
 	PG_RETURN_VOID();
@@ -87,6 +73,7 @@ set_next_toast_pg_type_oid(PG_FUNCTION_ARGS)
 {
 	Oid			typoid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_toast_pg_type_oid = typoid;
 
 	PG_RETURN_VOID();
@@ -97,6 +84,7 @@ set_next_heap_pg_class_oid(PG_FUNCTION_ARGS)
 {
 	Oid			reloid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_heap_pg_class_oid = reloid;
 
 	PG_RETURN_VOID();
@@ -107,6 +95,7 @@ set_next_index_pg_class_oid(PG_FUNCTION_ARGS)
 {
 	Oid			reloid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_index_pg_class_oid = reloid;
 
 	PG_RETURN_VOID();
@@ -117,6 +106,7 @@ set_next_toast_pg_class_oid(PG_FUNCTION_ARGS)
 {
 	Oid			reloid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_toast_pg_class_oid = reloid;
 
 	PG_RETURN_VOID();
@@ -127,6 +117,7 @@ set_next_pg_enum_oid(PG_FUNCTION_ARGS)
 {
 	Oid			enumoid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_pg_enum_oid = enumoid;
 
 	PG_RETURN_VOID();
@@ -137,6 +128,7 @@ set_next_pg_authid_oid(PG_FUNCTION_ARGS)
 {
 	Oid			authoid = PG_GETARG_OID(0);
 
+	CHECK_IS_BINARY_UPGRADE;
 	binary_upgrade_next_pg_authid_oid = authoid;
 	PG_RETURN_VOID();
 }
@@ -151,6 +143,8 @@ create_empty_extension(PG_FUNCTION_ARGS)
 	Datum		extConfig;
 	Datum		extCondition;
 	List	   *requiredExtensions;
+
+	CHECK_IS_BINARY_UPGRADE;
 
 	if (PG_ARGISNULL(4))
 		extConfig = PointerGetDatum(NULL);

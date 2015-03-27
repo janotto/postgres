@@ -3,7 +3,7 @@
  * lockfuncs.c
  *		Functions for SQL access to various lock-manager capabilities.
  *
- * Copyright (c) 2002-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2002-2015, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/backend/utils/adt/lockfuncs.c
@@ -12,6 +12,7 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -160,7 +161,7 @@ pg_lock_status(PG_FUNCTION_ARGS)
 		bool		nulls[NUM_LOCK_STATUS_COLUMNS];
 		HeapTuple	tuple;
 		Datum		result;
-		LockInstanceData   *instance;
+		LockInstanceData *instance;
 
 		instance = &(lockData->locks[mystatus->currIdx]);
 
@@ -375,8 +376,8 @@ pg_lock_status(PG_FUNCTION_ARGS)
 			nulls[11] = true;
 
 		/*
-		 * Lock mode. Currently all predicate locks are SIReadLocks, which
-		 * are always held (never waiting) and have no fast path
+		 * Lock mode. Currently all predicate locks are SIReadLocks, which are
+		 * always held (never waiting) and have no fast path
 		 */
 		values[12] = CStringGetTextDatum("SIReadLock");
 		values[13] = BoolGetDatum(true);

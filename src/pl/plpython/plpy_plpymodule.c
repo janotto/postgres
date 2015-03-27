@@ -21,7 +21,7 @@
 #include "plpy_subxactobject.h"
 
 
-HTAB *PLy_spi_exceptions = NULL;
+HTAB	   *PLy_spi_exceptions = NULL;
 
 
 static void PLy_add_exceptions(PyObject *plpy);
@@ -137,7 +137,7 @@ PyInit_plpy(void)
 
 	return m;
 }
-#endif /* PY_MAJOR_VERSION >= 3 */
+#endif   /* PY_MAJOR_VERSION >= 3 */
 
 void
 PLy_init_plpy(void)
@@ -145,6 +145,7 @@ PLy_init_plpy(void)
 	PyObject   *main_mod,
 			   *main_dict,
 			   *plpy_mod;
+
 #if PY_MAJOR_VERSION < 3
 	PyObject   *plpy;
 #endif
@@ -173,9 +174,11 @@ PLy_init_plpy(void)
 	main_mod = PyImport_AddModule("__main__");
 	main_dict = PyModule_GetDict(main_mod);
 	plpy_mod = PyImport_AddModule("plpy");
+	if (plpy_mod == NULL)
+		PLy_elog(ERROR, "could not import \"plpy\" module");
 	PyDict_SetItemString(main_dict, "plpy", plpy_mod);
 	if (PyErr_Occurred())
-		elog(ERROR, "could not initialize plpy");
+		PLy_elog(ERROR, "could not import \"plpy\" module");
 }
 
 static void
@@ -208,6 +211,11 @@ PLy_add_exceptions(PyObject *plpy)
 	PLy_exc_fatal = PyErr_NewException("plpy.Fatal", NULL, NULL);
 	PLy_exc_spi_error = PyErr_NewException("plpy.SPIError", NULL, NULL);
 
+	if (PLy_exc_error == NULL ||
+		PLy_exc_fatal == NULL ||
+		PLy_exc_spi_error == NULL)
+		PLy_elog(ERROR, "could not create the base SPI exceptions");
+
 	Py_INCREF(PLy_exc_error);
 	PyModule_AddObject(plpy, "Error", PLy_exc_error);
 	Py_INCREF(PLy_exc_fatal);
@@ -218,9 +226,8 @@ PLy_add_exceptions(PyObject *plpy)
 	memset(&hash_ctl, 0, sizeof(hash_ctl));
 	hash_ctl.keysize = sizeof(int);
 	hash_ctl.entrysize = sizeof(PLyExceptionEntry);
-	hash_ctl.hash = tag_hash;
 	PLy_spi_exceptions = hash_create("SPI exceptions", 256,
-									 &hash_ctl, HASH_ELEM | HASH_FUNCTION);
+									 &hash_ctl, HASH_ELEM | HASH_BLOBS);
 
 	PLy_generate_spi_exceptions(excmod, PLy_exc_spi_error);
 }
@@ -241,7 +248,13 @@ PLy_generate_spi_exceptions(PyObject *mod, PyObject *base)
 		PyObject   *sqlstate;
 		PyObject   *dict = PyDict_New();
 
+		if (dict == NULL)
+			PLy_elog(ERROR, "could not generate SPI exceptions");
+
 		sqlstate = PyString_FromString(unpack_sql_state(exception_map[i].sqlstate));
+		if (sqlstate == NULL)
+			PLy_elog(ERROR, "could not generate SPI exceptions");
+
 		PyDict_SetItemString(dict, "sqlstate", sqlstate);
 		Py_DECREF(sqlstate);
 		exc = PyErr_NewException(exception_map[i].name, base, dict);
@@ -260,49 +273,49 @@ PLy_generate_spi_exceptions(PyObject *mod, PyObject *base)
  */
 static PyObject *PLy_output(volatile int, PyObject *, PyObject *);
 
-PyObject *
+static PyObject *
 PLy_debug(PyObject *self, PyObject *args)
 {
 	return PLy_output(DEBUG2, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_log(PyObject *self, PyObject *args)
 {
 	return PLy_output(LOG, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_info(PyObject *self, PyObject *args)
 {
 	return PLy_output(INFO, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_notice(PyObject *self, PyObject *args)
 {
 	return PLy_output(NOTICE, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_warning(PyObject *self, PyObject *args)
 {
 	return PLy_output(WARNING, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_error(PyObject *self, PyObject *args)
 {
 	return PLy_output(ERROR, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_fatal(PyObject *self, PyObject *args)
 {
 	return PLy_output(FATAL, self, args);
 }
 
-PyObject *
+static PyObject *
 PLy_quote_literal(PyObject *self, PyObject *args)
 {
 	const char *str;
@@ -319,7 +332,7 @@ PLy_quote_literal(PyObject *self, PyObject *args)
 	return ret;
 }
 
-PyObject *
+static PyObject *
 PLy_quote_nullable(PyObject *self, PyObject *args)
 {
 	const char *str;
@@ -339,7 +352,7 @@ PLy_quote_nullable(PyObject *self, PyObject *args)
 	return ret;
 }
 
-PyObject *
+static PyObject *
 PLy_quote_ident(PyObject *self, PyObject *args)
 {
 	const char *str;
@@ -370,7 +383,8 @@ PLy_output(volatile int level, PyObject *self, PyObject *args)
 		 */
 		PyObject   *o;
 
-		PyArg_UnpackTuple(args, "plpy.elog", 1, 1, &o);
+		if (!PyArg_UnpackTuple(args, "plpy.elog", 1, 1, &o))
+			PLy_elog(ERROR, "could not unpack arguments in plpy.elog");
 		so = PyObject_Str(o);
 	}
 	else

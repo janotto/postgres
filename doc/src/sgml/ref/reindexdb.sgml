@@ -4,6 +4,10 @@ PostgreSQL documentation
 -->
 
 <refentry id="APP-REINDEXDB">
+ <indexterm zone="app-reindexdb">
+  <primary>reindexdb</primary>
+ </indexterm>
+
  <refmeta>
   <refentrytitle><application>reindexdb</application></refentrytitle>
   <manvolnum>1</manvolnum>
@@ -15,30 +19,61 @@ PostgreSQL documentation
   <refpurpose>reindex a <productname>PostgreSQL</productname> database</refpurpose>
  </refnamediv>
 
- <indexterm zone="app-reindexdb">
-  <primary>reindexdb</primary>
- </indexterm>
-
  <refsynopsisdiv>
   <cmdsynopsis>
    <command>reindexdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--table | -t <replaceable>table</replaceable> </arg>
-   <arg>--index | -i <replaceable>index</replaceable> </arg>
-   <arg><replaceable>dbname</replaceable></arg>
+
+   <arg choice="plain" rep="repeat">
+    <arg choice="opt">
+     <group choice="plain">
+      <arg choice="plain"><option>--schema</option></arg>
+      <arg choice="plain"><option>-S</option></arg>
+     </group>
+     <replaceable>table</replaceable>
+    </arg>
+   </arg>
+
+   <arg choice="plain" rep="repeat">
+    <arg choice="opt">
+     <group choice="plain">
+      <arg choice="plain"><option>--table</option></arg>
+      <arg choice="plain"><option>-t</option></arg>
+     </group>
+     <replaceable>table</replaceable>
+    </arg>
+   </arg>
+
+   <arg choice="plain" rep="repeat">
+    <arg choice="opt">
+     <group choice="plain">
+      <arg choice="plain"><option>--index</option></arg>
+      <arg choice="plain"><option>-i</option></arg>
+     </group>
+     <replaceable>index</replaceable>
+    </arg>
+   </arg>
+
+   <arg choice="opt"><replaceable>dbname</replaceable></arg>
   </cmdsynopsis>
 
   <cmdsynopsis>
    <command>reindexdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--all | -a</arg>
+   <group choice="plain">
+    <arg choice="plain"><option>--all</option></arg>
+    <arg choice="plain"><option>-a</option></arg>
+   </group>
   </cmdsynopsis>
 
   <cmdsynopsis>
    <command>reindexdb</command>
    <arg rep="repeat"><replaceable>connection-option</replaceable></arg>
-   <arg>--system | -s</arg>
-   <arg><replaceable>dbname</replaceable></arg>
+   <group choice="plain">
+    <arg choice="plain"><option>--system</option></arg>
+    <arg choice="plain"><option>-s</option></arg>
+   </group>
+   <arg choice="opt"><replaceable>dbname</replaceable></arg>
   </cmdsynopsis>
  </refsynopsisdiv>
 
@@ -110,6 +145,8 @@ PostgreSQL documentation
       <listitem>
        <para>
         Recreate <replaceable class="parameter">index</replaceable> only.
+        Multiple indexes can be recreated by writing multiple
+        <option>-i</> switches.
        </para>
       </listitem>
      </varlistentry>
@@ -135,11 +172,25 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>-S <replaceable class="parameter">schema</replaceable></></term>
+      <term><option>--schema=<replaceable class="parameter">schema</replaceable></></term>
+      <listitem>
+       <para>
+        Reindex <replaceable class="parameter">schema</replaceable> only.
+        Multiple schemas can be reindexed by writing multiple
+        <option>-S</> switches.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>-t <replaceable class="parameter">table</replaceable></></term>
       <term><option>--table=<replaceable class="parameter">table</replaceable></></term>
       <listitem>
        <para>
         Reindex <replaceable class="parameter">table</replaceable> only.
+        Multiple tables can be reindexed by writing multiple
+        <option>-t</> switches.
        </para>
       </listitem>
      </varlistentry>
@@ -249,7 +300,7 @@ PostgreSQL documentation
       <listitem>
        <para>
          Specifies the name of the database to connect to discover what other
-         databases should be vacuumed. If not specified, the
+         databases should be reindexed. If not specified, the
          <literal>postgres</literal> database will be used,
          and if that does not exist, <literal>template1</literal> will be used.
        </para>

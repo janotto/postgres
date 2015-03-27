@@ -23,13 +23,6 @@ PG_FUNCTION_INFO_V1(gbt_numeric_consistent);
 PG_FUNCTION_INFO_V1(gbt_numeric_penalty);
 PG_FUNCTION_INFO_V1(gbt_numeric_same);
 
-Datum		gbt_numeric_compress(PG_FUNCTION_ARGS);
-Datum		gbt_numeric_union(PG_FUNCTION_ARGS);
-Datum		gbt_numeric_picksplit(PG_FUNCTION_ARGS);
-Datum		gbt_numeric_consistent(PG_FUNCTION_ARGS);
-Datum		gbt_numeric_penalty(PG_FUNCTION_ARGS);
-Datum		gbt_numeric_same(PG_FUNCTION_ARGS);
-
 
 /* define for comparison */
 
@@ -177,7 +170,7 @@ gbt_numeric_penalty(PG_FUNCTION_ARGS)
 				uk;
 
 	rk = gbt_var_key_readable(org);
-	uni = PointerGetDatum(gbt_var_key_copy(&rk, TRUE));
+	uni = PointerGetDatum(gbt_var_key_copy(&rk));
 	gbt_var_bin_union(&uni, newe, PG_GET_COLLATION(), &tinfo);
 	ok = gbt_var_key_readable(org);
 	uk = gbt_var_key_readable((GBT_VARKEY *) DatumGetPointer(uni));

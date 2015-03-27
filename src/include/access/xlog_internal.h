@@ -6,9 +6,12 @@
  * NOTE: this file is intended to contain declarations useful for
  * manipulating the XLOG files directly, but it is not supposed to be
  * needed by rmgr routines (redo support for individual record types).
- * So the XLogRecord typedef and associated stuff appear in xlog.h.
+ * So the XLogRecord typedef and associated stuff appear in xlogrecord.h.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Note: This file must be includable in both frontend and backend contexts,
+ * to allow stand-alone tools like pg_receivexlog to deal with WAL files.
+ *
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/access/xlog_internal.h
@@ -16,62 +19,19 @@
 #ifndef XLOG_INTERNAL_H
 #define XLOG_INTERNAL_H
 
-#include "access/xlog.h"
-#include "fmgr.h"
+#include "access/xlogdefs.h"
+#include "access/xlogreader.h"
+#include "datatype/timestamp.h"
+#include "lib/stringinfo.h"
 #include "pgtime.h"
 #include "storage/block.h"
 #include "storage/relfilenode.h"
 
 
 /*
- * Header info for a backup block appended to an XLOG record.
- *
- * As a trivial form of data compression, the XLOG code is aware that
- * PG data pages usually contain an unused "hole" in the middle, which
- * contains only zero bytes.  If hole_length > 0 then we have removed
- * such a "hole" from the stored data (and it's not counted in the
- * XLOG record's CRC, either).  Hence, the amount of block data actually
- * present following the BkpBlock struct is BLCKSZ - hole_length bytes.
- *
- * Note that we don't attempt to align either the BkpBlock struct or the
- * block's data.  So, the struct must be copied to aligned local storage
- * before use.
- */
-typedef struct BkpBlock
-{
-	RelFileNode node;			/* relation containing block */
-	ForkNumber	fork;			/* fork within the relation */
-	BlockNumber block;			/* block number */
-	uint16		hole_offset;	/* number of bytes before "hole" */
-	uint16		hole_length;	/* number of bytes in "hole" */
-
-	/* ACTUAL BLOCK DATA FOLLOWS AT END OF STRUCT */
-} BkpBlock;
-
-/*
- * When there is not enough space on current page for whole record, we
- * continue on the next page with continuation record.	(However, the
- * XLogRecord header will never be split across pages; if there's less than
- * SizeOfXLogRecord space left at the end of a page, we just waste it.)
- *
- * Note that xl_rem_len includes backup-block data; that is, it tracks
- * xl_tot_len not xl_len in the initial header.  Also note that the
- * continuation data isn't necessarily aligned.
- */
-typedef struct XLogContRecord
-{
-	uint32		xl_rem_len;		/* total len of remaining data for record */
-
-	/* ACTUAL LOG DATA FOLLOWS AT END OF STRUCT */
-
-} XLogContRecord;
-
-#define SizeOfXLogContRecord	sizeof(XLogContRecord)
-
-/*
  * Each page of XLOG file has a header like this:
  */
-#define XLOG_PAGE_MAGIC 0xD070	/* can be used as WAL version indicator */
+#define XLOG_PAGE_MAGIC 0xD083	/* can be used as WAL version indicator */
 
 typedef struct XLogPageHeaderData
 {
@@ -79,6 +39,17 @@ typedef struct XLogPageHeaderData
 	uint16		xlp_info;		/* flag bits, see below */
 	TimeLineID	xlp_tli;		/* TimeLineID of first record on page */
 	XLogRecPtr	xlp_pageaddr;	/* XLOG address of this page */
+
+	/*
+	 * When there is not enough space on current page for whole record, we
+	 * continue on the next page.  xlp_rem_len is the number of bytes
+	 * remaining from a previous page.
+	 *
+	 * Note that xl_rem_len includes backup-block data; that is, it tracks
+	 * xl_tot_len not xl_len in the initial header.  Also note that the
+	 * continuation data isn't necessarily aligned.
+	 */
+	uint32		xlp_rem_len;	/* total len of remaining data for record */
 } XLogPageHeaderData;
 
 #define SizeOfXLogShortPHD	MAXALIGN(sizeof(XLogPageHeaderData))
@@ -115,74 +86,28 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
 	(((hdr)->xlp_info & XLP_LONG_HEADER) ? SizeOfXLogLongPHD : SizeOfXLogShortPHD)
 
 /*
- * We break each logical log file (xlogid value) into segment files of the
- * size indicated by XLOG_SEG_SIZE.  One possible segment at the end of each
- * log file is wasted, to ensure that we don't have problems representing
- * last-byte-position-plus-1.
+ * The XLOG is split into WAL segments (physical files) of the size indicated
+ * by XLOG_SEG_SIZE.
  */
 #define XLogSegSize		((uint32) XLOG_SEG_SIZE)
-#define XLogSegsPerFile (((uint32) 0xffffffff) / XLogSegSize)
-#define XLogFileSize	(XLogSegsPerFile * XLogSegSize)
+#define XLogSegmentsPerXLogId	(UINT64CONST(0x100000000) / XLOG_SEG_SIZE)
 
-
-/*
- * Macros for manipulating XLOG pointers
- */
-
-/* Increment an xlogid/segment pair */
-#define NextLogSeg(logId, logSeg)	\
-	do { \
-		if ((logSeg) >= XLogSegsPerFile-1) \
-		{ \
-			(logId)++; \
-			(logSeg) = 0; \
-		} \
-		else \
-			(logSeg)++; \
-	} while (0)
-
-/* Decrement an xlogid/segment pair (assume it's not 0,0) */
-#define PrevLogSeg(logId, logSeg)	\
-	do { \
-		if (logSeg) \
-			(logSeg)--; \
-		else \
-		{ \
-			(logId)--; \
-			(logSeg) = XLogSegsPerFile-1; \
-		} \
-	} while (0)
-
-/* Align a record pointer to next page */
-#define NextLogPage(recptr) \
-	do {	\
-		if ((recptr).xrecoff % XLOG_BLCKSZ != 0)	\
-			(recptr).xrecoff +=	\
-				(XLOG_BLCKSZ - (recptr).xrecoff % XLOG_BLCKSZ);	\
-		if ((recptr).xrecoff >= XLogFileSize) \
-		{	\
-			((recptr).xlogid)++;	\
-			(recptr).xrecoff = 0; \
-		}	\
-	} while (0)
+#define XLogSegNoOffsetToRecPtr(segno, offset, dest) \
+		(dest) = (segno) * XLOG_SEG_SIZE + (offset)
 
 /*
  * Compute ID and segment from an XLogRecPtr.
  *
  * For XLByteToSeg, do the computation at face value.  For XLByteToPrevSeg,
- * a boundary byte is taken to be in the previous segment.	This is suitable
+ * a boundary byte is taken to be in the previous segment.  This is suitable
  * for deciding which segment to write given a pointer to a record end,
- * for example.  (We can assume xrecoff is not zero, since no valid recptr
- * can have that.)
+ * for example.
  */
-#define XLByteToSeg(xlrp, logId, logSeg)	\
-	( logId = (xlrp).xlogid, \
-	  logSeg = (xlrp).xrecoff / XLogSegSize \
-	)
-#define XLByteToPrevSeg(xlrp, logId, logSeg)	\
-	( logId = (xlrp).xlogid, \
-	  logSeg = ((xlrp).xrecoff - 1) / XLogSegSize \
-	)
+#define XLByteToSeg(xlrp, logSegNo) \
+	logSegNo = (xlrp) / XLogSegSize
+
+#define XLByteToPrevSeg(xlrp, logSegNo) \
+	logSegNo = ((xlrp) - 1) / XLogSegSize
 
 /*
  * Is an XLogRecPtr within a particular XLOG segment?
@@ -190,18 +115,15 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
  * For XLByteInSeg, do the computation at face value.  For XLByteInPrevSeg,
  * a boundary byte is taken to be in the previous segment.
  */
-#define XLByteInSeg(xlrp, logId, logSeg)	\
-	((xlrp).xlogid == (logId) && \
-	 (xlrp).xrecoff / XLogSegSize == (logSeg))
+#define XLByteInSeg(xlrp, logSegNo) \
+	(((xlrp) / XLogSegSize) == (logSegNo))
 
-#define XLByteInPrevSeg(xlrp, logId, logSeg)	\
-	((xlrp).xlogid == (logId) && \
-	 ((xlrp).xrecoff - 1) / XLogSegSize == (logSeg))
+#define XLByteInPrevSeg(xlrp, logSegNo) \
+	((((xlrp) - 1) / XLogSegSize) == (logSegNo))
 
-/* Check if an xrecoff value is in a plausible range */
-#define XRecOffIsValid(xrecoff) \
-		((xrecoff) % XLOG_BLCKSZ >= SizeOfXLogShortPHD && \
-		(XLOG_BLCKSZ - (xrecoff) % XLOG_BLCKSZ) >= SizeOfXLogRecord)
+/* Check if an XLogRecPtr value is in a plausible range */
+#define XRecOffIsValid(xlrp) \
+		((xlrp) % XLOG_BLCKSZ >= SizeOfXLogShortPHD)
 
 /*
  * The XLog directory and control file (relative to $PGDATA)
@@ -215,14 +137,23 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
  */
 #define MAXFNAMELEN		64
 
-#define XLogFileName(fname, tli, log, seg)	\
-	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X", tli, log, seg)
+#define XLogFileName(fname, tli, logSegNo)	\
+	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X", tli,		\
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId), \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId))
 
-#define XLogFromFileName(fname, tli, log, seg)	\
-	sscanf(fname, "%08X%08X%08X", tli, log, seg)
+#define XLogFromFileName(fname, tli, logSegNo)	\
+	do {												\
+		uint32 log;										\
+		uint32 seg;										\
+		sscanf(fname, "%08X%08X%08X", tli, &log, &seg); \
+		*logSegNo = (uint64) log * XLogSegmentsPerXLogId + seg; \
+	} while (0)
 
-#define XLogFilePath(path, tli, log, seg)	\
-	snprintf(path, MAXPGPATH, XLOGDIR "/%08X%08X%08X", tli, log, seg)
+#define XLogFilePath(path, tli, logSegNo)	\
+	snprintf(path, MAXPGPATH, XLOGDIR "/%08X%08X%08X", tli,				\
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId),				\
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId))
 
 #define TLHistoryFileName(fname, tli)	\
 	snprintf(fname, MAXFNAMELEN, "%08X.history", tli)
@@ -233,26 +164,88 @@ typedef XLogLongPageHeaderData *XLogLongPageHeader;
 #define StatusFilePath(path, xlog, suffix)	\
 	snprintf(path, MAXPGPATH, XLOGDIR "/archive_status/%s%s", xlog, suffix)
 
-#define BackupHistoryFileName(fname, tli, log, seg, offset) \
-	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X.%08X.backup", tli, log, seg, offset)
+#define BackupHistoryFileName(fname, tli, logSegNo, offset) \
+	snprintf(fname, MAXFNAMELEN, "%08X%08X%08X.%08X.backup", tli, \
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId),		  \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId), offset)
 
-#define BackupHistoryFilePath(path, tli, log, seg, offset)	\
-	snprintf(path, MAXPGPATH, XLOGDIR "/%08X%08X%08X.%08X.backup", tli, log, seg, offset)
+#define BackupHistoryFilePath(path, tli, logSegNo, offset)	\
+	snprintf(path, MAXPGPATH, XLOGDIR "/%08X%08X%08X.%08X.backup", tli, \
+			 (uint32) ((logSegNo) / XLogSegmentsPerXLogId), \
+			 (uint32) ((logSegNo) % XLogSegmentsPerXLogId), offset)
 
+/*
+ * Information logged when we detect a change in one of the parameters
+ * important for Hot Standby.
+ */
+typedef struct xl_parameter_change
+{
+	int			MaxConnections;
+	int			max_worker_processes;
+	int			max_prepared_xacts;
+	int			max_locks_per_xact;
+	int			wal_level;
+	bool		wal_log_hints;
+	bool		track_commit_timestamp;
+} xl_parameter_change;
+
+/* logs restore point */
+typedef struct xl_restore_point
+{
+	TimestampTz rp_time;
+	char		rp_name[MAXFNAMELEN];
+} xl_restore_point;
+
+/* End of recovery mark, when we don't do an END_OF_RECOVERY checkpoint */
+typedef struct xl_end_of_recovery
+{
+	TimestampTz end_time;
+	TimeLineID	ThisTimeLineID; /* new TLI */
+	TimeLineID	PrevTimeLineID; /* previous TLI we forked off from */
+} xl_end_of_recovery;
+
+/*
+ * The functions in xloginsert.c construct a chain of XLogRecData structs
+ * to represent the final WAL record.
+ */
+typedef struct XLogRecData
+{
+	struct XLogRecData *next;	/* next struct in chain, or NULL */
+	char	   *data;			/* start of rmgr data to include */
+	uint32		len;			/* length of rmgr data to include */
+} XLogRecData;
+
+/*
+ * Recovery target action.
+ */
+typedef enum
+{
+	RECOVERY_TARGET_ACTION_PAUSE,
+	RECOVERY_TARGET_ACTION_PROMOTE,
+	RECOVERY_TARGET_ACTION_SHUTDOWN,
+} RecoveryTargetAction;
 
 /*
  * Method table for resource managers.
  *
- * RmgrTable[] is indexed by RmgrId values (see rmgr.h).
+ * This struct must be kept in sync with the PG_RMGR definition in
+ * rmgr.c.
+ *
+ * rm_identify must return a name for the record based on xl_info (without
+ * reference to the rmid). For example, XLOG_BTREE_VACUUM would be named
+ * "VACUUM". rm_desc can then be called to obtain additional detail for the
+ * record, if available (e.g. the last block).
+ *
+ * RmgrTable[] is indexed by RmgrId values (see rmgrlist.h).
  */
 typedef struct RmgrData
 {
 	const char *rm_name;
-	void		(*rm_redo) (XLogRecPtr lsn, XLogRecord *rptr);
-	void		(*rm_desc) (StringInfo buf, uint8 xl_info, char *rec);
+	void		(*rm_redo) (XLogReaderState *record);
+	void		(*rm_desc) (StringInfo buf, XLogReaderState *record);
+	const char *(*rm_identify) (uint8 info);
 	void		(*rm_startup) (void);
 	void		(*rm_cleanup) (void);
-	bool		(*rm_safe_restartpoint) (void);
 } RmgrData;
 
 extern const RmgrData RmgrTable[];
@@ -263,24 +256,31 @@ extern const RmgrData RmgrTable[];
 extern pg_time_t GetLastSegSwitchTime(void);
 extern XLogRecPtr RequestXLogSwitch(void);
 
+extern void GetOldestRestartPoint(XLogRecPtr *oldrecptr, TimeLineID *oldtli);
+
 /*
- * These aren't in xlog.h because I'd rather not include fmgr.h there.
+ * Exported for the functions in timeline.c and xlogarchive.c.  Only valid
+ * in the startup process.
  */
-extern Datum pg_start_backup(PG_FUNCTION_ARGS);
-extern Datum pg_stop_backup(PG_FUNCTION_ARGS);
-extern Datum pg_switch_xlog(PG_FUNCTION_ARGS);
-extern Datum pg_create_restore_point(PG_FUNCTION_ARGS);
-extern Datum pg_current_xlog_location(PG_FUNCTION_ARGS);
-extern Datum pg_current_xlog_insert_location(PG_FUNCTION_ARGS);
-extern Datum pg_last_xlog_receive_location(PG_FUNCTION_ARGS);
-extern Datum pg_last_xlog_replay_location(PG_FUNCTION_ARGS);
-extern Datum pg_last_xact_replay_timestamp(PG_FUNCTION_ARGS);
-extern Datum pg_xlogfile_name_offset(PG_FUNCTION_ARGS);
-extern Datum pg_xlogfile_name(PG_FUNCTION_ARGS);
-extern Datum pg_is_in_recovery(PG_FUNCTION_ARGS);
-extern Datum pg_xlog_replay_pause(PG_FUNCTION_ARGS);
-extern Datum pg_xlog_replay_resume(PG_FUNCTION_ARGS);
-extern Datum pg_is_xlog_replay_paused(PG_FUNCTION_ARGS);
-extern Datum pg_xlog_location_diff(PG_FUNCTION_ARGS);
+extern bool ArchiveRecoveryRequested;
+extern bool InArchiveRecovery;
+extern bool StandbyMode;
+extern char *recoveryRestoreCommand;
+
+/*
+ * Prototypes for functions in xlogarchive.c
+ */
+extern bool RestoreArchivedFile(char *path, const char *xlogfname,
+					const char *recovername, off_t expectedSize,
+					bool cleanupEnabled);
+extern void ExecuteRecoveryCommand(char *command, char *commandName,
+					   bool failOnerror);
+extern void KeepFileRestoredFromArchive(char *path, char *xlogfname);
+extern void XLogArchiveNotify(const char *xlog);
+extern void XLogArchiveNotifySeg(XLogSegNo segno);
+extern void XLogArchiveForceDone(const char *xlog);
+extern bool XLogArchiveCheckDone(const char *xlog);
+extern bool XLogArchiveIsBusy(const char *xlog);
+extern void XLogArchiveCleanup(const char *xlog);
 
 #endif   /* XLOG_INTERNAL_H */

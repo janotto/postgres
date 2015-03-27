@@ -4,7 +4,7 @@
  *	  utilities routines for the postgres inverted index access method.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 
 #include "access/gin_private.h"
 #include "access/reloptions.h"
+#include "access/xloginsert.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
@@ -67,9 +68,32 @@ initGinState(GinState *state, Relation index)
 		fmgr_info_copy(&(state->extractQueryFn[i]),
 					   index_getprocinfo(index, i + 1, GIN_EXTRACTQUERY_PROC),
 					   CurrentMemoryContext);
-		fmgr_info_copy(&(state->consistentFn[i]),
-					   index_getprocinfo(index, i + 1, GIN_CONSISTENT_PROC),
-					   CurrentMemoryContext);
+
+		/*
+		 * Check opclass capability to do tri-state or binary logic consistent
+		 * check.
+		 */
+		if (index_getprocid(index, i + 1, GIN_TRICONSISTENT_PROC) != InvalidOid)
+		{
+			fmgr_info_copy(&(state->triConsistentFn[i]),
+					 index_getprocinfo(index, i + 1, GIN_TRICONSISTENT_PROC),
+						   CurrentMemoryContext);
+		}
+
+		if (index_getprocid(index, i + 1, GIN_CONSISTENT_PROC) != InvalidOid)
+		{
+			fmgr_info_copy(&(state->consistentFn[i]),
+						index_getprocinfo(index, i + 1, GIN_CONSISTENT_PROC),
+						   CurrentMemoryContext);
+		}
+
+		if (state->consistentFn[i].fn_oid == InvalidOid &&
+			state->triConsistentFn[i].fn_oid == InvalidOid)
+		{
+			elog(ERROR, "missing GIN support function (%d or %d) for attribute %d of index \"%s\"",
+				 GIN_CONSISTENT_PROC, GIN_TRICONSISTENT_PROC,
+				 i + 1, RelationGetRelationName(index));
+		}
 
 		/*
 		 * Check opclass capability to do partial match.
@@ -436,7 +460,7 @@ ginExtractEntries(GinState *ginstate, OffsetNumber attnum,
 	 * If there's more than one key, sort and unique-ify.
 	 *
 	 * XXX Using qsort here is notationally painful, and the overhead is
-	 * pretty bad too.	For small numbers of keys it'd likely be better to use
+	 * pretty bad too.  For small numbers of keys it'd likely be better to use
 	 * a simple insertion sort.
 	 */
 	if (*nentries > 1)
@@ -501,7 +525,9 @@ ginoptions(PG_FUNCTION_ARGS)
 	GinOptions *rdopts;
 	int			numoptions;
 	static const relopt_parse_elt tab[] = {
-		{"fastupdate", RELOPT_TYPE_BOOL, offsetof(GinOptions, useFastUpdate)}
+		{"fastupdate", RELOPT_TYPE_BOOL, offsetof(GinOptions, useFastUpdate)},
+		{"gin_pending_list_limit", RELOPT_TYPE_INT, offsetof(GinOptions,
+																pendingListCleanupSize)}
 	};
 
 	options = parseRelOptions(reloptions, validate, RELOPT_KIND_GIN,
@@ -579,21 +605,18 @@ ginUpdateStats(Relation index, const GinStatsData *stats)
 	{
 		XLogRecPtr	recptr;
 		ginxlogUpdateMeta data;
-		XLogRecData rdata;
 
 		data.node = index->rd_node;
 		data.ntuples = 0;
 		data.newRightlink = data.prevTail = InvalidBlockNumber;
 		memcpy(&data.metadata, metadata, sizeof(GinMetaPageData));
 
-		rdata.buffer = InvalidBuffer;
-		rdata.data = (char *) &data;
-		rdata.len = sizeof(ginxlogUpdateMeta);
-		rdata.next = NULL;
+		XLogBeginInsert();
+		XLogRegisterData((char *) &data, sizeof(ginxlogUpdateMeta));
+		XLogRegisterBuffer(0, metabuffer, REGBUF_WILL_INIT);
 
-		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE, &rdata);
+		recptr = XLogInsert(RM_GIN_ID, XLOG_GIN_UPDATE_META_PAGE);
 		PageSetLSN(metapage, recptr);
-		PageSetTLI(metapage, ThisTimeLineID);
 	}
 
 	UnlockReleaseBuffer(metabuffer);

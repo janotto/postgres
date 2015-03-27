@@ -3,7 +3,7 @@
  * lsyscache.c
  *	  Convenience routines for common queries in the system catalog cache.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -16,6 +16,7 @@
 #include "postgres.h"
 
 #include "access/hash.h"
+#include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/pg_amop.h"
@@ -33,6 +34,7 @@
 #include "nodes/makefuncs.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
@@ -184,13 +186,13 @@ get_opfamily_member(Oid opfamily, Oid lefttype, Oid righttype,
  * (This indicates that the operator is not a valid ordering operator.)
  *
  * Note: the operator could be registered in multiple families, for example
- * if someone were to build a "reverse sort" opfamily.	This would result in
+ * if someone were to build a "reverse sort" opfamily.  This would result in
  * uncertainty as to whether "ORDER BY USING op" would default to NULLS FIRST
  * or NULLS LAST, as well as inefficient planning due to failure to match up
  * pathkeys that should be the same.  So we want a determinate result here.
  * Because of the way the syscache search works, we'll use the interpretation
  * associated with the opfamily with smallest OID, which is probably
- * determinate enough.	Since there is no longer any particularly good reason
+ * determinate enough.  Since there is no longer any particularly good reason
  * to build reverse-sort opfamilies, it doesn't seem worth expending any
  * additional effort on ensuring consistency.
  */
@@ -241,62 +243,6 @@ get_ordering_op_properties(Oid opno,
 	ReleaseSysCacheList(catlist);
 
 	return result;
-}
-
-/*
- * get_sort_function_for_ordering_op
- *		Get the OID of the datatype-specific btree sort support function,
- *		or if there is none, the btree comparison function,
- *		associated with an ordering operator (a "<" or ">" operator).
- *
- * *sortfunc receives the support or comparison function OID.
- * *issupport is set TRUE if it's a support func, FALSE if a comparison func.
- * *reverse is set FALSE if the operator is "<", TRUE if it's ">"
- * (indicating that comparison results must be negated before use).
- *
- * Returns TRUE if successful, FALSE if no btree function can be found.
- * (This indicates that the operator is not a valid ordering operator.)
- */
-bool
-get_sort_function_for_ordering_op(Oid opno, Oid *sortfunc,
-								  bool *issupport, bool *reverse)
-{
-	Oid			opfamily;
-	Oid			opcintype;
-	int16		strategy;
-
-	/* Find the operator in pg_amop */
-	if (get_ordering_op_properties(opno,
-								   &opfamily, &opcintype, &strategy))
-	{
-		/* Found a suitable opfamily, get matching support function */
-		*sortfunc = get_opfamily_proc(opfamily,
-									  opcintype,
-									  opcintype,
-									  BTSORTSUPPORT_PROC);
-		if (OidIsValid(*sortfunc))
-			*issupport = true;
-		else
-		{
-			/* opfamily doesn't provide sort support, get comparison func */
-			*sortfunc = get_opfamily_proc(opfamily,
-										  opcintype,
-										  opcintype,
-										  BTORDER_PROC);
-			if (!OidIsValid(*sortfunc))		/* should not happen */
-				elog(ERROR, "missing support function %d(%u,%u) in opfamily %u",
-					 BTORDER_PROC, opcintype, opcintype, opfamily);
-			*issupport = false;
-		}
-		*reverse = (strategy == BTGreaterStrategyNumber);
-		return true;
-	}
-
-	/* ensure outputs are set on failure */
-	*sortfunc = InvalidOid;
-	*issupport = false;
-	*reverse = false;
-	return false;
 }
 
 /*
@@ -401,7 +347,7 @@ get_ordering_op_for_equality_op(Oid opno, bool use_lhs_type)
  *
  * The planner currently uses simple equal() tests to compare the lists
  * returned by this function, which makes the list order relevant, though
- * strictly speaking it should not be.	Because of the way syscache list
+ * strictly speaking it should not be.  Because of the way syscache list
  * searches are handled, in normal operation the result will be sorted by OID
  * so everything works fine.  If running with system index usage disabled,
  * the result ordering is unspecified and hence the planner might fail to
@@ -1210,7 +1156,7 @@ op_mergejoinable(Oid opno, Oid inputtype)
  *
  * In some cases (currently only array_eq), hashjoinability depends on the
  * specific input data type the operator is invoked for, so that must be
- * passed as well.	We currently assume that only one input's type is needed
+ * passed as well.  We currently assume that only one input's type is needed
  * to check this --- by convention, pass the left input's data type.
  */
 bool
@@ -1491,6 +1437,25 @@ get_func_signature(Oid funcid, Oid **argtypes, int *nargs)
 }
 
 /*
+ * get_func_variadictype
+ *		Given procedure id, return the function's provariadic field.
+ */
+Oid
+get_func_variadictype(Oid funcid)
+{
+	HeapTuple	tp;
+	Oid			result;
+
+	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
+	if (!HeapTupleIsValid(tp))
+		elog(ERROR, "cache lookup failed for function %u", funcid);
+
+	result = ((Form_pg_proc) GETSTRUCT(tp))->provariadic;
+	ReleaseSysCache(tp);
+	return result;
+}
+
+/*
  * get_func_retset
  *		Given procedure id, return the function's proretset flag.
  */
@@ -1549,7 +1514,7 @@ func_volatile(Oid funcid)
 
 /*
  * get_func_leakproof
- *     Given procedure id, return the function's leakproof field.
+ *	   Given procedure id, return the function's leakproof field.
  */
 bool
 get_func_leakproof(Oid funcid)
@@ -1859,7 +1824,7 @@ get_typbyval(Oid typid)
  *		A two-fer: given the type OID, return both typlen and typbyval.
  *
  *		Since both pieces of info are needed to know how to copy a Datum,
- *		many places need both.	Might as well get them with one cache lookup
+ *		many places need both.  Might as well get them with one cache lookup
  *		instead of two.  Also, this routine raises an error instead of
  *		returning a bogus value when given a bad type OID.
  */
@@ -2390,6 +2355,27 @@ get_array_type(Oid typid)
 }
 
 /*
+ * get_promoted_array_type
+ *
+ *		The "promoted" type is what you'd get from an ARRAY(SELECT ...)
+ *		construct, that is, either the corresponding "true" array type
+ *		if the input is a scalar type that has such an array type,
+ *		or the same type if the input is already a "true" array type.
+ *		Returns InvalidOid if neither rule is satisfied.
+ */
+Oid
+get_promoted_array_type(Oid typid)
+{
+	Oid			array_type = get_array_type(typid);
+
+	if (OidIsValid(array_type))
+		return array_type;
+	if (OidIsValid(get_element_type(typid)))
+		return typid;
+	return InvalidOid;
+}
+
+/*
  * get_base_element_type
  *		Given the type OID, get the typelem, looking "through" any domain
  *		to its underlying array type.
@@ -2914,8 +2900,8 @@ get_range_subtype(Oid rangeOid)
 	tp = SearchSysCache1(RANGETYPE, ObjectIdGetDatum(rangeOid));
 	if (HeapTupleIsValid(tp))
 	{
-		Form_pg_range	rngtup = (Form_pg_range) GETSTRUCT(tp);
-		Oid				result;
+		Form_pg_range rngtup = (Form_pg_range) GETSTRUCT(tp);
+		Oid			result;
 
 		result = rngtup->rngsubtype;
 		ReleaseSysCache(tp);

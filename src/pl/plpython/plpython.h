@@ -2,7 +2,7 @@
  *
  * plpython.h - Python as a procedural language for PostgreSQL
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/pl/plpython/plpython.h
@@ -65,13 +65,6 @@ typedef int Py_ssize_t;
 
 #define PY_SSIZE_T_MAX INT_MAX
 #define PY_SSIZE_T_MIN INT_MIN
-#endif
-
-/*
- * PyBool_FromLong is supported from 2.3.
- */
-#if PY_VERSION_HEX < 0x02030000
-#define PyBool_FromLong(x) PyInt_FromLong(x)
 #endif
 
 /*
@@ -139,11 +132,11 @@ typedef int Py_ssize_t;
 #undef vsnprintf
 #endif
 #ifdef __GNUC__
-#define vsnprintf(...)  pg_vsnprintf(__VA_ARGS__)
-#define snprintf(...)   pg_snprintf(__VA_ARGS__)
+#define vsnprintf(...)	pg_vsnprintf(__VA_ARGS__)
+#define snprintf(...)	pg_snprintf(__VA_ARGS__)
 #else
-#define vsnprintf               pg_vsnprintf
-#define snprintf                pg_snprintf
+#define vsnprintf				pg_vsnprintf
+#define snprintf				pg_snprintf
 #endif   /* __GNUC__ */
 #endif   /* USE_REPL_SNPRINTF */
 

@@ -3,7 +3,7 @@
  * array_typanalyze.c
  *	  Functions for gathering statistics from array columns
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,6 +19,7 @@
 #include "commands/vacuum.h"
 #include "utils/array.h"
 #include "utils/datum.h"
+#include "utils/lsyscache.h"
 #include "utils/typcache.h"
 
 
@@ -42,9 +43,9 @@ typedef struct
 	char		typalign;
 
 	/*
-	 * Lookup data for element type's comparison and hash functions (these
-	 * are in the type's typcache entry, which we expect to remain valid
-	 * over the lifespan of the ANALYZE run)
+	 * Lookup data for element type's comparison and hash functions (these are
+	 * in the type's typcache entry, which we expect to remain valid over the
+	 * lifespan of the ANALYZE run)
 	 */
 	FmgrInfo   *cmp;
 	FmgrInfo   *hash;
@@ -108,11 +109,10 @@ array_typanalyze(PG_FUNCTION_ARGS)
 		PG_RETURN_BOOL(false);
 
 	/*
-	 * Check attribute data type is a varlena array.
+	 * Check attribute data type is a varlena array (or a domain over one).
 	 */
-	element_typeid = stats->attrtype->typelem;
-
-	if (!OidIsValid(element_typeid) || stats->attrtype->typlen != -1)
+	element_typeid = get_base_element_type(stats->attrtypid);
+	if (!OidIsValid(element_typeid))
 		elog(ERROR, "array_typanalyze was invoked for non-array type %u",
 			 stats->attrtypid);
 
@@ -149,8 +149,8 @@ array_typanalyze(PG_FUNCTION_ARGS)
 	stats->extra_data = extra_data;
 
 	/*
-	 * Note we leave stats->minrows set as std_typanalyze set it.  Should
-	 * it be increased for array analysis purposes?
+	 * Note we leave stats->minrows set as std_typanalyze set it.  Should it
+	 * be increased for array analysis purposes?
 	 */
 
 	PG_RETURN_BOOL(true);
@@ -242,8 +242,8 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 
 	/*
 	 * Invoke analyze.c's standard analysis function to create scalar-style
-	 * stats for the column.  It will expect its own extra_data pointer,
-	 * so temporarily install that.
+	 * stats for the column.  It will expect its own extra_data pointer, so
+	 * temporarily install that.
 	 */
 	stats->extra_data = extra_data->std_extra_data;
 	(*extra_data->std_compute_stats) (stats, fetchfunc, samplerows, totalrows);
@@ -282,7 +282,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	elem_hash_ctl.match = element_match;
 	elem_hash_ctl.hcxt = CurrentMemoryContext;
 	elements_tab = hash_create("Analyzed elements table",
-							   bucket_width * 7,
+							   num_mcelem,
 							   &elem_hash_ctl,
 					HASH_ELEM | HASH_FUNCTION | HASH_COMPARE | HASH_CONTEXT);
 
@@ -290,12 +290,11 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 	MemSet(&count_hash_ctl, 0, sizeof(count_hash_ctl));
 	count_hash_ctl.keysize = sizeof(int);
 	count_hash_ctl.entrysize = sizeof(DECountItem);
-	count_hash_ctl.hash = tag_hash;
 	count_hash_ctl.hcxt = CurrentMemoryContext;
 	count_tab = hash_create("Array distinct element count table",
 							64,
 							&count_hash_ctl,
-							HASH_ELEM | HASH_FUNCTION | HASH_CONTEXT);
+							HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	/* Initialize counters. */
 	b_current = 1;
@@ -373,8 +372,8 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 				/* The element value is already on the tracking list */
 
 				/*
-				 * The operators we assist ignore duplicate array elements,
-				 * so count a given distinct element only once per array.
+				 * The operators we assist ignore duplicate array elements, so
+				 * count a given distinct element only once per array.
 				 */
 				if (item->last_container == array_no)
 					continue;
@@ -387,11 +386,11 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 				/* Initialize new tracking list element */
 
 				/*
-				 * If element type is pass-by-reference, we must copy it
-				 * into palloc'd space, so that we can release the array
-				 * below.  (We do this so that the space needed for element
-				 * values is limited by the size of the hashtable; if we
-				 * kept all the array values around, it could be much more.)
+				 * If element type is pass-by-reference, we must copy it into
+				 * palloc'd space, so that we can release the array below. (We
+				 * do this so that the space needed for element values is
+				 * limited by the size of the hashtable; if we kept all the
+				 * array values around, it could be much more.)
 				 */
 				item->key = datumCopy(elem_value,
 									  extra_data->typbyval,
@@ -463,7 +462,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 
 		/*
 		 * Construct an array of the interesting hashtable items, that is,
-		 * those meeting the cutoff frequency (s - epsilon)*N.	Also identify
+		 * those meeting the cutoff frequency (s - epsilon)*N.  Also identify
 		 * the minimum and maximum frequencies among these items.
 		 *
 		 * Since epsilon = s/10 and bucket_width = 1/epsilon, the cutoff
@@ -498,7 +497,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 
 		/*
 		 * If we obtained more elements than we really want, get rid of those
-		 * with least frequencies.	The easiest way is to qsort the array into
+		 * with least frequencies.  The easiest way is to qsort the array into
 		 * descending frequency order and truncate the array.
 		 */
 		if (num_mcelem < track_len)
@@ -532,7 +531,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 			/*
 			 * We sorted statistics on the element value, but we want to be
 			 * able to find the minimal and maximal frequencies without going
-			 * through all the values.	We also want the frequency of null
+			 * through all the values.  We also want the frequency of null
 			 * elements.  Store these three values at the end of mcelem_freqs.
 			 */
 			mcelem_values = (Datum *) palloc(num_mcelem * sizeof(Datum));
@@ -655,7 +654,7 @@ compute_array_stats(VacAttrStats *stats, AnalyzeAttrFetchFunc fetchfunc,
 					frac += (int64) sorted_count_items[j]->frequency * (num_hist - 1);
 				}
 				hist[i] = sorted_count_items[j]->count;
-				frac -= delta;		/* update y for upcoming i increment */
+				frac -= delta;	/* update y for upcoming i increment */
 			}
 			Assert(j == count_items_count - 1);
 
@@ -775,8 +774,8 @@ trackitem_compare_element(const void *e1, const void *e2)
 static int
 countitem_compare_count(const void *e1, const void *e2)
 {
-	const DECountItem * const *t1 = (const DECountItem * const *) e1;
-	const DECountItem * const *t2 = (const DECountItem * const *) e2;
+	const DECountItem *const * t1 = (const DECountItem *const *) e1;
+	const DECountItem *const * t2 = (const DECountItem *const *) e2;
 
 	if ((*t1)->count < (*t2)->count)
 		return -1;

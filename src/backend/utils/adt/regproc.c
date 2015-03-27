@@ -8,7 +8,7 @@
  * special I/O conversion routines.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -23,6 +23,7 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
@@ -31,6 +32,7 @@
 #include "catalog/pg_ts_config.h"
 #include "catalog/pg_ts_dict.h"
 #include "catalog/pg_type.h"
+#include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "parser/parse_type.h"
 #include "utils/builtins.h"
@@ -39,6 +41,8 @@
 #include "utils/syscache.h"
 #include "utils/tqual.h"
 
+static char *format_operator_internal(Oid operator_oid, bool force_qualify);
+static char *format_procedure_internal(Oid procedure_oid, bool force_qualify);
 static void parseNameAndArgTypes(const char *string, bool allowNone,
 					 List **names, int *nargs, Oid *argtypes);
 
@@ -81,7 +85,7 @@ regprocin(PG_FUNCTION_ARGS)
 
 	/*
 	 * In bootstrap mode we assume the given name is not schema-qualified, and
-	 * just search pg_proc for a unique match.	This is needed for
+	 * just search pg_proc for a unique match.  This is needed for
 	 * initializing other system catalogs (pg_namespace may not exist yet, and
 	 * certainly there are no schemas other than pg_catalog).
 	 */
@@ -100,7 +104,7 @@ regprocin(PG_FUNCTION_ARGS)
 
 		hdesc = heap_open(ProcedureRelationId, AccessShareLock);
 		sysscan = systable_beginscan(hdesc, ProcedureNameArgsNspIndexId, true,
-									 SnapshotNow, 1, skey);
+									 NULL, 1, skey);
 
 		while (HeapTupleIsValid(tuple = systable_getnext(sysscan)))
 		{
@@ -131,7 +135,7 @@ regprocin(PG_FUNCTION_ARGS)
 	 * pg_proc entries in the current search path.
 	 */
 	names = stringToQualifiedNameList(pro_name_or_oid);
-	clist = FuncnameGetCandidates(names, -1, NIL, false, false);
+	clist = FuncnameGetCandidates(names, -1, NIL, false, false, false);
 
 	if (clist == NULL)
 		ereport(ERROR,
@@ -146,6 +150,31 @@ regprocin(PG_FUNCTION_ARGS)
 	result = clist->oid;
 
 	PG_RETURN_OID(result);
+}
+
+/*
+ * to_regproc	- converts "proname" to proc OID
+ *
+ * If the name is not found, we return NULL.
+ */
+Datum
+to_regproc(PG_FUNCTION_ARGS)
+{
+	char	   *pro_name = PG_GETARG_CSTRING(0);
+	List	   *names;
+	FuncCandidateList clist;
+
+	/*
+	 * Parse the name into components and see if it matches any pg_proc
+	 * entries in the current search path.
+	 */
+	names = stringToQualifiedNameList(pro_name);
+	clist = FuncnameGetCandidates(names, -1, NIL, false, false, true);
+
+	if (clist == NULL || clist->next != NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_OID(clist->oid);
 }
 
 /*
@@ -188,7 +217,7 @@ regprocout(PG_FUNCTION_ARGS)
 			 * qualify it.
 			 */
 			clist = FuncnameGetCandidates(list_make1(makeString(proname)),
-										  -1, NIL, false, false);
+										  -1, NIL, false, false, false);
 			if (clist != NULL && clist->next == NULL &&
 				clist->oid == proid)
 				nspname = NULL;
@@ -266,7 +295,7 @@ regprocedurein(PG_FUNCTION_ARGS)
 	/*
 	 * Else it's a name and arguments.  Parse the name and arguments, look up
 	 * potential matches in the current namespace search list, and scan to see
-	 * which one exactly matches the given argument types.	(There will not be
+	 * which one exactly matches the given argument types.  (There will not be
 	 * more than one match.)
 	 *
 	 * XXX at present, this code will not work in bootstrap mode, hence this
@@ -275,7 +304,7 @@ regprocedurein(PG_FUNCTION_ARGS)
 	 */
 	parseNameAndArgTypes(pro_name_or_oid, false, &names, &nargs, argtypes);
 
-	clist = FuncnameGetCandidates(names, nargs, NIL, false, false);
+	clist = FuncnameGetCandidates(names, nargs, NIL, false, false, false);
 
 	for (; clist; clist = clist->next)
 	{
@@ -294,6 +323,38 @@ regprocedurein(PG_FUNCTION_ARGS)
 }
 
 /*
+ * to_regprocedure	- converts "proname(args)" to proc OID
+ *
+ * If the name is not found, we return NULL.
+ */
+Datum
+to_regprocedure(PG_FUNCTION_ARGS)
+{
+	char	   *pro_name = PG_GETARG_CSTRING(0);
+	List	   *names;
+	int			nargs;
+	Oid			argtypes[FUNC_MAX_ARGS];
+	FuncCandidateList clist;
+
+	/*
+	 * Parse the name and arguments, look up potential matches in the current
+	 * namespace search list, and scan to see which one exactly matches the
+	 * given argument types.    (There will not be more than one match.)
+	 */
+	parseNameAndArgTypes(pro_name, false, &names, &nargs, argtypes);
+
+	clist = FuncnameGetCandidates(names, nargs, NIL, false, false, true);
+
+	for (; clist; clist = clist->next)
+	{
+		if (memcmp(clist->args, argtypes, nargs * sizeof(Oid)) == 0)
+			PG_RETURN_OID(clist->oid);
+	}
+
+	PG_RETURN_NULL();
+}
+
+/*
  * format_procedure		- converts proc OID to "pro_name(args)"
  *
  * This exports the useful functionality of regprocedureout for use
@@ -301,6 +362,25 @@ regprocedurein(PG_FUNCTION_ARGS)
  */
 char *
 format_procedure(Oid procedure_oid)
+{
+	return format_procedure_internal(procedure_oid, false);
+}
+
+char *
+format_procedure_qualified(Oid procedure_oid)
+{
+	return format_procedure_internal(procedure_oid, true);
+}
+
+/*
+ * Routine to produce regprocedure names; see format_procedure above.
+ *
+ * force_qualify says whether to schema-qualify; if true, the name is always
+ * qualified regardless of search_path visibility.  Otherwise the name is only
+ * qualified if the function is not in path.
+ */
+static char *
+format_procedure_internal(Oid procedure_oid, bool force_qualify)
 {
 	char	   *result;
 	HeapTuple	proctup;
@@ -322,9 +402,9 @@ format_procedure(Oid procedure_oid)
 
 		/*
 		 * Would this proc be found (given the right args) by regprocedurein?
-		 * If not, we need to qualify it.
+		 * If not, or if caller requests it, we need to qualify it.
 		 */
-		if (FunctionIsVisible(procedure_oid))
+		if (!force_qualify && FunctionIsVisible(procedure_oid))
 			nspname = NULL;
 		else
 			nspname = get_namespace_name(procform->pronamespace);
@@ -337,7 +417,10 @@ format_procedure(Oid procedure_oid)
 
 			if (i > 0)
 				appendStringInfoChar(&buf, ',');
-			appendStringInfoString(&buf, format_type_be(thisargtype));
+			appendStringInfoString(&buf,
+								   force_qualify ?
+								   format_type_be_qualified(thisargtype) :
+								   format_type_be(thisargtype));
 		}
 		appendStringInfoChar(&buf, ')');
 
@@ -353,6 +436,41 @@ format_procedure(Oid procedure_oid)
 	}
 
 	return result;
+}
+
+/*
+ * Output a objname/objargs representation for the procedure with the
+ * given OID.  If it doesn't exist, an error is thrown.
+ *
+ * This can be used to feed get_object_address.
+ */
+void
+format_procedure_parts(Oid procedure_oid, List **objnames, List **objargs)
+{
+	HeapTuple	proctup;
+	Form_pg_proc procform;
+	int			nargs;
+	int			i;
+
+	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(procedure_oid));
+
+	if (!HeapTupleIsValid(proctup))
+		elog(ERROR, "cache lookup failed for procedure with OID %u", procedure_oid);
+
+	procform = (Form_pg_proc) GETSTRUCT(proctup);
+	nargs = procform->pronargs;
+
+	*objnames = list_make2(get_namespace_name(procform->pronamespace),
+						   pstrdup(NameStr(procform->proname)));
+	*objargs = NIL;
+	for (i = 0; i < nargs; i++)
+	{
+		Oid		thisargtype = procform->proargtypes.values[i];
+
+		*objargs = lappend(*objargs, format_type_be_qualified(thisargtype));
+	}
+
+	ReleaseSysCache(proctup);
 }
 
 /*
@@ -427,7 +545,7 @@ regoperin(PG_FUNCTION_ARGS)
 
 	/*
 	 * In bootstrap mode we assume the given name is not schema-qualified, and
-	 * just search pg_operator for a unique match.	This is needed for
+	 * just search pg_operator for a unique match.  This is needed for
 	 * initializing other system catalogs (pg_namespace may not exist yet, and
 	 * certainly there are no schemas other than pg_catalog).
 	 */
@@ -446,7 +564,7 @@ regoperin(PG_FUNCTION_ARGS)
 
 		hdesc = heap_open(OperatorRelationId, AccessShareLock);
 		sysscan = systable_beginscan(hdesc, OperatorNameNspIndexId, true,
-									 SnapshotNow, 1, skey);
+									 NULL, 1, skey);
 
 		while (HeapTupleIsValid(tuple = systable_getnext(sysscan)))
 		{
@@ -476,7 +594,7 @@ regoperin(PG_FUNCTION_ARGS)
 	 * pg_operator entries in the current search path.
 	 */
 	names = stringToQualifiedNameList(opr_name_or_oid);
-	clist = OpernameGetCandidates(names, '\0');
+	clist = OpernameGetCandidates(names, '\0', false);
 
 	if (clist == NULL)
 		ereport(ERROR,
@@ -491,6 +609,31 @@ regoperin(PG_FUNCTION_ARGS)
 	result = clist->oid;
 
 	PG_RETURN_OID(result);
+}
+
+/*
+ * to_regoper		- converts "oprname" to operator OID
+ *
+ * If the name is not found, we return NULL.
+ */
+Datum
+to_regoper(PG_FUNCTION_ARGS)
+{
+	char	   *opr_name = PG_GETARG_CSTRING(0);
+	List	   *names;
+	FuncCandidateList clist;
+
+	/*
+	 * Parse the name into components and see if it matches any pg_operator
+	 * entries in the current search path.
+	 */
+	names = stringToQualifiedNameList(opr_name);
+	clist = OpernameGetCandidates(names, '\0', true);
+
+	if (clist == NULL || clist->next != NULL)
+		PG_RETURN_NULL();
+
+	PG_RETURN_OID(clist->oid);
 }
 
 /*
@@ -532,7 +675,7 @@ regoperout(PG_FUNCTION_ARGS)
 			 * qualify it.
 			 */
 			clist = OpernameGetCandidates(list_make1(makeString(oprname)),
-										  '\0');
+										  '\0', false);
 			if (clist != NULL && clist->next == NULL &&
 				clist->oid == oprid)
 				result = pstrdup(oprname);
@@ -616,7 +759,7 @@ regoperatorin(PG_FUNCTION_ARGS)
 	/*
 	 * Else it's a name and arguments.  Parse the name and arguments, look up
 	 * potential matches in the current namespace search list, and scan to see
-	 * which one exactly matches the given argument types.	(There will not be
+	 * which one exactly matches the given argument types.  (There will not be
 	 * more than one match.)
 	 *
 	 * XXX at present, this code will not work in bootstrap mode, hence this
@@ -646,13 +789,52 @@ regoperatorin(PG_FUNCTION_ARGS)
 }
 
 /*
+ * to_regoperator	- converts "oprname(args)" to operator OID
+ *
+ * If the name is not found, we return NULL.
+ */
+Datum
+to_regoperator(PG_FUNCTION_ARGS)
+{
+	char	   *opr_name_or_oid = PG_GETARG_CSTRING(0);
+	Oid			result;
+	List	   *names;
+	int			nargs;
+	Oid			argtypes[FUNC_MAX_ARGS];
+
+	/*
+	 * Parse the name and arguments, look up potential matches in the current
+	 * namespace search list, and scan to see which one exactly matches the
+	 * given argument types.    (There will not be more than one match.)
+	 */
+	parseNameAndArgTypes(opr_name_or_oid, true, &names, &nargs, argtypes);
+	if (nargs == 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_PARAMETER),
+				 errmsg("missing argument"),
+				 errhint("Use NONE to denote the missing argument of a unary operator.")));
+	if (nargs != 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+				 errmsg("too many arguments"),
+				 errhint("Provide two argument types for operator.")));
+
+	result = OpernameGetOprid(names, argtypes[0], argtypes[1]);
+
+	if (!OidIsValid(result))
+		PG_RETURN_NULL();
+
+	PG_RETURN_OID(result);
+}
+
+/*
  * format_operator		- converts operator OID to "opr_name(args)"
  *
  * This exports the useful functionality of regoperatorout for use
  * in other backend modules.  The result is a palloc'd string.
  */
-char *
-format_operator(Oid operator_oid)
+static char *
+format_operator_internal(Oid operator_oid, bool force_qualify)
 {
 	char	   *result;
 	HeapTuple	opertup;
@@ -672,9 +854,10 @@ format_operator(Oid operator_oid)
 
 		/*
 		 * Would this oper be found (given the right args) by regoperatorin?
-		 * If not, we need to qualify it.
+		 * If not, or if caller explicitely requests it, we need to qualify
+		 * it.
 		 */
-		if (!OperatorIsVisible(operator_oid))
+		if (force_qualify || !OperatorIsVisible(operator_oid))
 		{
 			nspname = get_namespace_name(operform->oprnamespace);
 			appendStringInfo(&buf, "%s.",
@@ -685,15 +868,19 @@ format_operator(Oid operator_oid)
 
 		if (operform->oprleft)
 			appendStringInfo(&buf, "%s,",
+							 force_qualify ?
+							 format_type_be_qualified(operform->oprleft) :
 							 format_type_be(operform->oprleft));
 		else
-			appendStringInfo(&buf, "NONE,");
+			appendStringInfoString(&buf, "NONE,");
 
 		if (operform->oprright)
 			appendStringInfo(&buf, "%s)",
+							 force_qualify ?
+							 format_type_be_qualified(operform->oprright) :
 							 format_type_be(operform->oprright));
 		else
-			appendStringInfo(&buf, "NONE)");
+			appendStringInfoString(&buf, "NONE)");
 
 		result = buf.data;
 
@@ -709,6 +896,43 @@ format_operator(Oid operator_oid)
 	}
 
 	return result;
+}
+
+char *
+format_operator(Oid operator_oid)
+{
+	return format_operator_internal(operator_oid, false);
+}
+
+char *
+format_operator_qualified(Oid operator_oid)
+{
+	return format_operator_internal(operator_oid, true);
+}
+
+void
+format_operator_parts(Oid operator_oid, List **objnames, List **objargs)
+{
+	HeapTuple	opertup;
+	Form_pg_operator oprForm;
+
+	opertup = SearchSysCache1(OPEROID, ObjectIdGetDatum(operator_oid));
+	if (!HeapTupleIsValid(opertup))
+		elog(ERROR, "cache lookup failed for operator with OID %u",
+			 operator_oid);
+
+	oprForm = (Form_pg_operator) GETSTRUCT(opertup);
+	*objnames = list_make2(get_namespace_name(oprForm->oprnamespace),
+						   pstrdup(NameStr(oprForm->oprname)));
+	*objargs = NIL;
+	if (oprForm->oprleft)
+		*objargs = lappend(*objargs,
+						   format_type_be_qualified(oprForm->oprleft));
+	if (oprForm->oprright)
+		*objargs = lappend(*objargs,
+						   format_type_be_qualified(oprForm->oprright));
+
+	ReleaseSysCache(opertup);
 }
 
 /*
@@ -800,7 +1024,7 @@ regclassin(PG_FUNCTION_ARGS)
 
 		hdesc = heap_open(RelationRelationId, AccessShareLock);
 		sysscan = systable_beginscan(hdesc, ClassNameNspIndexId, true,
-									 SnapshotNow, 1, skey);
+									 NULL, 1, skey);
 
 		if (HeapTupleIsValid(tuple = systable_getnext(sysscan)))
 			result = HeapTupleGetOid(tuple);
@@ -830,6 +1054,33 @@ regclassin(PG_FUNCTION_ARGS)
 }
 
 /*
+ * to_regclass		- converts "classname" to class OID
+ *
+ * If the name is not found, we return NULL.
+ */
+Datum
+to_regclass(PG_FUNCTION_ARGS)
+{
+	char	   *class_name = PG_GETARG_CSTRING(0);
+	Oid			result;
+	List	   *names;
+
+	/*
+	 * Parse the name into components and see if it matches any pg_class
+	 * entries in the current search path.
+	 */
+	names = stringToQualifiedNameList(class_name);
+
+	/* We might not even have permissions on this relation; don't lock it. */
+	result = RangeVarGetRelid(makeRangeVarFromNameList(names), NoLock, true);
+
+	if (OidIsValid(result))
+		PG_RETURN_OID(result);
+	else
+		PG_RETURN_NULL();
+}
+
+/*
  * regclassout		- converts class OID to "class_name"
  */
 Datum
@@ -854,7 +1105,7 @@ regclassout(PG_FUNCTION_ARGS)
 
 		/*
 		 * In bootstrap mode, skip the fancy namespace stuff and just return
-		 * the class name.	(This path is only needed for debugging output
+		 * the class name.  (This path is only needed for debugging output
 		 * anyway.)
 		 */
 		if (IsBootstrapProcessingMode())
@@ -964,7 +1215,7 @@ regtypein(PG_FUNCTION_ARGS)
 
 		hdesc = heap_open(TypeRelationId, AccessShareLock);
 		sysscan = systable_beginscan(hdesc, TypeNameNspIndexId, true,
-									 SnapshotNow, 1, skey);
+									 NULL, 1, skey);
 
 		if (HeapTupleIsValid(tuple = systable_getnext(sysscan)))
 			result = HeapTupleGetOid(tuple);
@@ -985,9 +1236,32 @@ regtypein(PG_FUNCTION_ARGS)
 	 * Normal case: invoke the full parser to deal with special cases such as
 	 * array syntax.
 	 */
-	parseTypeString(typ_name_or_oid, &result, &typmod);
+	parseTypeString(typ_name_or_oid, &result, &typmod, false);
 
 	PG_RETURN_OID(result);
+}
+
+/*
+ * to_regtype		- converts "typename" to type OID
+ *
+ * If the name is not found, we return NULL.
+ */
+Datum
+to_regtype(PG_FUNCTION_ARGS)
+{
+	char	   *typ_name = PG_GETARG_CSTRING(0);
+	Oid			result;
+	int32		typmod;
+
+	/*
+	 * Invoke the full parser to deal with special cases such as array syntax.
+	 */
+	parseTypeString(typ_name, &result, &typmod, true);
+
+	if (OidIsValid(result))
+		PG_RETURN_OID(result);
+	else
+		PG_RETURN_NULL();
 }
 
 /*
@@ -1346,7 +1620,7 @@ stringToQualifiedNameList(const char *string)
 
 /*
  * Given a C string, parse it into a qualified function or operator name
- * followed by a parenthesized list of type names.	Reduce the
+ * followed by a parenthesized list of type names.  Reduce the
  * type names to an array of OIDs (returned into *nargs and *argtypes;
  * the argtypes array should be of size FUNC_MAX_ARGS).  The function or
  * operator name is returned to *names as a List of Strings.
@@ -1480,7 +1754,7 @@ parseNameAndArgTypes(const char *string, bool allowNone, List **names,
 		else
 		{
 			/* Use full parser to resolve the type name */
-			parseTypeString(typename, &typeid, &typmod);
+			parseTypeString(typename, &typeid, &typmod, false);
 		}
 		if (*nargs >= FUNC_MAX_ARGS)
 			ereport(ERROR,

@@ -1,9 +1,17 @@
 /*-------------------------------------------------------------------------
  *
  * nodeSubplan.c
- *	  routines to support subselects
+ *	  routines to support sub-selects appearing in expressions
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * This module is concerned with executing SubPlan expression nodes, which
+ * should not be confused with sub-SELECTs appearing in FROM.  SubPlans are
+ * divided into "initplans", which are those that need only one evaluation per
+ * query (among other restrictions, this requires that they don't use any
+ * direct correlation variables from the parent plan level), and "regular"
+ * subplans, which are re-evaluated every time their result is required.
+ *
+ *
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,8 +26,10 @@
  */
 #include "postgres.h"
 
+#include <limits.h>
 #include <math.h>
 
+#include "access/htup_details.h"
 #include "executor/executor.h"
 #include "executor/nodeSubplan.h"
 #include "nodes/makefuncs.h"
@@ -44,13 +54,16 @@ static Datum ExecScanSubPlan(SubPlanState *node,
 				ExprContext *econtext,
 				bool *isNull);
 static void buildSubPlanHash(SubPlanState *node, ExprContext *econtext);
-static bool findPartialMatch(TupleHashTable hashtable, TupleTableSlot *slot);
+static bool findPartialMatch(TupleHashTable hashtable, TupleTableSlot *slot,
+				 FmgrInfo *eqfunctions);
 static bool slotAllNulls(TupleTableSlot *slot);
 static bool slotNoNulls(TupleTableSlot *slot);
 
 
 /* ----------------------------------------------------------------
  *		ExecSubPlan
+ *
+ * This is the main entry point for execution of a regular SubPlan.
  * ----------------------------------------------------------------
  */
 static Datum
@@ -69,7 +82,7 @@ ExecSubPlan(SubPlanState *node,
 	/* Sanity checks */
 	if (subplan->subLinkType == CTE_SUBLINK)
 		elog(ERROR, "CTE subplans should not be executed via ExecSubPlan");
-	if (subplan->setParam != NIL)
+	if (subplan->setParam != NIL && subplan->subLinkType != MULTIEXPR_SUBLINK)
 		elog(ERROR, "cannot set parent params from subquery");
 
 	/* Select appropriate evaluation strategy */
@@ -151,7 +164,7 @@ ExecHashSubPlan(SubPlanState *node,
 			return BoolGetDatum(true);
 		}
 		if (node->havenullrows &&
-			findPartialMatch(node->hashnulls, slot))
+			findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
 		{
 			ExecClearTuple(slot);
 			*isNull = true;
@@ -184,14 +197,14 @@ ExecHashSubPlan(SubPlanState *node,
 	}
 	/* Scan partly-null table first, since more likely to get a match */
 	if (node->havenullrows &&
-		findPartialMatch(node->hashnulls, slot))
+		findPartialMatch(node->hashnulls, slot, node->cur_eq_funcs))
 	{
 		ExecClearTuple(slot);
 		*isNull = true;
 		return BoolGetDatum(false);
 	}
 	if (node->havehashrows &&
-		findPartialMatch(node->hashtable, slot))
+		findPartialMatch(node->hashtable, slot, node->cur_eq_funcs))
 	{
 		ExecClearTuple(slot);
 		*isNull = true;
@@ -218,7 +231,38 @@ ExecScanSubPlan(SubPlanState *node,
 	bool		found = false;	/* TRUE if got at least one subplan tuple */
 	ListCell   *pvar;
 	ListCell   *l;
-	ArrayBuildState *astate = NULL;
+	ArrayBuildStateAny *astate = NULL;
+
+	/*
+	 * MULTIEXPR subplans, when "executed", just return NULL; but first we
+	 * mark the subplan's output parameters as needing recalculation.  (This
+	 * is a bit of a hack: it relies on the subplan appearing later in its
+	 * targetlist than any of the referencing Params, so that all the Params
+	 * have been evaluated before we re-mark them for the next evaluation
+	 * cycle.  But in general resjunk tlist items appear after non-resjunk
+	 * ones, so this should be safe.)  Unlike ExecReScanSetParamPlan, we do
+	 * *not* set bits in the parent plan node's chgParam, because we don't
+	 * want to cause a rescan of the parent.
+	 */
+	if (subLinkType == MULTIEXPR_SUBLINK)
+	{
+		EState	   *estate = node->parent->state;
+
+		foreach(l, subplan->setParam)
+		{
+			int			paramid = lfirst_int(l);
+			ParamExecData *prm = &(estate->es_param_exec_vals[paramid]);
+
+			prm->execPlan = node;
+		}
+		*isNull = true;
+		return (Datum) 0;
+	}
+
+	/* Initialize ArrayBuildStateAny in caller's context, if needed */
+	if (subLinkType == ARRAY_SUBLINK)
+		astate = initArrayResultAny(subplan->firstColType,
+									CurrentMemoryContext, true);
 
 	/*
 	 * We are probably in a short-lived expression-evaluation context. Switch
@@ -258,12 +302,12 @@ ExecScanSubPlan(SubPlanState *node,
 	 * semantics for ANY_SUBLINK or AND semantics for ALL_SUBLINK.
 	 * (ROWCOMPARE_SUBLINK doesn't allow multiple tuples from the subplan.)
 	 * NULL results from the combining operators are handled according to the
-	 * usual SQL semantics for OR and AND.	The result for no input tuples is
+	 * usual SQL semantics for OR and AND.  The result for no input tuples is
 	 * FALSE for ANY_SUBLINK, TRUE for ALL_SUBLINK, NULL for
 	 * ROWCOMPARE_SUBLINK.
 	 *
 	 * For EXPR_SUBLINK we require the subplan to produce no more than one
-	 * tuple, else an error is raised.	If zero tuples are produced, we return
+	 * tuple, else an error is raised.  If zero tuples are produced, we return
 	 * NULL.  Assuming we get a tuple, we just use its first column (there can
 	 * be only one non-junk column in this case).
 	 *
@@ -327,8 +371,8 @@ ExecScanSubPlan(SubPlanState *node,
 			/* stash away current value */
 			Assert(subplan->firstColType == tdesc->attrs[0]->atttypid);
 			dvalue = slot_getattr(slot, 1, &disnull);
-			astate = accumArrayResult(astate, dvalue, disnull,
-									  subplan->firstColType, oldcontext);
+			astate = accumArrayResultAny(astate, dvalue, disnull,
+										 subplan->firstColType, oldcontext);
 			/* keep scanning subplan to collect all values */
 			continue;
 		}
@@ -398,15 +442,12 @@ ExecScanSubPlan(SubPlanState *node,
 	if (subLinkType == ARRAY_SUBLINK)
 	{
 		/* We return the result in the caller's context */
-		if (astate != NULL)
-			result = makeArrayResult(astate, oldcontext);
-		else
-			result = PointerGetDatum(construct_empty_array(subplan->firstColType));
+		result = makeArrayResultAny(astate, oldcontext, true);
 	}
 	else if (!found)
 	{
 		/*
-		 * deal with empty subplan result.	result/isNull were previously
+		 * deal with empty subplan result.  result/isNull were previously
 		 * initialized correctly for all sublink types except EXPR and
 		 * ROWCOMPARE; for those, return NULL.
 		 */
@@ -571,9 +612,13 @@ buildSubPlanHash(SubPlanState *node, ExprContext *econtext)
  * We have to scan the whole hashtable; we can't usefully use hashkeys
  * to guide probing, since we might get partial matches on tuples with
  * hashkeys quite unrelated to what we'd get from the given tuple.
+ *
+ * Caller must provide the equality functions to use, since in cross-type
+ * cases these are different from the hashtable's internal functions.
  */
 static bool
-findPartialMatch(TupleHashTable hashtable, TupleTableSlot *slot)
+findPartialMatch(TupleHashTable hashtable, TupleTableSlot *slot,
+				 FmgrInfo *eqfunctions)
 {
 	int			numCols = hashtable->numCols;
 	AttrNumber *keyColIdx = hashtable->keyColIdx;
@@ -586,7 +631,7 @@ findPartialMatch(TupleHashTable hashtable, TupleTableSlot *slot)
 		ExecStoreMinimalTuple(entry->firstTuple, hashtable->tableslot, false);
 		if (!execTuplesUnequal(slot, hashtable->tableslot,
 							   numCols, keyColIdx,
-							   hashtable->cur_eq_funcs,
+							   eqfunctions,
 							   hashtable->tempcxt))
 		{
 			TermTupleHashIterator(&hashiter);
@@ -660,6 +705,9 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	sstate->planstate = (PlanState *) list_nth(estate->es_subplanstates,
 											   subplan->plan_id - 1);
 
+	/* ... and to its parent's state */
+	sstate->parent = parent;
+
 	/* Initialize subexpressions */
 	sstate->testexpr = ExecInitExpr((Expr *) subplan->testexpr, parent);
 	sstate->args = (List *) ExecInitExpr((Expr *) subplan->args, parent);
@@ -668,6 +716,7 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	 * initialize my state
 	 */
 	sstate->curTuple = NULL;
+	sstate->curArray = PointerGetDatum(NULL);
 	sstate->projLeft = NULL;
 	sstate->projRight = NULL;
 	sstate->hashtable = NULL;
@@ -682,15 +731,16 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 	sstate->cur_eq_funcs = NULL;
 
 	/*
-	 * If this plan is un-correlated or undirect correlated one and want to
-	 * set params for parent plan then mark parameters as needing evaluation.
+	 * If this is an initplan or MULTIEXPR subplan, it has output parameters
+	 * that the parent plan will use, so mark those parameters as needing
+	 * evaluation.  We don't actually run the subplan until we first need one
+	 * of its outputs.
 	 *
 	 * A CTE subplan's output parameter is never to be evaluated in the normal
 	 * way, so skip this in that case.
 	 *
-	 * Note that in the case of un-correlated subqueries we don't care about
-	 * setting parent->chgParam here: indices take care about it, for others -
-	 * it doesn't matter...
+	 * Note that we don't set parent->chgParam here: the parent plan hasn't
+	 * been run yet, so no need to force it to re-run.
 	 */
 	if (subplan->setParam != NIL && subplan->subLinkType != CTE_SUBLINK)
 	{
@@ -882,11 +932,11 @@ ExecInitSubPlan(SubPlan *subplan, PlanState *parent)
 /* ----------------------------------------------------------------
  *		ExecSetParamPlan
  *
- *		Executes an InitPlan subplan and sets its output parameters.
+ *		Executes a subplan and sets its output parameters.
  *
  * This is called from ExecEvalParamExec() when the value of a PARAM_EXEC
  * parameter is requested and the param's execPlan field is set (indicating
- * that the param has not yet been evaluated).	This allows lazy evaluation
+ * that the param has not yet been evaluated).  This allows lazy evaluation
  * of initplans: we don't run the subplan until/unless we need its output.
  * Note that this routine MUST clear the execPlan fields of the plan's
  * output parameters after evaluating them!
@@ -900,9 +950,10 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	SubLinkType subLinkType = subplan->subLinkType;
 	MemoryContext oldcontext;
 	TupleTableSlot *slot;
+	ListCell   *pvar;
 	ListCell   *l;
 	bool		found = false;
-	ArrayBuildState *astate = NULL;
+	ArrayBuildStateAny *astate = NULL;
 
 	if (subLinkType == ANY_SUBLINK ||
 		subLinkType == ALL_SUBLINK)
@@ -910,10 +961,36 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 	if (subLinkType == CTE_SUBLINK)
 		elog(ERROR, "CTE subplans should not be executed via ExecSetParamPlan");
 
+	/* Initialize ArrayBuildStateAny in caller's context, if needed */
+	if (subLinkType == ARRAY_SUBLINK)
+		astate = initArrayResultAny(subplan->firstColType,
+									CurrentMemoryContext, true);
+
 	/*
 	 * Must switch to per-query memory context.
 	 */
 	oldcontext = MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
+
+	/*
+	 * Set Params of this plan from parent plan correlation values. (Any
+	 * calculation we have to do is done in the parent econtext, since the
+	 * Param values don't need to have per-query lifetime.)  Currently, we
+	 * expect only MULTIEXPR_SUBLINK plans to have any correlation values.
+	 */
+	Assert(subplan->parParam == NIL || subLinkType == MULTIEXPR_SUBLINK);
+	Assert(list_length(subplan->parParam) == list_length(node->args));
+
+	forboth(l, subplan->parParam, pvar, node->args)
+	{
+		int			paramid = lfirst_int(l);
+		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
+
+		prm->value = ExecEvalExprSwitchContext((ExprState *) lfirst(pvar),
+											   econtext,
+											   &(prm->isnull),
+											   NULL);
+		planstate->chgParam = bms_add_member(planstate->chgParam, paramid);
+	}
 
 	/*
 	 * Run the plan.  (If it needs to be rescanned, the first ExecProcNode
@@ -948,14 +1025,15 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 			/* stash away current value */
 			Assert(subplan->firstColType == tdesc->attrs[0]->atttypid);
 			dvalue = slot_getattr(slot, 1, &disnull);
-			astate = accumArrayResult(astate, dvalue, disnull,
-									  subplan->firstColType, oldcontext);
+			astate = accumArrayResultAny(astate, dvalue, disnull,
+										 subplan->firstColType, oldcontext);
 			/* keep scanning subplan to collect all values */
 			continue;
 		}
 
 		if (found &&
 			(subLinkType == EXPR_SUBLINK ||
+			 subLinkType == MULTIEXPR_SUBLINK ||
 			 subLinkType == ROWCOMPARE_SUBLINK))
 			ereport(ERROR,
 					(errcode(ERRCODE_CARDINALITY_VIOLATION),
@@ -994,16 +1072,18 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 		int			paramid = linitial_int(subplan->setParam);
 		ParamExecData *prm = &(econtext->ecxt_param_exec_vals[paramid]);
 
+		/*
+		 * We build the result array in query context so it won't disappear;
+		 * to avoid leaking memory across repeated calls, we have to remember
+		 * the latest value, much as for curTuple above.
+		 */
+		if (node->curArray != PointerGetDatum(NULL))
+			pfree(DatumGetPointer(node->curArray));
+		node->curArray = makeArrayResultAny(astate,
+											econtext->ecxt_per_query_memory,
+											true);
 		prm->execPlan = NULL;
-		/* We build the result in query context so it won't disappear */
-		if (astate != NULL)
-			prm->value = makeArrayResult(astate,
-										 econtext->ecxt_per_query_memory);
-		else
-		{
-			MemoryContextSwitchTo(econtext->ecxt_per_query_memory);
-			prm->value = PointerGetDatum(construct_empty_array(subplan->firstColType));
-		}
+		prm->value = node->curArray;
 		prm->isnull = false;
 	}
 	else if (!found)
@@ -1020,6 +1100,7 @@ ExecSetParamPlan(SubPlanState *node, ExprContext *econtext)
 		}
 		else
 		{
+			/* For other sublink types, set all the output params to NULL */
 			foreach(l, subplan->setParam)
 			{
 				int			paramid = lfirst_int(l);
@@ -1107,7 +1188,7 @@ ExecInitAlternativeSubPlan(AlternativeSubPlan *asplan, PlanState *parent)
 	/*
 	 * Select the one to be used.  For this, we need an estimate of the number
 	 * of executions of the subplan.  We use the number of output rows
-	 * expected from the parent plan node.	This is a good estimate if we are
+	 * expected from the parent plan node.  This is a good estimate if we are
 	 * in the parent's targetlist, and an underestimate (but probably not by
 	 * more than a factor of 2) if we are in the qual.
 	 */

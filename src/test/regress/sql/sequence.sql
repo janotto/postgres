@@ -59,6 +59,7 @@ SELECT nextval('serialTest2_f6_seq');
 
 -- basic sequence operations using both text and oid references
 CREATE SEQUENCE sequence_test;
+CREATE SEQUENCE IF NOT EXISTS sequence_test;
 
 SELECT nextval('sequence_test'::text);
 SELECT nextval('sequence_test'::regclass);
@@ -72,6 +73,8 @@ SELECT setval('sequence_test'::regclass, 32);
 SELECT nextval('sequence_test'::text);
 SELECT setval('sequence_test'::regclass, 99, false);
 SELECT nextval('sequence_test'::text);
+DISCARD SEQUENCES;
+SELECT currval('sequence_test'::regclass);
 
 DROP SEQUENCE sequence_test;
 
@@ -152,6 +155,8 @@ SELECT nextval('seq');
 SELECT lastval();
 SELECT setval('seq', 99);
 SELECT lastval();
+DISCARD SEQUENCES;
+SELECT lastval();
 
 CREATE SEQUENCE seq2;
 SELECT nextval('seq2');
@@ -163,11 +168,86 @@ SELECT lastval();
 
 CREATE USER seq_user;
 
+-- privileges tests
+
+-- nextval
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT SELECT ON seq3 TO seq_user;
+SELECT nextval('seq3');
+ROLLBACK;
+
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT UPDATE ON seq3 TO seq_user;
+SELECT nextval('seq3');
+ROLLBACK;
+
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT USAGE ON seq3 TO seq_user;
+SELECT nextval('seq3');
+ROLLBACK;
+
+-- currval
 BEGIN;
 SET LOCAL SESSION AUTHORIZATION seq_user;
 CREATE SEQUENCE seq3;
 SELECT nextval('seq3');
 REVOKE ALL ON seq3 FROM seq_user;
+GRANT SELECT ON seq3 TO seq_user;
+SELECT currval('seq3');
+ROLLBACK;
+
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+SELECT nextval('seq3');
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT UPDATE ON seq3 TO seq_user;
+SELECT currval('seq3');
+ROLLBACK;
+
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+SELECT nextval('seq3');
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT USAGE ON seq3 TO seq_user;
+SELECT currval('seq3');
+ROLLBACK;
+
+-- lastval
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+SELECT nextval('seq3');
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT SELECT ON seq3 TO seq_user;
+SELECT lastval();
+ROLLBACK;
+
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+SELECT nextval('seq3');
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT UPDATE ON seq3 TO seq_user;
+SELECT lastval();
+ROLLBACK;
+
+BEGIN;
+SET LOCAL SESSION AUTHORIZATION seq_user;
+CREATE SEQUENCE seq3;
+SELECT nextval('seq3');
+REVOKE ALL ON seq3 FROM seq_user;
+GRANT USAGE ON seq3 TO seq_user;
 SELECT lastval();
 ROLLBACK;
 

@@ -1,11 +1,38 @@
 <!-- doc/src/sgml/pgupgrade.sgml -->
 
-<sect1 id="pgupgrade" xreflabel="pg_upgrade">
- <title>pg_upgrade</title>
-
+<refentry id="pgupgrade">
  <indexterm zone="pgupgrade">
   <primary>pg_upgrade</primary>
  </indexterm>
+
+ <refmeta>
+  <refentrytitle><application>pg_upgrade</application></refentrytitle>
+  <manvolnum>1</manvolnum>
+  <refmiscinfo>Application</refmiscinfo>
+ </refmeta>
+
+ <refnamediv>
+  <refname>pg_upgrade</refname>
+  <refpurpose>upgrade a <productname>PostgreSQL</productname> server instance</refpurpose>
+ </refnamediv>
+
+ <refsynopsisdiv>
+  <cmdsynopsis>
+   <command>pg_upgrade</command>
+   <arg choice="plain"><option>-b</option></arg>
+   <arg choice="plain"><replaceable>oldbindir</replaceable></arg>
+   <arg choice="plain"><option>-B</option></arg>
+   <arg choice="plain"><replaceable>newbindir</replaceable></arg>
+   <arg choice="plain"><option>-d</option></arg>
+   <arg choice="plain"><replaceable>olddatadir</replaceable></arg>
+   <arg choice="plain"><option>-D</option></arg>
+   <arg choice="plain"><replaceable>newdatadir</replaceable></arg>
+   <arg rep="repeat"><replaceable>option</replaceable></arg>
+  </cmdsynopsis>
+ </refsynopsisdiv>
+
+ <refsect1>
+  <title>Description</title>
 
  <para>
   <application>pg_upgrade</> (formerly called <application>pg_migrator</>) allows data
@@ -37,19 +64,14 @@
   be checked by <application>pg_upgrade</>.
  </para>
 
- <sect2>
-  <title>Supported Versions</title>
-
   <para>
-   pg_upgrade supports upgrades from 8.3.X and later to the current
+   pg_upgrade supports upgrades from 8.4.X and later to the current
    major release of <productname>PostgreSQL</>, including snapshot and alpha releases.
-
   </para>
+ </refsect1>
 
- </sect2>
-
- <sect2>
-  <title><application>pg_upgrade</> Options</title>
+ <refsect1>
+  <title>Options</title>
 
    <para>
     <application>pg_upgrade</application> accepts the following command-line arguments:
@@ -57,16 +79,16 @@
     <variablelist>
 
      <varlistentry>
-      <term><option>-b</option> <replaceable>old_bindir</></term>
-      <term><option>--old-bindir=</option><replaceable>old_bindir</></term>
-      <listitem><para>the old cluster executable directory;
+      <term><option>-b</option> <replaceable>bindir</></term>
+      <term><option>--old-bindir=</option><replaceable>bindir</></term>
+      <listitem><para>the old PostgreSQL executable directory;
       environment variable <envar>PGBINOLD</></para></listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-B</option> <replaceable>new_bindir</></term>
-      <term><option>--new-bindir=</option><replaceable>new_bindir</></term>
-      <listitem><para>the new cluster executable directory;
+      <term><option>-B</option> <replaceable>bindir</></term>
+      <term><option>--new-bindir=</option><replaceable>bindir</></term>
+      <listitem><para>the new PostgreSQL executable directory;
       environment variable <envar>PGBINNEW</></para></listitem>
      </varlistentry>
 
@@ -77,82 +99,81 @@
      </varlistentry>
 
      <varlistentry>
-      <term><option>-d</option> <replaceable>old_datadir</></term>
-      <term><option>--old-datadir=</option><replaceable>old_datadir</></term>
+      <term><option>-d</option> <replaceable>datadir</></term>
+      <term><option>--old-datadir=</option><replaceable>datadir</></term>
       <listitem><para>the old cluster data directory; environment
       variable <envar>PGDATAOLD</></para></listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-D</option> <replaceable>new_datadir</></term>
-      <term><option>--new-datadir=</option><replaceable>new_datadir</></term>
+      <term><option>-D</option> <replaceable>datadir</></term>
+      <term><option>--new-datadir=</option><replaceable>datadir</></term>
       <listitem><para>the new cluster data directory; environment
       variable <envar>PGDATANEW</></para></listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-g</option></term>
-      <term><option>--debug</option></term>
-      <listitem><para>enable debugging</para></listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>-G</option> <replaceable>debug_filename</></term>
-      <term><option>--debugfile=</option><replaceable>debug_filename</></term>
-      <listitem><para>output debugging activity to file</para></listitem>
+      <term><option>-j</option></term>
+      <term><option>--jobs</option></term>
+      <listitem><para>number of simultaneous processes or threads to use
+      </para></listitem>
      </varlistentry>
 
      <varlistentry>
       <term><option>-k</option></term>
       <term><option>--link</option></term>
-      <listitem><para>use hard links instead of copying files to the new cluster</para></listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>-l</option> <replaceable>log_filename</></term>
-      <term><option>--logfile=</option><replaceable>log_filename</></term>
-      <listitem><para>log internal activity to file</para></listitem>
+      <listitem><para>use hard links instead of copying files to the new
+      cluster (use junction points on Windows)</para></listitem>
      </varlistentry>
 
      <varlistentry>
       <term><option>-o</option> <replaceable class="parameter">options</replaceable></term>
       <term><option>--old-options</option> <replaceable class="parameter">options</replaceable></term>
       <listitem><para>options to be passed directly to the
-      old <command>postgres</command> command</para></listitem>
+      old <command>postgres</command> command;  multiple
+      option invocations are appended</para></listitem>
      </varlistentry>
 
      <varlistentry>
       <term><option>-O</option> <replaceable class="parameter">options</replaceable></term>
       <term><option>--new-options</option> <replaceable class="parameter">options</replaceable></term>
       <listitem><para>options to be passed directly to the
-      new <command>postgres</command> command</para></listitem>
+      new <command>postgres</command> command;  multiple
+      option invocations are appended</para></listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-p</option> <replaceable>old_port_number</></term>
-      <term><option>--old-port=</option><replaceable>old_portnum</></term>
+      <term><option>-p</option> <replaceable>port</></term>
+      <term><option>--old-port=</option><replaceable>port</></term>
       <listitem><para>the old cluster port number; environment
       variable <envar>PGPORTOLD</></para></listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-P</option> <replaceable>new_port_number</></term>
-      <term><option>--new-port=</option><replaceable>new_portnum</></term>
+      <term><option>-P</option> <replaceable>port</></term>
+      <term><option>--new-port=</option><replaceable>port</></term>
       <listitem><para>the new cluster port number; environment
       variable <envar>PGPORTNEW</></para></listitem>
      </varlistentry>
 
      <varlistentry>
-      <term><option>-u</option> <replaceable>user_name</></term>
-      <term><option>--user=</option><replaceable>user_name</></term>
-      <listitem><para>cluster's super user name; environment
+      <term><option>-r</option></term>
+      <term><option>--retain</option></term>
+      <listitem><para>retain SQL and log files even after successful completion
+      </para></listitem>
+     </varlistentry>
+
+     <varlistentry>
+      <term><option>-U</option> <replaceable>username</></term>
+      <term><option>--username=</option><replaceable>username</></term>
+      <listitem><para>cluster's install user name; environment
       variable <envar>PGUSER</></para></listitem>
      </varlistentry>
 
      <varlistentry>
       <term><option>-v</option></term>
       <term><option>--verbose</option></term>
-      <listitem><para>enable verbose output</para></listitem>
+      <listitem><para>enable verbose internal logging</para></listitem>
      </varlistentry>
 
      <varlistentry>
@@ -163,7 +184,6 @@
 
      <varlistentry>
       <term><option>-?</option></term>
-      <term><option>-h</option></term>
       <term><option>--help</option></term>
       <listitem><para>show help, then exit</para></listitem>
      </varlistentry>
@@ -171,10 +191,15 @@
     </variablelist>
    </para>
 
- </sect2>
+ </refsect1>
 
- <sect2>
-  <title>Upgrade Steps</title>
+ <refsect1>
+  <title>Usage</title>
+
+  <para>
+   These are the steps to perform an upgrade
+   with <application>pg_upgrade</application>:
+  </para>
 
   <procedure>
    <step performance="optional">
@@ -183,7 +208,7 @@
     <para>
      If you are using a version-specific installation directory, e.g.
      <filename>/opt/PostgreSQL/9.1</>, you do not need to move the old cluster. The
-     one-click installers all use version-specific installation directories.
+     graphical installers all use version-specific installation directories.
     </para>
 
     <para>
@@ -223,9 +248,8 @@ mv /usr/local/pgsql /usr/local/pgsql.old
      location, use the <literal>prefix</literal> variable:
 
 <programlisting>
-gmake prefix=/usr/local/pgsql.new install
-</programlisting>
-    </para>
+make prefix=/usr/local/pgsql.new install
+</programlisting></para>
    </step>
 
    <step>
@@ -233,7 +257,8 @@ gmake prefix=/usr/local/pgsql.new install
 
     <para>
      Install the <application>pg_upgrade</> binary and
-     <application>pg_upgrade_support</> library in the new PostgreSQL cluster.
+     <application>pg_upgrade_support</> library in the new PostgreSQL
+     installation.
     </para>
    </step>
 
@@ -254,7 +279,7 @@ gmake prefix=/usr/local/pgsql.new install
 
     <para>
      Install any custom shared object files (or DLLs) used by the old cluster
-     into the new cluster, e.g. <filename>pgcrypto.so</filename>, 
+     into the new cluster, e.g. <filename>pgcrypto.so</filename>,
      whether they are from <filename>contrib</filename>
      or some other source. Do not install the schema definitions, e.g.
      <filename>pgcrypto.sql</>, because these will be upgraded from the old cluster.
@@ -265,11 +290,10 @@ gmake prefix=/usr/local/pgsql.new install
     <title>Adjust authentication</title>
 
     <para>
-     <command>pg_upgrade</> will connect to the old and new servers several times,
-     so you might want to set authentication to <literal>trust</> in
-     <filename>pg_hba.conf</>, or if using <literal>md5</> authentication,
-     use a <filename>~/.pgpass</> file (see <xref linkend="libpq-pgpass">)
-     to avoid being prompted repeatedly for a password.
+     <command>pg_upgrade</> will connect to the old and new servers several
+     times, so you might want to set authentication to <literal>peer</>
+     in <filename>pg_hba.conf</> or use a <filename>~/.pgpass</> file
+     (see <xref linkend="libpq-pgpass">).
     </para>
    </step>
 
@@ -290,12 +314,11 @@ pg_ctl -D /opt/PostgreSQL/9.0 stop
 NET STOP postgresql-8.4
 NET STOP postgresql-9.0
 </programlisting>
+    </para>
 
-     or
-
-<programlisting>
-NET STOP pgsql-8.3  (<productname>PostgreSQL</> 8.3 and older used a different service name)
-</programlisting>
+    <para>
+     Streaming replication and log-shipping standby servers can remain running until
+     a later step.
     </para>
    </step>
 
@@ -312,15 +335,23 @@ NET STOP pgsql-8.3  (<productname>PostgreSQL</> 8.3 and older used a different s
 
     <para>
      If you use link mode, the upgrade will be much faster (no file
-     copying), but you will not be able to access your old cluster
+     copying) and use less disk space, but you will not be able to access
+     your old cluster
      once you start the new cluster after the upgrade.  Link mode also
      requires that the old and new cluster data directories be in the
-     same file system.  See <literal>pg_upgrade --help</> for a full
+     same file system.  (Tablespaces and <filename>pg_xlog</> can be on
+     different file systems.)  See <literal>pg_upgrade --help</> for a full
      list of options.
-   </para>
+    </para>
 
-   <para>
-   </para>
+    <para>
+     The <option>--jobs</> option allows multiple CPU cores to be used
+     for copying/linking of files and to dump and reload database schemas
+     in parallel;  a good place to start is the maximum of the number of
+     CPU cores and tablespaces.  This option can dramatically reduce the
+     time to upgrade a multi-database server running on a multiprocessor
+     machine.
+    </para>
 
     <para>
      For Windows users, you must be logged into an administrative account, and
@@ -345,7 +376,9 @@ pg_upgrade.exe
      and then do the upgrade. You can use <command>pg_upgrade --check</>
      to perform only the checks, even if the old server is still
      running. <command>pg_upgrade --check</> will also outline any
-     manual adjustments you will need to make after the upgrade.
+     manual adjustments you will need to make after the upgrade.  If you
+     are going to be using link mode, you should use the <option>--link</>
+     option with <option>--check</option> to enable link-mode-specific checks.
      <command>pg_upgrade</> requires write permission in the current directory.
     </para>
 
@@ -353,8 +386,10 @@ pg_upgrade.exe
      Obviously, no one should be accessing the clusters during the
      upgrade.  <application>pg_upgrade</> defaults to running servers
      on port 50432 to avoid unintended client connections.
-     You can use the same port numbers for both clusters because the
-     old and new clusters will not be running at the same time.
+     You can use the same port number for both clusters when doing an
+     upgrade because the old and new clusters will not be running at the
+     same time.  However, when checking an old running server, the old
+     and new port numbers must be different.
     </para>
 
     <para>
@@ -369,11 +404,151 @@ pg_upgrade.exe
    </step>
 
    <step>
+    <title>Upgrade Streaming Replication and Log-Shipping standby
+    servers</title>
+
+    <para>
+     If you have Streaming Replication (<xref
+     linkend="streaming-replication">) or Log-Shipping (<xref
+     linkend="warm-standby">) standby servers, follow these steps to
+     upgrade them (before starting any servers):
+    </para>
+
+    <procedure>
+
+     <step>
+      <title>Install the new PostgreSQL binaries on standby servers</title>
+
+      <para>
+       Make sure the new binaries and support files are installed on all
+       standby servers.
+      </para>
+     </step>
+
+     <step>
+      <title>Make sure the new standby data directories do <emphasis>not</>
+      exist</title>
+
+      <para>
+       Make sure the new standby data directories do <emphasis>not</>
+       exist or are empty.  If <application>initdb</> was run, delete
+       the standby server data directories.
+      </para>
+     </step>
+
+     <step>
+      <title>Install custom shared object files</title>
+
+      <para>
+       Install the same custom shared object files on the new standbys
+       that you installed in the new master cluster.
+      </para>
+     </step>
+
+     <step>
+      <title>Stop standby servers</title>
+
+      <para>
+       If the standby servers are still running, stop them now using the
+       above instructions.
+      </para>
+     </step>
+
+     <step>
+      <title>Verify standby servers</title>
+
+      <para>
+       To prevent old standby servers from being modified, run
+       <application>pg_controldata</> against the primary and standby
+       clusters and verify that the <quote>Latest checkpoint location</>
+       values match in all clusters.  (This requires the standbys to be
+       shut down after the primary.)
+      </para>
+     </step>
+
+     <step>
+      <title>Save configuration files</title>
+
+      <para>
+       Save any configuration files from the standbys you need to keep,
+       e.g.  <filename>postgresql.conf</>, <literal>recovery.conf</>,
+       as these will be overwritten or removed in the next step.
+      </para>
+     </step>
+
+     <step>
+      <title>Start and stop the new master cluster</title>
+
+      <para>
+       In the new master cluster, change <varname>wal_level</> to
+       <literal>hot_standby</> in the <filename>postgresql.conf</> file
+       and then start and stop the cluster.
+      </para>
+     </step>
+
+     <step>
+      <title>Run <application>rsync</></title>
+
+      <para>
+       From a directory that is above the old and new database cluster
+       directories, run this for each slave:
+
+<programlisting>
+       rsync --archive --delete --hard-links --size-only old_pgdata new_pgdata remote_dir
+</programlisting>
+
+       where <option>old_pgdata</> and <option>new_pgdata</> are relative
+       to the current directory, and <option>remote_dir</> is
+       <emphasis>above</> the old and new cluster directories on
+       the standby server.  The old and new relative cluster paths
+       must match on the master and standby server.  Consult the
+       <application>rsync</> manual page for details on specifying the
+       remote directory, e.g. <literal>standbyhost:/opt/PostgreSQL/</>.
+       <application>rsync</> will be fast when <application>pg_upgrade</>'s
+       <option>--link</> mode is used because it will create hard links
+       on the remote server rather than transferring user data.
+      </para>
+
+      <para>
+       If you have tablespaces, you will need to run a similar
+       <application>rsync</> command for each tablespace directory.  If you
+       have relocated <filename>pg_xlog</> outside the data directories,
+       <application>rsync</> must be run on those directories too.
+      </para>
+     </step>
+
+     <step>
+      <title>Configure streaming replication and log-shipping standby
+      servers</title>
+
+      <para>
+       Configure the servers for log shipping.  (You do not need to run
+       <function>pg_start_backup()</> and <function>pg_stop_backup()</>
+       or take a file system backup as the slaves are still synchronized
+       with the master.)
+      </para>
+     </step>
+
+    </procedure>
+
+   </step>
+
+   <step>
     <title>Restore <filename>pg_hba.conf</></title>
 
     <para>
-     If you modified <filename>pg_hba.conf</> to use <literal>trust</>,
-     restore its original authentication settings.
+     If you modified <filename>pg_hba.conf</>, restore its original settings.
+     It might also be necessary to adjust other configuration files in the new
+     cluster to match the old cluster, e.g. <filename>postgresql.conf</>.
+    </para>
+   </step>
+
+   <step>
+    <title>Start the new server</title>
+
+    <para>
+     The new server can now be safely started, and then any
+     <application>rsync</>'ed standby servers.
     </para>
    </step>
 
@@ -411,7 +586,8 @@ psql --username postgres --file script.sql postgres
     <para>
      Because optimizer statistics are not transferred by <command>pg_upgrade</>, you will
      be instructed to run a command to regenerate that information at the end
-     of the upgrade.
+     of the upgrade.  You might need to set connection parameters to
+     match your new cluster.
     </para>
    </step>
 
@@ -421,8 +597,9 @@ psql --username postgres --file script.sql postgres
     <para>
      Once you are satisfied with the upgrade, you can delete the old
      cluster's data directories by running the script mentioned when
-     <command>pg_upgrade</command> completes. You can also delete the
-     old installation directories
+     <command>pg_upgrade</command> completes. (Automatic deletion is not
+     possible if you have user-defined tablespaces inside the old data
+     directory.)  You can also delete the old installation directories
      (e.g. <filename>bin</>, <filename>share</>).
     </para>
    </step>
@@ -470,84 +647,9 @@ psql --username postgres --file script.sql postgres
    </step>
   </procedure>
 
- </sect2>
+ </refsect1>
 
- <sect2>
-  <title>Limitations in Upgrading <emphasis>from</> PostgreSQL 8.3</title>
-
-  <para>
-   Upgrading from PostgreSQL 8.3 has additional restrictions not present
-   when upgrading from later PostgreSQL releases.  For example,
-   pg_upgrade will not work for upgrading from 8.3 if a user column
-   is defined as:
-   <itemizedlist>
-    <listitem>
-     <para>
-      a <type>tsquery</> data type
-     </para>
-    </listitem>
-    <listitem>
-     <para>
-      data type <type>name</> and is not the first column
-     </para>
-    </listitem>
-   </itemizedlist>
-  </para>
-
-  <para>
-   You must drop any such columns and upgrade them manually.
-  </para>
-
-  <para>
-   pg_upgrade will not work if the <filename>ltree</>
-   contrib module is installed in a database.
-  </para>
-
-  <para>
-   pg_upgrade will require a table rebuild if:
-   <itemizedlist>
-    <listitem>
-     <para>
-      a user column is of data type <type>tsvector</type>
-     </para>
-    </listitem>
-   </itemizedlist>
-  </para>
-
-  <para>
-   pg_upgrade will require a reindex if:
-   <itemizedlist>
-    <listitem>
-     <para>
-      an index is of type hash or GIN
-     </para>
-    </listitem>
-    <listitem>
-     <para>
-      an index uses <function>bpchar_pattern_ops</>
-     </para>
-    </listitem>
-   </itemizedlist>
-  </para>
-
-  <para>
-   Also, the default datetime storage format changed to integer after
-   <productname>PostgreSQL</> 8.3. pg_upgrade will check that the datetime storage format
-   used by the old and new clusters match. Make sure your new cluster is
-   built with the configure flag <option>--disable-integer-datetimes</>.
-  </para>
-
-  <para>
-   For Windows users, note that due to different integer datetimes settings
-   used by the one-click installer and the MSI installer, it is only
-   possible to upgrade from version 8.3 of the one-click distribution to
-   version 8.4 or later of the one-click distribution. It is not
-   possible to upgrade from the MSI installer to the one-click installer.
-  </para>
-
- </sect2>
-
- <sect2>
+ <refsect1>
   <title>Notes</title>
 
   <para>
@@ -562,7 +664,11 @@ psql --username postgres --file script.sql postgres
    All failure, rebuild, and reindex cases will be reported by
    <application>pg_upgrade</> if they affect your installation;
    post-upgrade scripts to rebuild tables and indexes will be
-   generated automatically.
+   generated automatically.  If you are trying to automate the upgrade
+   of many clusters, you should find that clusters with identical database
+   schemas require the same post-upgrade steps for all cluster upgrades;
+   this is because the post-upgrade steps are based on the database
+   schemas, and not user data.
   </para>
 
   <para>
@@ -579,15 +685,40 @@ psql --username postgres --file script.sql postgres
   </para>
 
   <para>
+   If using a pre-9.1 old server that is using a non-default Unix-domain
+   socket directory or a default that differs from the default of the
+   new cluster, set <envar>PGHOST</> to point to the old server's socket
+   location.  (This is not relevant on Windows.)
+  </para>
+
+  <para>
    If you want to use link mode and you do not want your old cluster
    to be modified when the new cluster is started, make a copy of the
    old cluster and upgrade that in link mode. To make a valid copy
    of the old cluster, use <command>rsync</> to create a dirty
    copy of the old cluster while the server is running, then shut down
-   the old server and run <command>rsync</> again to update the copy with any
-   changes to make it consistent.
+   the old server and run <command>rsync --checksum</> again to update the
+   copy with any changes to make it consistent.  (<option>--checksum</>
+   is necessary because <command>rsync</> only has file modification-time
+   granularity of one second.)  You might want to exclude some
+   files, e.g. <filename>postmaster.pid</>, as documented in <xref
+   linkend="backup-lowlevel-base-backup">.  If your file system supports
+   file system snapshots or copy-on-write file copies, you can use that
+   to make a backup of the old cluster and tablespaces, though the snapshot
+   and copies must be created simultaneously or while the database server
+   is down.
   </para>
 
- </sect2>
+ </refsect1>
 
-</sect1>
+ <refsect1>
+  <title>See Also</title>
+
+  <simplelist type="inline">
+   <member><xref linkend="app-initdb"></member>
+   <member><xref linkend="app-pg-ctl"></member>
+   <member><xref linkend="app-pgdump"></member>
+   <member><xref linkend="app-postgres"></member>
+  </simplelist>
+ </refsect1>
+</refentry>

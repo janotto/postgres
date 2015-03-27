@@ -3,7 +3,7 @@
  * syncrep.h
  *	  Exports from replication/syncrep.c.
  *
- * Portions Copyright (c) 2010-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2010-2015, PostgreSQL Global Development Group
  *
  * IDENTIFICATION
  *		src/include/replication/syncrep.h
@@ -13,6 +13,7 @@
 #ifndef _SYNCREP_H
 #define _SYNCREP_H
 
+#include "access/xlogdefs.h"
 #include "utils/guc.h"
 
 #define SyncRepRequested() \
@@ -43,11 +44,12 @@ extern void SyncRepCleanupAtProcExit(void);
 extern void SyncRepInitConfig(void);
 extern void SyncRepReleaseWaiters(void);
 
-/* called by wal writer */
+/* called by checkpointer */
 extern void SyncRepUpdateSyncStandbysDefined(void);
 
-/* called by various procs */
-extern int	SyncRepWakeQueue(bool all, int mode);
+/* forward declaration to avoid pulling in walsender_private.h */
+struct WalSnd;
+extern struct WalSnd *SyncRepGetSynchronousStandby(void);
 
 extern bool check_synchronous_standby_names(char **newval, void **extra, GucSource source);
 extern void assign_synchronous_commit(int newval, void *extra);

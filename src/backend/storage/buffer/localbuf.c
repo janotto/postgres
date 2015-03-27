@@ -4,7 +4,7 @@
  *	  local buffer manager. Fast buffer manager for temporary tables,
  *	  which never need to be WAL-logged or checkpointed, etc.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994-5, Regents of the University of California
  *
  *
@@ -21,7 +21,7 @@
 #include "storage/bufmgr.h"
 #include "utils/guc.h"
 #include "utils/memutils.h"
-#include "utils/resowner.h"
+#include "utils/resowner_private.h"
 
 
 /*#define LBDEBUG*/
@@ -94,7 +94,7 @@ LocalPrefetchBuffer(SMgrRelation smgr, ForkNumber forkNum,
  *	  Find or create a local buffer for the given page of the given relation.
  *
  * API is similar to bufmgr.c's BufferAlloc, except that we do not need
- * to do any locking since this is all local.	Also, IO_IN_PROGRESS
+ * to do any locking since this is all local.   Also, IO_IN_PROGRESS
  * does not get set.  Lastly, we support only default access strategy
  * (hence, usage_count is always advanced).
  */
@@ -122,7 +122,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	if (hresult)
 	{
 		b = hresult->id;
-		bufHdr = &LocalBufferDescriptors[b];
+		bufHdr = GetLocalBufferDescriptor(b);
 		Assert(BUFFERTAGS_EQUAL(bufHdr->tag, newTag));
 #ifdef LBDEBUG
 		fprintf(stderr, "LB ALLOC (%u,%d,%d) %d\n",
@@ -165,7 +165,7 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		if (++nextFreeLocalBuf >= NLocBuffer)
 			nextFreeLocalBuf = 0;
 
-		bufHdr = &LocalBufferDescriptors[b];
+		bufHdr = GetLocalBufferDescriptor(b);
 
 		if (LocalRefCount[b] == 0)
 		{
@@ -196,15 +196,18 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 	if (bufHdr->flags & BM_DIRTY)
 	{
 		SMgrRelation oreln;
+		Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
 		/* Find smgr relation for buffer */
 		oreln = smgropen(bufHdr->tag.rnode, MyBackendId);
+
+		PageSetChecksumInplace(localpage, bufHdr->tag.blockNum);
 
 		/* And write... */
 		smgrwrite(oreln,
 				  bufHdr->tag.forkNum,
 				  bufHdr->tag.blockNum,
-				  (char *) LocalBufHdrGetBlock(bufHdr),
+				  localpage,
 				  false);
 
 		/* Mark not-dirty now in case we error out below */
@@ -275,7 +278,7 @@ MarkLocalBufferDirty(Buffer buffer)
 
 	Assert(LocalRefCount[bufid] > 0);
 
-	bufHdr = &LocalBufferDescriptors[bufid];
+	bufHdr = GetLocalBufferDescriptor(bufid);
 
 	if (!(bufHdr->flags & BM_DIRTY))
 		pgBufferUsage.local_blks_dirtied++;
@@ -289,7 +292,7 @@ MarkLocalBufferDirty(Buffer buffer)
  *		specified relation that have block numbers >= firstDelBlock.
  *		(In particular, with firstDelBlock = 0, all pages are removed.)
  *		Dirty pages are simply dropped, without bothering to write them
- *		out first.	Therefore, this is NOT rollback-able, and so should be
+ *		out first.  Therefore, this is NOT rollback-able, and so should be
  *		used only with extreme caution!
  *
  *		See DropRelFileNodeBuffers in bufmgr.c for more notes.
@@ -302,13 +305,53 @@ DropRelFileNodeLocalBuffers(RelFileNode rnode, ForkNumber forkNum,
 
 	for (i = 0; i < NLocBuffer; i++)
 	{
-		BufferDesc *bufHdr = &LocalBufferDescriptors[i];
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
 		LocalBufferLookupEnt *hresult;
 
 		if ((bufHdr->flags & BM_TAG_VALID) &&
 			RelFileNodeEquals(bufHdr->tag.rnode, rnode) &&
 			bufHdr->tag.forkNum == forkNum &&
 			bufHdr->tag.blockNum >= firstDelBlock)
+		{
+			if (LocalRefCount[i] != 0)
+				elog(ERROR, "block %u of %s is still referenced (local %u)",
+					 bufHdr->tag.blockNum,
+					 relpathbackend(bufHdr->tag.rnode, MyBackendId,
+									bufHdr->tag.forkNum),
+					 LocalRefCount[i]);
+			/* Remove entry from hashtable */
+			hresult = (LocalBufferLookupEnt *)
+				hash_search(LocalBufHash, (void *) &bufHdr->tag,
+							HASH_REMOVE, NULL);
+			if (!hresult)		/* shouldn't happen */
+				elog(ERROR, "local buffer hash table corrupted");
+			/* Mark buffer invalid */
+			CLEAR_BUFFERTAG(bufHdr->tag);
+			bufHdr->flags = 0;
+			bufHdr->usage_count = 0;
+		}
+	}
+}
+
+/*
+ * DropRelFileNodeAllLocalBuffers
+ *		This function removes from the buffer pool all pages of all forks
+ *		of the specified relation.
+ *
+ *		See DropRelFileNodeAllBuffers in bufmgr.c for more notes.
+ */
+void
+DropRelFileNodeAllLocalBuffers(RelFileNode rnode)
+{
+	int			i;
+
+	for (i = 0; i < NLocBuffer; i++)
+	{
+		BufferDesc *bufHdr = GetLocalBufferDescriptor(i);
+		LocalBufferLookupEnt *hresult;
+
+		if ((bufHdr->flags & BM_TAG_VALID) &&
+			RelFileNodeEquals(bufHdr->tag.rnode, rnode))
 		{
 			if (LocalRefCount[i] != 0)
 				elog(ERROR, "block %u of %s is still referenced (local %u)",
@@ -357,7 +400,7 @@ InitLocalBuffers(void)
 	/* initialize fields that need to start off nonzero */
 	for (i = 0; i < nbufs; i++)
 	{
-		BufferDesc *buf = &LocalBufferDescriptors[i];
+		BufferDesc *buf = GetLocalBufferDescriptor(i);
 
 		/*
 		 * negative to indicate local buffer. This is tricky: shared buffers
@@ -372,12 +415,11 @@ InitLocalBuffers(void)
 	MemSet(&info, 0, sizeof(info));
 	info.keysize = sizeof(BufferTag);
 	info.entrysize = sizeof(LocalBufferLookupEnt);
-	info.hash = tag_hash;
 
 	LocalBufHash = hash_create("Local Buffer Lookup Table",
 							   nbufs,
 							   &info,
-							   HASH_ELEM | HASH_FUNCTION);
+							   HASH_ELEM | HASH_BLOBS);
 
 	if (!LocalBufHash)
 		elog(ERROR, "could not initialize local buffer hash table");
@@ -416,7 +458,7 @@ GetLocalBufferStorage(void)
 		/*
 		 * We allocate local buffers in a context of their own, so that the
 		 * space eaten for them is easily recognizable in MemoryContextStats
-		 * output.	Create the context on first use.
+		 * output.  Create the context on first use.
 		 */
 		if (LocalBufferContext == NULL)
 			LocalBufferContext =
@@ -448,6 +490,35 @@ GetLocalBufferStorage(void)
 }
 
 /*
+ * CheckForLocalBufferLeaks - ensure this backend holds no local buffer pins
+ *
+ * This is just like CheckBufferLeaks(), but for local buffers.
+ */
+static void
+CheckForLocalBufferLeaks(void)
+{
+#ifdef USE_ASSERT_CHECKING
+	if (LocalRefCount)
+	{
+		int			RefCountErrors = 0;
+		int			i;
+
+		for (i = 0; i < NLocBuffer; i++)
+		{
+			if (LocalRefCount[i] != 0)
+			{
+				Buffer		b = -i - 1;
+
+				PrintBufferLeakWarning(b);
+				RefCountErrors++;
+			}
+		}
+		Assert(RefCountErrors == 0);
+	}
+#endif
+}
+
+/*
  * AtEOXact_LocalBuffers - clean up at end of transaction.
  *
  * This is just like AtEOXact_Buffers, but for local buffers.
@@ -455,39 +526,21 @@ GetLocalBufferStorage(void)
 void
 AtEOXact_LocalBuffers(bool isCommit)
 {
-#ifdef USE_ASSERT_CHECKING
-	if (assert_enabled)
-	{
-		int			i;
-
-		for (i = 0; i < NLocBuffer; i++)
-		{
-			Assert(LocalRefCount[i] == 0);
-		}
-	}
-#endif
+	CheckForLocalBufferLeaks();
 }
 
 /*
  * AtProcExit_LocalBuffers - ensure we have dropped pins during backend exit.
  *
- * This is just like AtProcExit_Buffers, but for local buffers.  We shouldn't
- * be holding any remaining pins; if we are, and assertions aren't enabled,
- * we'll fail later in DropRelFileNodeBuffers while trying to drop the temp
- * rels.
+ * This is just like AtProcExit_Buffers, but for local buffers.
  */
 void
 AtProcExit_LocalBuffers(void)
 {
-#ifdef USE_ASSERT_CHECKING
-	if (assert_enabled && LocalRefCount)
-	{
-		int			i;
-
-		for (i = 0; i < NLocBuffer; i++)
-		{
-			Assert(LocalRefCount[i] == 0);
-		}
-	}
-#endif
+	/*
+	 * We shouldn't be holding any remaining pins; if we are, and assertions
+	 * aren't enabled, we'll fail later in DropRelFileNodeBuffers while trying
+	 * to drop the temp rels.
+	 */
+	CheckForLocalBufferLeaks();
 }

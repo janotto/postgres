@@ -19,15 +19,19 @@
  * have regd_count = 1 and are counted in RegisteredSnapshots, but are not
  * tracked by any resource owner.
  *
- * These arrangements let us reset MyProc->xmin when there are no snapshots
- * referenced by this transaction.	(One possible improvement would be to be
+ * The same is true for historic snapshots used during logical decoding,
+ * their lifetime is managed separately (as they life longer as one xact.c
+ * transaction).
+ *
+ * These arrangements let us reset MyPgXact->xmin when there are no snapshots
+ * referenced by this transaction.  (One possible improvement would be to be
  * able to advance Xmin when the snapshot with the earliest Xmin is no longer
- * referenced.	That's a bit harder though, it requires more locking, and
+ * referenced.  That's a bit harder though, it requires more locking, and
  * anyway it should be rather uncommon to keep temporary snapshots referenced
  * for too long.)
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -42,13 +46,17 @@
 
 #include "access/transam.h"
 #include "access/xact.h"
+#include "lib/pairingheap.h"
 #include "miscadmin.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "storage/sinval.h"
 #include "utils/builtins.h"
 #include "utils/memutils.h"
+#include "utils/resowner_private.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 #include "utils/tqual.h"
 
 
@@ -56,31 +64,46 @@
  * CurrentSnapshot points to the only snapshot taken in transaction-snapshot
  * mode, and to the latest one taken in a read-committed transaction.
  * SecondarySnapshot is a snapshot that's always up-to-date as of the current
- * instant, even in transaction-snapshot mode.	It should only be used for
- * special-purpose code (say, RI checking.)
+ * instant, even in transaction-snapshot mode.  It should only be used for
+ * special-purpose code (say, RI checking.)  CatalogSnapshot points to an
+ * MVCC snapshot intended to be used for catalog scans; we must refresh it
+ * whenever a system catalog change occurs.
  *
  * These SnapshotData structs are static to simplify memory allocation
  * (see the hack in GetSnapshotData to avoid repeated malloc/free).
  */
 static SnapshotData CurrentSnapshotData = {HeapTupleSatisfiesMVCC};
 static SnapshotData SecondarySnapshotData = {HeapTupleSatisfiesMVCC};
+SnapshotData CatalogSnapshotData = {HeapTupleSatisfiesMVCC};
 
 /* Pointers to valid snapshots */
 static Snapshot CurrentSnapshot = NULL;
 static Snapshot SecondarySnapshot = NULL;
+static Snapshot CatalogSnapshot = NULL;
+static Snapshot HistoricSnapshot = NULL;
+
+/*
+ * Staleness detection for CatalogSnapshot.
+ */
+static bool CatalogSnapshotStale = true;
 
 /*
  * These are updated by GetSnapshotData.  We initialize them this way
  * for the convenience of TransactionIdIsInProgress: even in bootstrap
  * mode, we don't want it to say that BootstrapTransactionId is in progress.
  *
- * RecentGlobalXmin is initialized to InvalidTransactionId, to ensure that no
- * one tries to use a stale value.	Readers should ensure that it has been set
- * to something else before using it.
+ * RecentGlobalXmin and RecentGlobalDataXmin are initialized to
+ * InvalidTransactionId, to ensure that no one tries to use a stale
+ * value. Readers should ensure that it has been set to something else
+ * before using it.
  */
 TransactionId TransactionXmin = FirstNormalTransactionId;
 TransactionId RecentXmin = FirstNormalTransactionId;
 TransactionId RecentGlobalXmin = InvalidTransactionId;
+TransactionId RecentGlobalDataXmin = InvalidTransactionId;
+
+/* (table, ctid) => (cmin, cmax) mapping during timetravel */
+static HTAB *tuplecid_data = NULL;
 
 /*
  * Elements of the active snapshot stack.
@@ -101,13 +124,14 @@ typedef struct ActiveSnapshotElt
 static ActiveSnapshotElt *ActiveSnapshot = NULL;
 
 /*
- * How many snapshots is resowner.c tracking for us?
- *
- * Note: for now, a simple counter is enough.  However, if we ever want to be
- * smarter about advancing our MyProc->xmin we will need to be more
- * sophisticated about this, perhaps keeping our own list of snapshots.
+ * Currently registered Snapshots.  Ordered in a heap by xmin, so that we can
+ * quickly find the one with lowest xmin, to advance our MyPgXat->xmin.
+ * resowner.c also tracks these.
  */
-static int	RegisteredSnapshots = 0;
+static int xmin_cmp(const pairingheap_node *a, const pairingheap_node *b,
+		 void *arg);
+
+static pairingheap RegisteredSnapshots = { &xmin_cmp, NULL, NULL };
 
 /* first GetTransactionSnapshot call in a transaction? */
 bool		FirstSnapshotSet = false;
@@ -128,7 +152,7 @@ static Snapshot FirstXactSnapshot = NULL;
 /* Current xact's exported snapshots (a list of Snapshot structs) */
 static List *exportedSnapshots = NIL;
 
-
+/* Prototypes for local functions */
 static Snapshot CopySnapshot(Snapshot snapshot);
 static void FreeSnapshot(Snapshot snapshot);
 static void SnapshotResetXmin(void);
@@ -146,10 +170,22 @@ static void SnapshotResetXmin(void);
 Snapshot
 GetTransactionSnapshot(void)
 {
+	/*
+	 * Return historic snapshot if doing logical decoding. We'll never need a
+	 * non-historic transaction snapshot in this (sub-)transaction, so there's
+	 * no need to be careful to set one up for later calls to
+	 * GetTransactionSnapshot().
+	 */
+	if (HistoricSnapshotActive())
+	{
+		Assert(!FirstSnapshotSet);
+		return HistoricSnapshot;
+	}
+
 	/* First call in transaction? */
 	if (!FirstSnapshotSet)
 	{
-		Assert(RegisteredSnapshots == 0);
+		Assert(pairingheap_is_empty(&RegisteredSnapshots));
 		Assert(FirstXactSnapshot == NULL);
 
 		/*
@@ -171,10 +207,13 @@ GetTransactionSnapshot(void)
 			FirstXactSnapshot = CurrentSnapshot;
 			/* Mark it as "registered" in FirstXactSnapshot */
 			FirstXactSnapshot->regd_count++;
-			RegisteredSnapshots++;
+			pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
 		}
 		else
 			CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
+
+		/* Don't allow catalog snapshot to be older than xact snapshot. */
+		CatalogSnapshotStale = true;
 
 		FirstSnapshotSet = true;
 		return CurrentSnapshot;
@@ -182,6 +221,9 @@ GetTransactionSnapshot(void)
 
 	if (IsolationUsesXactSnapshot())
 		return CurrentSnapshot;
+
+	/* Don't allow catalog snapshot to be older than xact snapshot. */
+	CatalogSnapshotStale = true;
 
 	CurrentSnapshot = GetSnapshotData(&CurrentSnapshotData);
 
@@ -196,13 +238,88 @@ GetTransactionSnapshot(void)
 Snapshot
 GetLatestSnapshot(void)
 {
-	/* Should not be first call in transaction */
+	/*
+	 * So far there are no cases requiring support for GetLatestSnapshot()
+	 * during logical decoding, but it wouldn't be hard to add if required.
+	 */
+	Assert(!HistoricSnapshotActive());
+
+	/* If first call in transaction, go ahead and set the xact snapshot */
 	if (!FirstSnapshotSet)
-		elog(ERROR, "no snapshot has been set");
+		return GetTransactionSnapshot();
 
 	SecondarySnapshot = GetSnapshotData(&SecondarySnapshotData);
 
 	return SecondarySnapshot;
+}
+
+/*
+ * GetCatalogSnapshot
+ *		Get a snapshot that is sufficiently up-to-date for scan of the
+ *		system catalog with the specified OID.
+ */
+Snapshot
+GetCatalogSnapshot(Oid relid)
+{
+	/*
+	 * Return historic snapshot while we're doing logical decoding, so we can
+	 * see the appropriate state of the catalog.
+	 *
+	 * This is the primary reason for needing to reset the system caches after
+	 * finishing decoding.
+	 */
+	if (HistoricSnapshotActive())
+		return HistoricSnapshot;
+
+	return GetNonHistoricCatalogSnapshot(relid);
+}
+
+/*
+ * GetNonHistoricCatalogSnapshot
+ *		Get a snapshot that is sufficiently up-to-date for scan of the system
+ *		catalog with the specified OID, even while historic snapshots are set
+ *		up.
+ */
+Snapshot
+GetNonHistoricCatalogSnapshot(Oid relid)
+{
+	/*
+	 * If the caller is trying to scan a relation that has no syscache, no
+	 * catcache invalidations will be sent when it is updated.  For a few
+	 * key relations, snapshot invalidations are sent instead.  If we're
+	 * trying to scan a relation for which neither catcache nor snapshot
+	 * invalidations are sent, we must refresh the snapshot every time.
+	 */
+	if (!CatalogSnapshotStale && !RelationInvalidatesSnapshotsOnly(relid) &&
+		!RelationHasSysCache(relid))
+		CatalogSnapshotStale = true;
+
+	if (CatalogSnapshotStale)
+	{
+		/* Get new snapshot. */
+		CatalogSnapshot = GetSnapshotData(&CatalogSnapshotData);
+
+		/*
+		 * Mark new snapshost as valid.  We must do this last, in case an
+		 * ERROR occurs inside GetSnapshotData().
+		 */
+		CatalogSnapshotStale = false;
+	}
+
+	return CatalogSnapshot;
+}
+
+/*
+ * Mark the current catalog snapshot as invalid.  We could change this API
+ * to allow the caller to provide more fine-grained invalidation details, so
+ * that a change to relation A wouldn't prevent us from using our cached
+ * snapshot to scan relation B, but so far there's no evidence that the CPU
+ * cycles we spent tracking such fine details would be well-spent.
+ */
+void
+InvalidateCatalogSnapshot()
+{
+	CatalogSnapshotStale = true;
 }
 
 /*
@@ -235,8 +352,9 @@ SetTransactionSnapshot(Snapshot sourcesnap, TransactionId sourcexid)
 	/* Caller should have checked this already */
 	Assert(!FirstSnapshotSet);
 
-	Assert(RegisteredSnapshots == 0);
+	Assert(pairingheap_is_empty(&RegisteredSnapshots));
 	Assert(FirstXactSnapshot == NULL);
+	Assert(!HistoricSnapshotActive());
 
 	/*
 	 * Even though we are not going to use the snapshot it computes, we must
@@ -266,22 +384,22 @@ SetTransactionSnapshot(Snapshot sourcesnap, TransactionId sourcexid)
 	/* NB: curcid should NOT be copied, it's a local matter */
 
 	/*
-	 * Now we have to fix what GetSnapshotData did with MyProc->xmin and
+	 * Now we have to fix what GetSnapshotData did with MyPgXact->xmin and
 	 * TransactionXmin.  There is a race condition: to make sure we are not
 	 * causing the global xmin to go backwards, we have to test that the
-	 * source transaction is still running, and that has to be done atomically.
-	 * So let procarray.c do it.
+	 * source transaction is still running, and that has to be done
+	 * atomically. So let procarray.c do it.
 	 *
-	 * Note: in serializable mode, predicate.c will do this a second time.
-	 * It doesn't seem worth contorting the logic here to avoid two calls,
+	 * Note: in serializable mode, predicate.c will do this a second time. It
+	 * doesn't seem worth contorting the logic here to avoid two calls,
 	 * especially since it's not clear that predicate.c *must* do this.
 	 */
 	if (!ProcArrayInstallImportedXmin(CurrentSnapshot->xmin, sourcexid))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("could not import the requested snapshot"),
-				 errdetail("The source transaction %u is not running anymore.",
-						   sourcexid)));
+			   errdetail("The source transaction %u is not running anymore.",
+						 sourcexid)));
 
 	/*
 	 * In transaction-snapshot mode, the first snapshot must live until end of
@@ -297,7 +415,7 @@ SetTransactionSnapshot(Snapshot sourcesnap, TransactionId sourcexid)
 		FirstXactSnapshot = CurrentSnapshot;
 		/* Mark it as "registered" in FirstXactSnapshot */
 		FirstXactSnapshot->regd_count++;
-		RegisteredSnapshots++;
+		pairingheap_add(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
 	}
 
 	FirstSnapshotSet = true;
@@ -381,7 +499,7 @@ FreeSnapshot(Snapshot snapshot)
  *
  * If the passed snapshot is a statically-allocated one, or it is possibly
  * subject to a future command counter update, create a new long-lived copy
- * with active refcount=1.	Otherwise, only increment the refcount.
+ * with active refcount=1.  Otherwise, only increment the refcount.
  */
 void
 PushActiveSnapshot(Snapshot snap)
@@ -523,7 +641,8 @@ RegisterSnapshotOnOwner(Snapshot snapshot, ResourceOwner owner)
 	snap->regd_count++;
 	ResourceOwnerRememberSnapshot(owner, snap);
 
-	RegisteredSnapshots++;
+	if (snap->regd_count == 1)
+		pairingheap_add(&RegisteredSnapshots, &snap->ph_node);
 
 	return snap;
 }
@@ -555,11 +674,15 @@ UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner)
 		return;
 
 	Assert(snapshot->regd_count > 0);
-	Assert(RegisteredSnapshots > 0);
+	Assert(!pairingheap_is_empty(&RegisteredSnapshots));
 
 	ResourceOwnerForgetSnapshot(owner, snapshot);
-	RegisteredSnapshots--;
-	if (--snapshot->regd_count == 0 && snapshot->active_count == 0)
+
+	snapshot->regd_count--;
+	if (snapshot->regd_count == 0)
+		pairingheap_remove(&RegisteredSnapshots, &snapshot->ph_node);
+
+	if (snapshot->regd_count == 0 && snapshot->active_count == 0)
 	{
 		FreeSnapshot(snapshot);
 		SnapshotResetXmin();
@@ -567,17 +690,54 @@ UnregisterSnapshotFromOwner(Snapshot snapshot, ResourceOwner owner)
 }
 
 /*
+ * Comparison function for RegisteredSnapshots heap.  Snapshots are ordered
+ * by xmin, so that the snapshot with smallest xmin is at the top.
+ */
+static int
+xmin_cmp(const pairingheap_node *a, const pairingheap_node *b, void *arg)
+{
+	const SnapshotData *asnap = pairingheap_const_container(SnapshotData, ph_node, a);
+	const SnapshotData *bsnap = pairingheap_const_container(SnapshotData, ph_node, b);
+
+	if (TransactionIdPrecedes(asnap->xmin, bsnap->xmin))
+		return 1;
+	else if (TransactionIdFollows(asnap->xmin, bsnap->xmin))
+		return -1;
+	else
+		return 0;
+}
+
+/*
  * SnapshotResetXmin
  *
- * If there are no more snapshots, we can reset our PGPROC->xmin to InvalidXid.
+ * If there are no more snapshots, we can reset our PGXACT->xmin to InvalidXid.
  * Note we can do this without locking because we assume that storing an Xid
  * is atomic.
+ *
+ * Even if there are some remaining snapshots, we may be able to advance our
+ * PGXACT->xmin to some degree.  This typically happens when a portal is
+ * dropped.  For efficiency, we only consider recomputing PGXACT->xmin when
+ * the active snapshot stack is empty.
  */
 static void
 SnapshotResetXmin(void)
 {
-	if (RegisteredSnapshots == 0 && ActiveSnapshot == NULL)
+	Snapshot minSnapshot;
+
+	if (ActiveSnapshot != NULL)
+		return;
+
+	if (pairingheap_is_empty(&RegisteredSnapshots))
+	{
 		MyPgXact->xmin = InvalidTransactionId;
+		return;
+	}
+
+	minSnapshot = pairingheap_container(SnapshotData, ph_node,
+									pairingheap_first(&RegisteredSnapshots));
+
+	if (TransactionIdPrecedes(MyPgXact->xmin, minSnapshot->xmin))
+		MyPgXact->xmin = minSnapshot->xmin;
 }
 
 /*
@@ -647,14 +807,14 @@ AtEOXact_Snapshot(bool isCommit)
 	 * RegisteredSnapshots to keep the check below happy.  But we don't bother
 	 * to do FreeSnapshot, for two reasons: the memory will go away with
 	 * TopTransactionContext anyway, and if someone has left the snapshot
-	 * stacked as active, we don't want the code below to be chasing through
-	 * a dangling pointer.
+	 * stacked as active, we don't want the code below to be chasing through a
+	 * dangling pointer.
 	 */
 	if (FirstXactSnapshot != NULL)
 	{
 		Assert(FirstXactSnapshot->regd_count > 0);
-		Assert(RegisteredSnapshots > 0);
-		RegisteredSnapshots--;
+		Assert(!pairingheap_is_empty(&RegisteredSnapshots));
+		pairingheap_remove(&RegisteredSnapshots, &FirstXactSnapshot->ph_node);
 	}
 	FirstXactSnapshot = NULL;
 
@@ -666,11 +826,12 @@ AtEOXact_Snapshot(bool isCommit)
 		TransactionId myxid = GetTopTransactionId();
 		int			i;
 		char		buf[MAXPGPATH];
+		ListCell   *lc;
 
 		/*
-		 * Get rid of the files.  Unlink failure is only a WARNING because
-		 * (1) it's too late to abort the transaction, and (2) leaving a
-		 * leaked file around has little real consequence anyway.
+		 * Get rid of the files.  Unlink failure is only a WARNING because (1)
+		 * it's too late to abort the transaction, and (2) leaving a leaked
+		 * file around has little real consequence anyway.
 		 */
 		for (i = 1; i <= list_length(exportedSnapshots); i++)
 		{
@@ -682,14 +843,13 @@ AtEOXact_Snapshot(bool isCommit)
 		/*
 		 * As with the FirstXactSnapshot, we needn't spend any effort on
 		 * cleaning up the per-snapshot data structures, but we do need to
-		 * adjust the RegisteredSnapshots count to prevent a warning below.
-		 *
-		 * Note: you might be thinking "why do we have the exportedSnapshots
-		 * list at all?  All we need is a counter!".  You're right, but we do
-		 * it this way in case we ever feel like improving xmin management.
+		 * unlink them from RegisteredSnapshots to prevent a warning below.
 		 */
-		Assert(RegisteredSnapshots >= list_length(exportedSnapshots));
-		RegisteredSnapshots -= list_length(exportedSnapshots);
+		foreach(lc, exportedSnapshots)
+		{
+			Snapshot snap = (Snapshot) lfirst(lc);
+			pairingheap_remove(&RegisteredSnapshots, &snap->ph_node);
+		}
 
 		exportedSnapshots = NIL;
 	}
@@ -699,9 +859,8 @@ AtEOXact_Snapshot(bool isCommit)
 	{
 		ActiveSnapshotElt *active;
 
-		if (RegisteredSnapshots != 0)
-			elog(WARNING, "%d registered snapshots seem to remain after cleanup",
-				 RegisteredSnapshots);
+		if (!pairingheap_is_empty(&RegisteredSnapshots))
+			elog(WARNING, "registered snapshots seem to remain after cleanup");
 
 		/* complain about unpopped active snapshots */
 		for (active = ActiveSnapshot; active != NULL; active = active->as_next)
@@ -713,7 +872,7 @@ AtEOXact_Snapshot(bool isCommit)
 	 * it'll go away with TopTransactionContext.
 	 */
 	ActiveSnapshot = NULL;
-	RegisteredSnapshots = 0;
+	pairingheap_reset(&RegisteredSnapshots);
 
 	CurrentSnapshot = NULL;
 	SecondarySnapshot = NULL;
@@ -730,7 +889,7 @@ AtEOXact_Snapshot(bool isCommit)
  *		Returns the token (the file name) that can be used to import this
  *		snapshot.
  */
-static char *
+char *
 ExportSnapshot(Snapshot snapshot)
 {
 	TransactionId topXid;
@@ -745,17 +904,17 @@ ExportSnapshot(Snapshot snapshot)
 	char		pathtmp[MAXPGPATH];
 
 	/*
-	 * It's tempting to call RequireTransactionChain here, since it's not
-	 * very useful to export a snapshot that will disappear immediately
-	 * afterwards.  However, we haven't got enough information to do that,
-	 * since we don't know if we're at top level or not.  For example, we
-	 * could be inside a plpgsql function that is going to fire off other
-	 * transactions via dblink.  Rather than disallow perfectly legitimate
-	 * usages, don't make a check.
+	 * It's tempting to call RequireTransactionChain here, since it's not very
+	 * useful to export a snapshot that will disappear immediately afterwards.
+	 * However, we haven't got enough information to do that, since we don't
+	 * know if we're at top level or not.  For example, we could be inside a
+	 * plpgsql function that is going to fire off other transactions via
+	 * dblink.  Rather than disallow perfectly legitimate usages, don't make a
+	 * check.
 	 *
 	 * Also note that we don't make any restriction on the transaction's
-	 * isolation level; however, importers must check the level if they
-	 * are serializable.
+	 * isolation level; however, importers must check the level if they are
+	 * serializable.
 	 */
 
 	/*
@@ -784,8 +943,7 @@ ExportSnapshot(Snapshot snapshot)
 	 * Copy the snapshot into TopTransactionContext, add it to the
 	 * exportedSnapshots list, and mark it pseudo-registered.  We do this to
 	 * ensure that the snapshot's xmin is honored for the rest of the
-	 * transaction.  (Right now, because SnapshotResetXmin is so stupid, this
-	 * is overkill; but later we might make that routine smarter.)
+	 * transaction.
 	 */
 	snapshot = CopySnapshot(snapshot);
 
@@ -794,12 +952,12 @@ ExportSnapshot(Snapshot snapshot)
 	MemoryContextSwitchTo(oldcxt);
 
 	snapshot->regd_count++;
-	RegisteredSnapshots++;
+	pairingheap_add(&RegisteredSnapshots, &snapshot->ph_node);
 
 	/*
 	 * Fill buf with a text serialization of the snapshot, plus identification
-	 * data about this transaction.  The format expected by ImportSnapshot
-	 * is pretty rigid: each line must be fieldname:value.
+	 * data about this transaction.  The format expected by ImportSnapshot is
+	 * pretty rigid: each line must be fieldname:value.
 	 */
 	initStringInfo(&buf);
 
@@ -830,8 +988,8 @@ ExportSnapshot(Snapshot snapshot)
 		appendStringInfo(&buf, "xip:%u\n", topXid);
 
 	/*
-	 * Similarly, we add our subcommitted child XIDs to the subxid data.
-	 * Here, we have to cope with possible overflow.
+	 * Similarly, we add our subcommitted child XIDs to the subxid data. Here,
+	 * we have to cope with possible overflow.
 	 */
 	if (snapshot->suboverflowed ||
 		snapshot->subxcnt + nchildren > GetMaxSnapshotSubxidCount())
@@ -963,16 +1121,16 @@ parseXidFromText(const char *prefix, char **s, const char *filename)
 
 /*
  * ImportSnapshot
- *      Import a previously exported snapshot.  The argument should be a
- *      filename in SNAPSHOT_EXPORT_DIR.  Load the snapshot from that file.
- *      This is called by "SET TRANSACTION SNAPSHOT 'foo'".
+ *		Import a previously exported snapshot.  The argument should be a
+ *		filename in SNAPSHOT_EXPORT_DIR.  Load the snapshot from that file.
+ *		This is called by "SET TRANSACTION SNAPSHOT 'foo'".
  */
 void
 ImportSnapshot(const char *idstr)
 {
 	char		path[MAXPGPATH];
 	FILE	   *f;
-	struct stat	stat_buf;
+	struct stat stat_buf;
 	char	   *filebuf;
 	int			xcnt;
 	int			i;
@@ -985,19 +1143,19 @@ ImportSnapshot(const char *idstr)
 	/*
 	 * Must be at top level of a fresh transaction.  Note in particular that
 	 * we check we haven't acquired an XID --- if we have, it's conceivable
-	 * that the snapshot would show it as not running, making for very
-	 * screwy behavior.
+	 * that the snapshot would show it as not running, making for very screwy
+	 * behavior.
 	 */
 	if (FirstSnapshotSet ||
 		GetTopTransactionIdIfAny() != InvalidTransactionId ||
 		IsSubTransaction())
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
-				 errmsg("SET TRANSACTION SNAPSHOT must be called before any query")));
+		errmsg("SET TRANSACTION SNAPSHOT must be called before any query")));
 
 	/*
-	 * If we are in read committed mode then the next query would execute
-	 * with a new snapshot thus making this function call quite useless.
+	 * If we are in read committed mode then the next query would execute with
+	 * a new snapshot thus making this function call quite useless.
 	 */
 	if (!IsolationUsesXactSnapshot())
 		ereport(ERROR,
@@ -1011,7 +1169,7 @@ ImportSnapshot(const char *idstr)
 	if (strspn(idstr, "0123456789ABCDEF-") != strlen(idstr))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid snapshot identifier \"%s\"", idstr)));
+				 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
 
 	/* OK, read the file */
 	snprintf(path, MAXPGPATH, SNAPSHOT_EXPORT_DIR "/%s", idstr);
@@ -1020,7 +1178,7 @@ ImportSnapshot(const char *idstr)
 	if (!f)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("invalid snapshot identifier \"%s\"", idstr)));
+				 errmsg("invalid snapshot identifier: \"%s\"", idstr)));
 
 	/* get the size of the file so that we know how much memory we need */
 	if (fstat(fileno(f), &stat_buf))
@@ -1100,8 +1258,8 @@ ImportSnapshot(const char *idstr)
 
 	/*
 	 * If we're serializable, the source transaction must be too, otherwise
-	 * predicate.c has problems (SxactGlobalXmin could go backwards).  Also,
-	 * a non-read-only transaction can't adopt a snapshot from a read-only
+	 * predicate.c has problems (SxactGlobalXmin could go backwards).  Also, a
+	 * non-read-only transaction can't adopt a snapshot from a read-only
 	 * transaction, as predicate.c handles the cases very differently.
 	 */
 	if (IsolationIsSerializable())
@@ -1120,15 +1278,15 @@ ImportSnapshot(const char *idstr)
 	 * We cannot import a snapshot that was taken in a different database,
 	 * because vacuum calculates OldestXmin on a per-database basis; so the
 	 * source transaction's xmin doesn't protect us from data loss.  This
-	 * restriction could be removed if the source transaction were to mark
-	 * its xmin as being globally applicable.  But that would require some
+	 * restriction could be removed if the source transaction were to mark its
+	 * xmin as being globally applicable.  But that would require some
 	 * additional syntax, since that has to be known when the snapshot is
 	 * initially taken.  (See pgsql-hackers discussion of 2011-10-21.)
 	 */
 	if (src_dbid != MyDatabaseId)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("cannot import a snapshot from a different database")));
+			  errmsg("cannot import a snapshot from a different database")));
 
 	/* OK, install the snapshot */
 	SetTransactionSnapshot(&snapshot, src_xid);
@@ -1182,4 +1340,56 @@ DeleteAllExportedSnapshotFiles(void)
 	}
 
 	FreeDir(s_dir);
+}
+
+bool
+ThereAreNoPriorRegisteredSnapshots(void)
+{
+	if (pairingheap_is_empty(&RegisteredSnapshots) ||
+		pairingheap_is_singular(&RegisteredSnapshots))
+		return true;
+
+	return false;
+}
+
+/*
+ * Setup a snapshot that replaces normal catalog snapshots that allows catalog
+ * access to behave just like it did at a certain point in the past.
+ *
+ * Needed for logical decoding.
+ */
+void
+SetupHistoricSnapshot(Snapshot historic_snapshot, HTAB *tuplecids)
+{
+	Assert(historic_snapshot != NULL);
+
+	/* setup the timetravel snapshot */
+	HistoricSnapshot = historic_snapshot;
+
+	/* setup (cmin, cmax) lookup hash */
+	tuplecid_data = tuplecids;
+}
+
+
+/*
+ * Make catalog snapshots behave normally again.
+ */
+void
+TeardownHistoricSnapshot(bool is_error)
+{
+	HistoricSnapshot = NULL;
+	tuplecid_data = NULL;
+}
+
+bool
+HistoricSnapshotActive(void)
+{
+	return HistoricSnapshot != NULL;
+}
+
+HTAB *
+HistoricSnapshotGetTupleCids(void)
+{
+	Assert(HistoricSnapshotActive());
+	return tuplecid_data;
 }

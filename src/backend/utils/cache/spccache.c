@@ -4,11 +4,11 @@
  *	  Tablespace cache management.
  *
  * We cache the parsed version of spcoptions for each tablespace to avoid
- * needing to reparse on every lookup.	Right now, there doesn't appear to
+ * needing to reparse on every lookup.  Right now, there doesn't appear to
  * be a measurable performance gain from doing this, but that might change
  * in the future as we add more options.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -23,6 +23,7 @@
 #include "commands/tablespace.h"
 #include "miscadmin.h"
 #include "optimizer/cost.h"
+#include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/spccache.h"
@@ -80,10 +81,9 @@ InitializeTableSpaceCache(void)
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(TableSpaceCacheEntry);
-	ctl.hash = oid_hash;
 	TableSpaceCacheHash =
 		hash_create("TableSpace cache", 16, &ctl,
-					HASH_ELEM | HASH_FUNCTION);
+					HASH_ELEM | HASH_BLOBS);
 
 	/* Make sure we've initialized CacheMemoryContext. */
 	if (!CacheMemoryContext)
@@ -127,7 +127,7 @@ get_tablespace(Oid spcid)
 		return spc;
 
 	/*
-	 * Not found in TableSpace cache.  Check catcache.	If we don't find a
+	 * Not found in TableSpace cache.  Check catcache.  If we don't find a
 	 * valid HeapTuple, it must mean someone has managed to request tablespace
 	 * details for a non-existent tablespace.  We'll just treat that case as
 	 * if no options were specified.
@@ -157,7 +157,7 @@ get_tablespace(Oid spcid)
 	}
 
 	/*
-	 * Now create the cache entry.	It's important to do this only after
+	 * Now create the cache entry.  It's important to do this only after
 	 * reading the pg_tablespace entry, since doing so could cause a cache
 	 * flush.
 	 */

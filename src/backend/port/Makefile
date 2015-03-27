@@ -21,11 +21,7 @@ subdir = src/backend/port
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-OBJS = dynloader.o pg_sema.o pg_shmem.o pg_latch.o $(TAS)
-
-ifneq (,$(filter $(PORTNAME),cygwin win32))
-OBJS += pipe.o
-endif
+OBJS = atomics.o dynloader.o pg_sema.o pg_shmem.o pg_latch.o $(TAS)
 
 ifeq ($(PORTNAME), darwin)
 SUBDIRS += darwin
@@ -46,11 +42,7 @@ else
 	$(CC) $(CFLAGS) -c $<
 endif
 
-# IPC test program
-ipc_test: ipc_test.o pg_sema.o pg_shmem.o
-	$(CC) $(CFLAGS) $(LDFLAGS) $(LDFLAGS_EX) $(export_dynamic) $^ $(LIBS) -o $@
-
 distclean clean:
-	rm -f ipc_test ipc_test.o tas_cpp.s
+	rm -f tas_cpp.s
 	$(MAKE) -C darwin clean
 	$(MAKE) -C win32 clean

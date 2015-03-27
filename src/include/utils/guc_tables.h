@@ -5,7 +5,7 @@
  *
  * See src/backend/utils/misc/README for design notes.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  *	  src/include/utils/guc_tables.h
  *
@@ -88,6 +88,7 @@ enum config_group
 	CLIENT_CONN,
 	CLIENT_CONN_STATEMENT,
 	CLIENT_CONN_LOCALE,
+	CLIENT_CONN_PRELOAD,
 	CLIENT_CONN_OTHER,
 	LOCK_MANAGEMENT,
 	COMPAT_OPTIONS,
@@ -120,7 +121,7 @@ typedef struct guc_stack
 	GucSource	source;			/* source of the prior value */
 	/* masked value's source must be PGC_S_SESSION, so no need to store it */
 	GucContext	scontext;		/* context that set the prior value */
-	GucContext	masked_scontext; /* context that set the masked value */
+	GucContext	masked_scontext;	/* context that set the masked value */
 	config_var_value prior;		/* previous value of variable */
 	config_var_value masked;	/* SET value in a GUC_SET_LOCAL entry */
 } GucStack;
@@ -152,7 +153,7 @@ struct config_generic
 	GucSource	source;			/* source of the current actual value */
 	GucSource	reset_source;	/* source of the reset_value */
 	GucContext	scontext;		/* context that set the current value */
-	GucContext	reset_scontext;	/* context that set the reset value */
+	GucContext	reset_scontext; /* context that set the reset value */
 	GucStack   *stack;			/* stacked prior values */
 	void	   *extra;			/* "extra" pointer for current actual value */
 	char	   *sourcefile;		/* file current setting is from (NULL if not
@@ -260,6 +261,5 @@ extern void build_guc_variables(void);
 extern const char *config_enum_lookup_by_value(struct config_enum * record, int val);
 extern bool config_enum_lookup_by_name(struct config_enum * record,
 						   const char *value, int *retval);
-
 
 #endif   /* GUC_TABLES_H */

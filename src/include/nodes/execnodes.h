@@ -4,7 +4,7 @@
  *	  definitions for executor state nodes
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/nodes/execnodes.h
@@ -88,14 +88,14 @@ typedef struct ExprContext_CB
  *
  *		This class holds the "current context" information
  *		needed to evaluate expressions for doing tuple qualifications
- *		and tuple projections.	For example, if an expression refers
+ *		and tuple projections.  For example, if an expression refers
  *		to an attribute in the current inner tuple then we need to know
  *		what the current inner tuple is and so we look at the expression
  *		context.
  *
  *	There are two memory contexts associated with an ExprContext:
  *	* ecxt_per_query_memory is a query-lifespan context, typically the same
- *	  context the ExprContext node itself is allocated in.	This context
+ *	  context the ExprContext node itself is allocated in.  This context
  *	  can be used for purposes such as storing function call cache info.
  *	* ecxt_per_tuple_memory is a short-term context for expression results.
  *	  As the name suggests, it will typically be reset once per tuple,
@@ -141,7 +141,7 @@ typedef struct ExprContext
 	/* Link to containing EState (NULL if a standalone ExprContext) */
 	struct EState *ecxt_estate;
 
-	/* Functions to call back when ExprContext is shut down */
+	/* Functions to call back when ExprContext is shut down or rescanned */
 	ExprContext_CB *ecxt_callbacks;
 } ExprContext;
 
@@ -198,9 +198,9 @@ typedef struct ReturnSetInfo
  *		Nodes which need to do projections create one of these.
  *
  *		ExecProject() evaluates the tlist, forms a tuple, and stores it
- *		in the given slot.	Note that the result will be a "virtual" tuple
+ *		in the given slot.  Note that the result will be a "virtual" tuple
  *		unless ExecMaterializeSlot() is then called to force it to be
- *		converted to a physical tuple.	The slot must have a tupledesc
+ *		converted to a physical tuple.  The slot must have a tupledesc
  *		that matches the output of the tlist!
  *
  *		The planner very often produces tlists that consist entirely of
@@ -255,7 +255,7 @@ typedef struct ProjectionInfo
  *	  in emitted tuples.  For example, when we do an UPDATE query,
  *	  the planner adds a "junk" entry to the targetlist so that the tuples
  *	  returned to ExecutePlan() contain an extra attribute: the ctid of
- *	  the tuple to be updated.	This is needed to do the update, but we
+ *	  the tuple to be updated.  This is needed to do the update, but we
  *	  don't want the ctid to be part of the stored new tuple!  So, we
  *	  apply a "junk filter" to remove the junk attributes and form the
  *	  real output tuple.  The junkfilter code also provides routines to
@@ -270,7 +270,8 @@ typedef struct ProjectionInfo
  *	  resultSlot:		tuple slot used to hold cleaned tuple.
  *	  junkAttNo:		not used by junkfilter code.  Can be used by caller
  *						to remember the attno of a specific junk attribute
- *						(execMain.c stores the "ctid" attno here).
+ *						(nodeModifyTable.c keeps the "ctid" or "wholerow"
+ *						attno here).
  * ----------------
  */
 typedef struct JunkFilter
@@ -300,6 +301,10 @@ typedef struct JunkFilter
  *		TrigFunctions			cached lookup info for trigger functions
  *		TrigWhenExprs			array of trigger WHEN expr states
  *		TrigInstrument			optional runtime measurements for triggers
+ *		FdwRoutine				FDW callback functions, if foreign table
+ *		FdwState				available to save private state of FDW
+ *		WithCheckOptions		list of WithCheckOption's for views
+ *		WithCheckOptionExprs	list of WithCheckOption expr states
  *		ConstraintExprs			array of constraint-checking expr states
  *		junkFilter				for removing junk attributes from tuples
  *		projectReturning		for computing a RETURNING list
@@ -317,6 +322,10 @@ typedef struct ResultRelInfo
 	FmgrInfo   *ri_TrigFunctions;
 	List	  **ri_TrigWhenExprs;
 	Instrumentation *ri_TrigInstrument;
+	struct FdwRoutine *ri_FdwRoutine;
+	void	   *ri_FdwState;
+	List	   *ri_WithCheckOptions;
+	List	   *ri_WithCheckOptionExprs;
 	List	  **ri_ConstraintExprs;
 	JunkFilter *ri_junkFilter;
 	ProjectionInfo *ri_projectReturning;
@@ -371,8 +380,6 @@ typedef struct EState
 
 	int			es_top_eflags;	/* eflags passed to ExecutorStart */
 	int			es_instrument;	/* OR of InstrumentOption flags */
-	bool		es_select_into; /* true if doing SELECT INTO */
-	bool		es_into_oids;	/* true to generate OIDs in SELECT INTO */
 	bool		es_finished;	/* true when ExecutorFinish is done */
 
 	List	   *es_exprcontexts;	/* List of ExprContexts within EState */
@@ -390,7 +397,7 @@ typedef struct EState
 
 	/*
 	 * These fields are for re-evaluating plan quals when an updated tuple is
-	 * substituted in READ COMMITTED mode.	es_epqTuple[] contains tuples that
+	 * substituted in READ COMMITTED mode.  es_epqTuple[] contains tuples that
 	 * scan plan nodes should return instead of whatever they'd normally
 	 * return, or NULL if nothing to return; es_epqTupleSet[] is true if a
 	 * particular array entry is valid; and es_epqScanDone[] is state to
@@ -405,30 +412,33 @@ typedef struct EState
 
 /*
  * ExecRowMark -
- *	   runtime representation of FOR UPDATE/SHARE clauses
+ *	   runtime representation of FOR [KEY] UPDATE/SHARE clauses
  *
- * When doing UPDATE, DELETE, or SELECT FOR UPDATE/SHARE, we should have an
+ * When doing UPDATE, DELETE, or SELECT FOR [KEY] UPDATE/SHARE, we will have an
  * ExecRowMark for each non-target relation in the query (except inheritance
- * parent RTEs, which can be ignored at runtime).  See PlanRowMark for details
- * about most of the fields.  In addition to fields directly derived from
- * PlanRowMark, we store curCtid, which is used by the WHERE CURRENT OF code.
+ * parent RTEs, which can be ignored at runtime).  Virtual relations such as
+ * subqueries-in-FROM will have an ExecRowMark with relation == NULL.  See
+ * PlanRowMark for details about most of the fields.  In addition to fields
+ * directly derived from PlanRowMark, we store curCtid, which is used by the
+ * WHERE CURRENT OF code.
  *
  * EState->es_rowMarks is a list of these structs.
  */
 typedef struct ExecRowMark
 {
 	Relation	relation;		/* opened and suitably locked relation */
+	Oid			relid;			/* its OID (or InvalidOid, if subquery) */
 	Index		rti;			/* its range table index */
 	Index		prti;			/* parent range table index, if child */
 	Index		rowmarkId;		/* unique identifier for resjunk columns */
 	RowMarkType markType;		/* see enum in nodes/plannodes.h */
-	bool		noWait;			/* NOWAIT option */
+	LockWaitPolicy waitPolicy;	/* NOWAIT and SKIP LOCKED */
 	ItemPointerData curCtid;	/* ctid of currently locked tuple, if any */
 } ExecRowMark;
 
 /*
  * ExecAuxRowMark -
- *	   additional runtime representation of FOR UPDATE/SHARE clauses
+ *	   additional runtime representation of FOR [KEY] UPDATE/SHARE clauses
  *
  * Each LockRows and ModifyTable node keeps a list of the rowmarks it needs to
  * deal with.  In addition to a pointer to the related entry in es_rowMarks,
@@ -563,13 +573,27 @@ typedef struct GenericExprState
 } GenericExprState;
 
 /* ----------------
+ *		WholeRowVarExprState node
+ * ----------------
+ */
+typedef struct WholeRowVarExprState
+{
+	ExprState	xprstate;
+	struct PlanState *parent;	/* parent PlanState, or NULL if none */
+	TupleDesc	wrv_tupdesc;	/* descriptor for resulting tuples */
+	JunkFilter *wrv_junkFilter; /* JunkFilter to remove resjunk cols */
+} WholeRowVarExprState;
+
+/* ----------------
  *		AggrefExprState node
  * ----------------
  */
 typedef struct AggrefExprState
 {
 	ExprState	xprstate;
-	List	   *args;			/* states of argument expressions */
+	List	   *aggdirectargs;	/* states of direct-argument expressions */
+	List	   *args;			/* states of aggregated-argument expressions */
+	ExprState  *aggfilter;		/* state of FILTER expression, if any */
 	int			aggno;			/* ID number for agg within its plan node */
 } AggrefExprState;
 
@@ -581,6 +605,7 @@ typedef struct WindowFuncExprState
 {
 	ExprState	xprstate;
 	List	   *args;			/* states of argument expressions */
+	ExprState  *aggfilter;		/* FILTER expression */
 	int			wfuncno;		/* ID number for wfunc within its plan node */
 } WindowFuncExprState;
 
@@ -635,7 +660,7 @@ typedef struct FuncExprState
 
 	/*
 	 * In some cases we need to compute a tuple descriptor for the function's
-	 * output.	If so, it's stored here.
+	 * output.  If so, it's stored here.
 	 */
 	TupleDesc	funcResultDesc;
 	bool		funcReturnsTuple;		/* valid when funcResultDesc isn't
@@ -659,7 +684,7 @@ typedef struct FuncExprState
 
 	/*
 	 * Flag to remember whether we have registered a shutdown callback for
-	 * this FuncExprState.	We do so only if funcResultStore or setArgsValid
+	 * this FuncExprState.  We do so only if funcResultStore or setArgsValid
 	 * has been set at least once (since all the callback is for is to release
 	 * the tuplestore or clear setArgsValid).
 	 */
@@ -707,9 +732,11 @@ typedef struct SubPlanState
 {
 	ExprState	xprstate;
 	struct PlanState *planstate;	/* subselect plan's state tree */
+	struct PlanState *parent;	/* parent plan node's state tree */
 	ExprState  *testexpr;		/* state of combining expression */
 	List	   *args;			/* states of argument expression(s) */
 	HeapTuple	curTuple;		/* copy of most recent tuple from subplan */
+	Datum		curArray;		/* most recent array from ARRAY() subplan */
 	/* these are used when hashing the subselect's output: */
 	ProjectionInfo *projLeft;	/* for projecting lefthand exprs */
 	ProjectionInfo *projRight;	/* for projecting subselect output */
@@ -918,8 +945,9 @@ typedef struct CoerceToDomainState
 {
 	ExprState	xprstate;
 	ExprState  *arg;			/* input expression */
-	/* Cached list of constraints that need to be checked */
-	List	   *constraints;	/* list of DomainConstraintState nodes */
+	/* Cached set of constraints that need to be checked */
+	/* use struct pointer to avoid including typcache.h here */
+	struct DomainConstraintRef *constraint_ref;
 } CoerceToDomainState;
 
 /*
@@ -1090,10 +1118,8 @@ typedef struct AppendState
  *		nkeys			number of sort key columns
  *		sortkeys		sort keys in SortSupport representation
  *		slots			current output tuple of each subplan
- *		heap			heap of active tuples (represented as array indexes)
- *		heap_size		number of active heap entries
+ *		heap			heap of active tuples
  *		initialized		true if we have fetched first tuple from each subplan
- *		last_slot		last subplan fetched from (which must be re-called)
  * ----------------
  */
 typedef struct MergeAppendState
@@ -1102,12 +1128,10 @@ typedef struct MergeAppendState
 	PlanState **mergeplans;		/* array of PlanStates for my inputs */
 	int			ms_nplans;
 	int			ms_nkeys;
-	SortSupport	ms_sortkeys;	/* array of length ms_nkeys */
+	SortSupport ms_sortkeys;	/* array of length ms_nkeys */
 	TupleTableSlot **ms_slots;	/* array of length ms_nplans */
-	int		   *ms_heap;		/* array of length ms_nplans */
-	int			ms_heap_size;	/* current active length of ms_heap[] */
+	struct binaryheap *ms_heap; /* binary heap of slot indices */
 	bool		ms_initialized; /* are subplans started? */
-	int			ms_last_slot;	/* last subplan slot we returned from */
 } MergeAppendState;
 
 /* ----------------
@@ -1320,6 +1344,8 @@ typedef struct BitmapIndexScanState
  *		tbm				   bitmap obtained from child index scan(s)
  *		tbmiterator		   iterator for scanning current pages
  *		tbmres			   current-page data
+ *		exact_pages		   total number of exact pages retrieved
+ *		lossy_pages		   total number of lossy pages retrieved
  *		prefetch_iterator  iterator for prefetching ahead of current page
  *		prefetch_pages	   # pages prefetch iterator is ahead of current
  *		prefetch_target    target prefetch distance
@@ -1332,6 +1358,8 @@ typedef struct BitmapHeapScanState
 	TIDBitmap  *tbm;
 	TBMIterator *tbmiterator;
 	TBMIterateResult *tbmres;
+	long		exact_pages;
+	long		lossy_pages;
 	TBMIterator *prefetch_iterator;
 	int			prefetch_pages;
 	int			prefetch_target;
@@ -1353,7 +1381,6 @@ typedef struct TidScanState
 	bool		tss_isCurrentOf;
 	int			tss_NumTids;
 	int			tss_TidPtr;
-	int			tss_MarkTidPtr;
 	ItemPointerData *tss_TidList;
 	HeapTupleData tss_htup;
 } TidScanState;
@@ -1378,18 +1405,28 @@ typedef struct SubqueryScanState
  *		function appearing in FROM (typically a function returning set).
  *
  *		eflags				node's capability flags
- *		tupdesc				expected return tuple description
- *		tuplestorestate		private state of tuplestore.c
- *		funcexpr			state for function expression being evaluated
+ *		ordinality			is this scan WITH ORDINALITY?
+ *		simple				true if we have 1 function and no ordinality
+ *		ordinal				current ordinal column value
+ *		nfuncs				number of functions being executed
+ *		funcstates			per-function execution states (private in
+ *							nodeFunctionscan.c)
+ *		argcontext			memory context to evaluate function arguments in
  * ----------------
  */
+struct FunctionScanPerFuncState;
+
 typedef struct FunctionScanState
 {
 	ScanState	ss;				/* its first field is NodeTag */
 	int			eflags;
-	TupleDesc	tupdesc;
-	Tuplestorestate *tuplestorestate;
-	ExprState  *funcexpr;
+	bool		ordinality;
+	bool		simple;
+	int64		ordinal;
+	int			nfuncs;
+	struct FunctionScanPerFuncState *funcstates;		/* array of length
+														 * nfuncs */
+	MemoryContext argcontext;
 } FunctionScanState;
 
 /* ----------------
@@ -1401,7 +1438,6 @@ typedef struct FunctionScanState
  *		exprlists			array of expression lists being evaluated
  *		array_len			size of array
  *		curr_idx			current array index (0-based)
- *		marked_idx			marked position (for mark/restore)
  *
  *	Note: ss.ps.ps_ExprContext is used to evaluate any qual or projection
  *	expressions attached to the node.  We create a second ExprContext,
@@ -1417,7 +1453,6 @@ typedef struct ValuesScanState
 	List	  **exprlists;
 	int			array_len;
 	int			curr_idx;
-	int			marked_idx;
 } ValuesScanState;
 
 /* ----------------
@@ -1447,7 +1482,7 @@ typedef struct CteScanState
  *	 WorkTableScanState information
  *
  *		WorkTableScan nodes are used to scan the work table created by
- *		a RecursiveUnion node.	We locate the RecursiveUnion node
+ *		a RecursiveUnion node.  We locate the RecursiveUnion node
  *		during executor startup.
  * ----------------
  */
@@ -1470,6 +1505,49 @@ typedef struct ForeignScanState
 	struct FdwRoutine *fdwroutine;
 	void	   *fdw_state;		/* foreign-data wrapper can keep state here */
 } ForeignScanState;
+
+/* ----------------
+ *	 CustomScanState information
+ *
+ *		CustomScan nodes are used to execute custom code within executor.
+ *
+ * Core code must avoid assuming that the CustomScanState is only as large as
+ * the structure declared here; providers are allowed to make it the first
+ * element in a larger structure, and typically would need to do so.  The
+ * struct is actually allocated by the CreateCustomScanState method associated
+ * with the plan node.  Any additional fields can be initialized there, or in
+ * the BeginCustomScan method.
+ * ----------------
+ */
+struct ExplainState;			/* avoid including explain.h here */
+struct CustomScanState;
+
+typedef struct CustomExecMethods
+{
+	const char *CustomName;
+
+	/* Executor methods: mark/restore are optional, the rest are required */
+	void		(*BeginCustomScan) (struct CustomScanState *node,
+												EState *estate,
+												int eflags);
+	TupleTableSlot *(*ExecCustomScan) (struct CustomScanState *node);
+	void		(*EndCustomScan) (struct CustomScanState *node);
+	void		(*ReScanCustomScan) (struct CustomScanState *node);
+	void		(*MarkPosCustomScan) (struct CustomScanState *node);
+	void		(*RestrPosCustomScan) (struct CustomScanState *node);
+
+	/* Optional: print additional information in EXPLAIN */
+	void		(*ExplainCustomScan) (struct CustomScanState *node,
+												  List *ancestors,
+												  struct ExplainState *es);
+} CustomExecMethods;
+
+typedef struct CustomScanState
+{
+	ScanState	ss;
+	uint32		flags;			/* mask of CUSTOMPATH_* flags, see relation.h */
+	const CustomExecMethods *methods;
+} CustomScanState;
 
 /* ----------------------------------------------------------------
  *				 Join State Information
@@ -1679,6 +1757,7 @@ typedef struct AggState
 	AggStatePerAgg peragg;		/* per-Aggref information */
 	MemoryContext aggcontext;	/* memory context for long-lived data */
 	ExprContext *tmpcontext;	/* econtext for input expressions */
+	AggStatePerAgg curperagg;	/* identifies currently active aggregate */
 	bool		agg_done;		/* indicates completion of Agg scan */
 	/* these fields are used in AGG_PLAIN and AGG_SORTED modes: */
 	AggStatePerGroup pergroup;	/* per-Aggref-per-group working state */
@@ -1731,7 +1810,8 @@ typedef struct WindowAggState
 	Datum		endOffsetValue; /* result of endOffset evaluation */
 
 	MemoryContext partcontext;	/* context for partition-lifespan data */
-	MemoryContext aggcontext;	/* context for each aggregate data */
+	MemoryContext aggcontext;	/* shared context for aggregate working data */
+	MemoryContext curaggcontext;	/* current aggregate's working data */
 	ExprContext *tmpcontext;	/* short-term evaluation context */
 
 	bool		all_first;		/* true if the scan is starting */
@@ -1759,7 +1839,7 @@ typedef struct WindowAggState
  *	 UniqueState information
  *
  *		Unique nodes are used "on top of" sort nodes to discard
- *		duplicate tuples returned from the sort phase.	Basically
+ *		duplicate tuples returned from the sort phase.  Basically
  *		all it does is compare the current tuple from the subplan
  *		with the previously fetched tuple (stored in its result slot).
  *		If the two are identical in all interesting fields, then
@@ -1818,7 +1898,7 @@ typedef struct SetOpState
 /* ----------------
  *	 LockRowsState information
  *
- *		LockRows nodes are used to enforce FOR UPDATE/FOR SHARE locking.
+ *		LockRows nodes are used to enforce FOR [KEY] UPDATE/SHARE locking.
  * ----------------
  */
 typedef struct LockRowsState

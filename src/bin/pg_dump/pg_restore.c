@@ -38,24 +38,19 @@
  *
  *-------------------------------------------------------------------------
  */
+#include "postgres_fe.h"
 
-#include "pg_backup_archiver.h"
+#include "getopt_long.h"
 
-#include "dumpmem.h"
 #include "dumputils.h"
+#include "parallel.h"
+#include "pg_backup_utils.h"
 
 #include <ctype.h>
 
 #ifdef HAVE_TERMIOS_H
 #include <termios.h>
 #endif
-
-#include <unistd.h>
-
-#include "getopt_long.h"
-
-extern char *optarg;
-extern int	optind;
 
 #ifdef ENABLE_NLS
 #include <locale.h>
@@ -72,9 +67,12 @@ main(int argc, char **argv)
 	RestoreOptions *opts;
 	int			c;
 	int			exit_code;
+	int			numWorkers = 1;
 	Archive    *AH;
 	char	   *inputFileSpec;
 	static int	disable_triggers = 0;
+	static int	enable_row_security = 0;
+	static int	if_exists = 0;
 	static int	no_data_for_failed_tables = 0;
 	static int	outputNoTablespaces = 0;
 	static int	use_setsessauth = 0;
@@ -115,6 +113,8 @@ main(int argc, char **argv)
 		 * the following options don't have an equivalent short option letter
 		 */
 		{"disable-triggers", no_argument, &disable_triggers, 1},
+		{"enable-row-security", no_argument, &enable_row_security, 1},
+		{"if-exists", no_argument, &if_exists, 1},
 		{"no-data-for-failed-tables", no_argument, &no_data_for_failed_tables, 1},
 		{"no-tablespaces", no_argument, &outputNoTablespaces, 1},
 		{"role", required_argument, NULL, 2},
@@ -183,7 +183,7 @@ main(int argc, char **argv)
 				break;
 
 			case 'j':			/* number of restore jobs */
-				opts->number_of_jobs = atoi(optarg);
+				numWorkers = atoi(optarg);
 				break;
 
 			case 'l':			/* Dump the TOC summary */
@@ -195,7 +195,7 @@ main(int argc, char **argv)
 				break;
 
 			case 'n':			/* Dump data for this schema only */
-				opts->schemaNames = pg_strdup(optarg);
+				simple_string_list_append(&opts->schemaNames, optarg);
 				break;
 
 			case 'O':
@@ -212,17 +212,17 @@ main(int argc, char **argv)
 			case 'P':			/* Function */
 				opts->selTypes = 1;
 				opts->selFunction = 1;
-				opts->functionNames = pg_strdup(optarg);
+				simple_string_list_append(&opts->functionNames, optarg);
 				break;
 			case 'I':			/* Index */
 				opts->selTypes = 1;
 				opts->selIndex = 1;
-				opts->indexNames = pg_strdup(optarg);
+				simple_string_list_append(&opts->indexNames, optarg);
 				break;
 			case 'T':			/* Trigger */
 				opts->selTypes = 1;
 				opts->selTrigger = 1;
-				opts->triggerNames = pg_strdup(optarg);
+				simple_string_list_append(&opts->triggerNames, optarg);
 				break;
 			case 's':			/* dump schema only */
 				opts->schemaOnly = 1;
@@ -234,11 +234,11 @@ main(int argc, char **argv)
 			case 't':			/* Dump data for this table only */
 				opts->selTypes = 1;
 				opts->selTable = 1;
-				opts->tableNames = pg_strdup(optarg);
+				simple_string_list_append(&opts->tableNames, optarg);
 				break;
 
 			case 'U':
-				opts->username = optarg;
+				opts->username = pg_strdup(optarg);
 				break;
 
 			case 'v':			/* verbose */
@@ -270,11 +270,11 @@ main(int argc, char **argv)
 				break;
 
 			case 2:				/* SET ROLE */
-				opts->use_role = optarg;
+				opts->use_role = pg_strdup(optarg);
 				break;
 
 			case 3:				/* section */
-				set_section(optarg, &(opts->dumpSections));
+				set_dump_section(optarg, &(opts->dumpSections));
 				break;
 
 			default:
@@ -299,30 +299,6 @@ main(int argc, char **argv)
 		exit_nicely(1);
 	}
 
-	if (opts->dataOnly && opts->schemaOnly)
-	{
-		fprintf(stderr, _("%s: options -s/--schema-only and -a/--data-only cannot be used together\n"),
-			progname);
-		exit_nicely(1);
-	}
-
-	if ((opts->dataOnly || opts->schemaOnly) && (opts->dumpSections != DUMP_UNSECTIONED))
-	{
-		fprintf(stderr, _("%s: options -s/--schema-only and -a/--data-only cannot be used with --section\n"),
-			progname);
-		exit_nicely(1);
-	}
-
-	if (opts->dataOnly)
-		opts->dumpSections = DUMP_DATA;
-	else if (opts->schemaOnly)
-		opts->dumpSections = DUMP_PRE_DATA | DUMP_POST_DATA;
-	else if ( opts->dumpSections != DUMP_UNSECTIONED)
-	{
-		opts->dataOnly = opts->dumpSections == DUMP_DATA;
-		opts->schemaOnly = !(opts->dumpSections & DUMP_DATA);
-	}
-
 	/* Should get at most one of -d and -f, else user is confused */
 	if (opts->dbname)
 	{
@@ -337,8 +313,22 @@ main(int argc, char **argv)
 		opts->useDB = 1;
 	}
 
+	if (opts->dataOnly && opts->schemaOnly)
+	{
+		fprintf(stderr, _("%s: options -s/--schema-only and -a/--data-only cannot be used together\n"),
+				progname);
+		exit_nicely(1);
+	}
+
+	if (opts->dataOnly && opts->dropSchema)
+	{
+		fprintf(stderr, _("%s: options -c/--clean and -a/--data-only cannot be used together\n"),
+				progname);
+		exit_nicely(1);
+	}
+
 	/* Can't do single-txn mode with multiple connections */
-	if (opts->single_txn && opts->number_of_jobs > 1)
+	if (opts->single_txn && numWorkers > 1)
 	{
 		fprintf(stderr, _("%s: cannot specify both --single-transaction and multiple jobs\n"),
 				progname);
@@ -346,10 +336,19 @@ main(int argc, char **argv)
 	}
 
 	opts->disable_triggers = disable_triggers;
+	opts->enable_row_security = enable_row_security;
 	opts->noDataForFailedTables = no_data_for_failed_tables;
 	opts->noTablespace = outputNoTablespaces;
 	opts->use_setsessauth = use_setsessauth;
 	opts->no_security_labels = no_security_labels;
+
+	if (if_exists && !opts->dropSchema)
+	{
+		fprintf(stderr, _("%s: option --if-exists requires option -c/--clean\n"),
+				progname);
+		exit_nicely(1);
+	}
+	opts->if_exists = if_exists;
 
 	if (opts->formatName)
 	{
@@ -363,11 +362,6 @@ main(int argc, char **argv)
 			case 'd':
 			case 'D':
 				opts->format = archDirectory;
-				break;
-
-			case 'f':
-			case 'F':
-				opts->format = archFiles;
 				break;
 
 			case 't':
@@ -384,6 +378,13 @@ main(int argc, char **argv)
 
 	AH = OpenArchive(inputFileSpec, opts->format);
 
+	/*
+	 * We don't have a connection yet but that doesn't matter. The connection
+	 * is initialized to NULL and if we terminate through exit_nicely() while
+	 * it's still NULL, the cleanup function will just be a no-op.
+	 */
+	on_exit_close_archive(AH);
+
 	/* Let the archiver know how noisy to be */
 	AH->verbose = opts->verbose;
 
@@ -394,19 +395,26 @@ main(int argc, char **argv)
 
 	if (opts->tocFile)
 		SortTocFromFile(AH, opts);
-	else if (opts->noDataForFailedTables)
+
+	/* See comments in pg_dump.c */
+#ifdef WIN32
+	if (numWorkers > MAXIMUM_WAIT_OBJECTS)
 	{
-		/*
-		 * we implement this option by clearing idWanted entries, so must
-		 * create a dummy idWanted array if there wasn't a tocFile
-		 */
-		InitDummyWantedList(AH, opts);
+		fprintf(stderr, _("%s: maximum number of parallel jobs is %d\n"),
+				progname, MAXIMUM_WAIT_OBJECTS);
+		exit(1);
 	}
+#endif
+
+	AH->numWorkers = numWorkers;
 
 	if (opts->tocSummary)
 		PrintTOCSummary(AH, opts);
 	else
-		RestoreArchive(AH, opts);
+	{
+		SetArchiveRestoreOptions(AH, opts);
+		RestoreArchive(AH);
+	}
 
 	/* done, print a summary of ignored errors */
 	if (AH->n_errors)
@@ -416,7 +424,7 @@ main(int argc, char **argv)
 	/* AH may be freed in CloseArchive? */
 	exit_code = AH->n_errors ? 1 : 0;
 
-	CloseArchive(AH);
+	CloseArchive(AH, NULL);
 
 	return exit_code;
 }
@@ -434,39 +442,38 @@ usage(const char *progname)
 	printf(_("  -F, --format=c|d|t       backup file format (should be automatic)\n"));
 	printf(_("  -l, --list               print summarized TOC of the archive\n"));
 	printf(_("  -v, --verbose            verbose mode\n"));
-	printf(_("  --help                   show this help, then exit\n"));
-	printf(_("  --version                output version information, then exit\n"));
+	printf(_("  -V, --version            output version information, then exit\n"));
+	printf(_("  -?, --help               show this help, then exit\n"));
 
 	printf(_("\nOptions controlling the restore:\n"));
-	printf(_("  -a, --data-only          restore only the data, no schema\n"));
-	printf(_("  -c, --clean              clean (drop) database objects before recreating\n"));
-	printf(_("  -C, --create             create the target database\n"));
-	printf(_("  -e, --exit-on-error      exit on error, default is to continue\n"));
-	printf(_("  -I, --index=NAME         restore named index\n"));
-	printf(_("  -j, --jobs=NUM           use this many parallel jobs to restore\n"));
-	printf(_("  -L, --use-list=FILENAME  use table of contents from this file for\n"
-			 "                           selecting/ordering output\n"));
-	printf(_("  -n, --schema=NAME        restore only objects in this schema\n"));
-	printf(_("  -O, --no-owner           skip restoration of object ownership\n"));
-	printf(_("  -P, --function=NAME(args)\n"
-			 "                           restore named function\n"));
-	printf(_("  -s, --schema-only        restore only the schema, no data\n"));
-	printf(_("  -S, --superuser=NAME     superuser user name to use for disabling triggers\n"));
-	printf(_("  -t, --table=NAME         restore named table\n"));
-	printf(_("  -T, --trigger=NAME       restore named trigger\n"));
-	printf(_("  -x, --no-privileges      skip restoration of access privileges (grant/revoke)\n"));
-	printf(_("  -1, --single-transaction\n"
-			 "                           restore as a single transaction\n"));
-	printf(_("  --disable-triggers       disable triggers during data-only restore\n"));
-	printf(_("  --no-data-for-failed-tables\n"
-			 "                           do not restore data of tables that could not be\n"
-			 "                           created\n"));
-	printf(_("  --no-security-labels     do not restore security labels\n"));
-	printf(_("  --no-tablespaces         do not restore tablespace assignments\n"));
-	printf(_("  --section=SECTION        restore named section (pre-data, data, or post-data)\n"));
+	printf(_("  -a, --data-only              restore only the data, no schema\n"));
+	printf(_("  -c, --clean                  clean (drop) database objects before recreating\n"));
+	printf(_("  -C, --create                 create the target database\n"));
+	printf(_("  -e, --exit-on-error          exit on error, default is to continue\n"));
+	printf(_("  -I, --index=NAME             restore named index\n"));
+	printf(_("  -j, --jobs=NUM               use this many parallel jobs to restore\n"));
+	printf(_("  -L, --use-list=FILENAME      use table of contents from this file for\n"
+			 "                               selecting/ordering output\n"));
+	printf(_("  -n, --schema=NAME            restore only objects in this schema\n"));
+	printf(_("  -O, --no-owner               skip restoration of object ownership\n"));
+	printf(_("  -P, --function=NAME(args)    restore named function\n"));
+	printf(_("  -s, --schema-only            restore only the schema, no data\n"));
+	printf(_("  -S, --superuser=NAME         superuser user name to use for disabling triggers\n"));
+	printf(_("  -t, --table=NAME             restore named table\n"));
+	printf(_("  -T, --trigger=NAME           restore named trigger\n"));
+	printf(_("  -x, --no-privileges          skip restoration of access privileges (grant/revoke)\n"));
+	printf(_("  -1, --single-transaction     restore as a single transaction\n"));
+	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
+	printf(_("  --enable-row-security        enable row level security\n"));
+	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
+	printf(_("  --no-data-for-failed-tables  do not restore data of tables that could not be\n"
+			 "                               created\n"));
+	printf(_("  --no-security-labels         do not restore security labels\n"));
+	printf(_("  --no-tablespaces             do not restore tablespace assignments\n"));
+	printf(_("  --section=SECTION            restore named section (pre-data, data, or post-data)\n"));
 	printf(_("  --use-set-session-authorization\n"
-			 "                           use SET SESSION AUTHORIZATION commands instead of\n"
-	  "                           ALTER OWNER commands to set ownership\n"));
+			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
+			 "                               ALTER OWNER commands to set ownership\n"));
 
 	printf(_("\nConnection options:\n"));
 	printf(_("  -h, --host=HOSTNAME      database server host or socket directory\n"));
@@ -476,6 +483,9 @@ usage(const char *progname)
 	printf(_("  -W, --password           force password prompt (should happen automatically)\n"));
 	printf(_("  --role=ROLENAME          do SET ROLE before restore\n"));
 
+	printf(_("\n"
+			 "The options -I, -n, -P, -t, -T, and --section can be combined and specified\n"
+			 "multiple times to select multiple objects.\n"));
 	printf(_("\nIf no input file name is supplied, then standard input is used.\n\n"));
 	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
 }

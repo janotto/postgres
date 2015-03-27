@@ -3,7 +3,7 @@
  * globals.c
  *	  global variable declarations
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -18,7 +18,7 @@
  */
 #include "postgres.h"
 
-#include "catalog/objectaccess.h"
+#include "libpq/libpq-be.h"
 #include "libpq/pqcomm.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"
@@ -30,8 +30,8 @@ volatile bool InterruptPending = false;
 volatile bool QueryCancelPending = false;
 volatile bool ProcDiePending = false;
 volatile bool ClientConnectionLost = false;
-volatile bool ImmediateInterruptOK = false;
 volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
 
 int			MyProcPid;
@@ -39,6 +39,15 @@ pg_time_t	MyStartTime;
 struct Port *MyProcPort;
 long		MyCancelKey;
 int			MyPMChildSlot;
+
+/*
+ * MyLatch points to the latch that should be used for signal handling by the
+ * current process. It will either point to a process local latch if the
+ * current process does not have a PGPROC entry in that moment, or to
+ * PGPROC->procLatch if it has. Thus it can always be used in signal handlers,
+ * without checking for its existence.
+ */
+struct Latch *MyLatch;
 
 /*
  * DataDir is the absolute path to the top level of the PGDATA directory tree.
@@ -87,14 +96,13 @@ pid_t		PostmasterPid = 0;
 bool		IsPostmasterEnvironment = false;
 bool		IsUnderPostmaster = false;
 bool		IsBinaryUpgrade = false;
+bool		IsBackgroundWorker = false;
 
 bool		ExitOnAnyError = false;
 
 int			DateStyle = USE_ISO_DATES;
 int			DateOrder = DATEORDER_MDY;
 int			IntervalStyle = INTSTYLE_POSTGRES;
-bool		HasCTZSet = false;
-int			CTimeZone = 0;
 
 bool		enableFsync = true;
 bool		allowSystemTableMods = false;
@@ -102,13 +110,15 @@ int			work_mem = 1024;
 int			maintenance_work_mem = 16384;
 
 /*
- * Primary determinants of sizes of shared-memory structures.  MaxBackends is
- * MaxConnections + autovacuum_max_workers + 1 (it is computed by the GUC
- * assign hooks for those variables):
+ * Primary determinants of sizes of shared-memory structures.
+ *
+ * MaxBackends is computed by PostmasterMain after modules have had a chance to
+ * register background workers.
  */
 int			NBuffers = 1000;
-int			MaxBackends = 100;
 int			MaxConnections = 90;
+int			max_worker_processes = 8;
+int			MaxBackends = 0;
 
 int			VacuumCostPageHit = 1;		/* GUC parameters for vacuum */
 int			VacuumCostPageMiss = 10;
@@ -122,11 +132,3 @@ int			VacuumPageDirty = 0;
 
 int			VacuumCostBalance = 0;		/* working state for vacuum */
 bool		VacuumCostActive = false;
-
-int			GinFuzzySearchLimit = 0;
-
-/*
- * Hook on object accesses.  This is intended as infrastructure for security
- * and logging plugins.
- */
-object_access_hook_type object_access_hook = NULL;

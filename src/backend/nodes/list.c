@@ -4,7 +4,7 @@
  *	  implementation for PostgreSQL generic linked list package
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -14,6 +14,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+/* see pg_list.h */
+#define PG_LIST_INCLUDE_DEFINITIONS
 
 #include "nodes/pg_list.h"
 
@@ -382,7 +385,7 @@ list_truncate(List *list, int new_size)
  * Locate the n'th cell (counting from 0) of the list.  It is an assertion
  * failure if there is no such cell.
  */
-static ListCell *
+ListCell *
 list_nth_cell(const List *list, int n)
 {
 	ListCell   *match;
@@ -443,7 +446,7 @@ list_nth_oid(const List *list, int n)
 bool
 list_member(const List *list, const void *datum)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsPointerList(list));
 	check_list_invariants(list);
@@ -464,7 +467,7 @@ list_member(const List *list, const void *datum)
 bool
 list_member_ptr(const List *list, const void *datum)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsPointerList(list));
 	check_list_invariants(list);
@@ -484,7 +487,7 @@ list_member_ptr(const List *list, const void *datum)
 bool
 list_member_int(const List *list, int datum)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsIntegerList(list));
 	check_list_invariants(list);
@@ -504,7 +507,7 @@ list_member_int(const List *list, int datum)
 bool
 list_member_oid(const List *list, Oid datum)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsOidList(list));
 	check_list_invariants(list);
@@ -697,7 +700,7 @@ List *
 list_union(const List *list1, const List *list2)
 {
 	List	   *result;
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsPointerList(list1));
 	Assert(IsPointerList(list2));
@@ -721,7 +724,7 @@ List *
 list_union_ptr(const List *list1, const List *list2)
 {
 	List	   *result;
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsPointerList(list1));
 	Assert(IsPointerList(list2));
@@ -744,7 +747,7 @@ List *
 list_union_int(const List *list1, const List *list2)
 {
 	List	   *result;
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsIntegerList(list1));
 	Assert(IsIntegerList(list2));
@@ -767,7 +770,7 @@ List *
 list_union_oid(const List *list1, const List *list2)
 {
 	List	   *result;
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	Assert(IsOidList(list1));
 	Assert(IsOidList(list2));
@@ -793,14 +796,14 @@ list_union_oid(const List *list1, const List *list2)
  * "intersection" if list1 is known unique beforehand.
  *
  * This variant works on lists of pointers, and determines list
- * membership via equal().	Note that the list1 member will be pointed
+ * membership via equal().  Note that the list1 member will be pointed
  * to in the result.
  */
 List *
 list_intersection(const List *list1, const List *list2)
 {
 	List	   *result;
-	const ListCell   *cell;
+	const ListCell *cell;
 
 	if (list1 == NIL || list2 == NIL)
 		return NIL;
@@ -831,7 +834,7 @@ list_intersection(const List *list1, const List *list2)
 List *
 list_difference(const List *list1, const List *list2)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 	List	   *result = NIL;
 
 	Assert(IsPointerList(list1));
@@ -857,7 +860,7 @@ list_difference(const List *list1, const List *list2)
 List *
 list_difference_ptr(const List *list1, const List *list2)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 	List	   *result = NIL;
 
 	Assert(IsPointerList(list1));
@@ -882,7 +885,7 @@ list_difference_ptr(const List *list1, const List *list2)
 List *
 list_difference_int(const List *list1, const List *list2)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 	List	   *result = NIL;
 
 	Assert(IsIntegerList(list1));
@@ -907,7 +910,7 @@ list_difference_int(const List *list1, const List *list2)
 List *
 list_difference_oid(const List *list1, const List *list2)
 {
-	const ListCell   *cell;
+	const ListCell *cell;
 	List	   *result = NIL;
 
 	Assert(IsOidList(list1));
@@ -985,7 +988,7 @@ list_append_unique_oid(List *list, Oid datum)
  * via equal().
  *
  * This is almost the same functionality as list_union(), but list1 is
- * modified in-place rather than being copied.	Note also that list2's cells
+ * modified in-place rather than being copied.  Note also that list2's cells
  * are not inserted in list1, so the analogy to list_concat() isn't perfect.
  */
 List *
@@ -1222,31 +1225,6 @@ list_copy_tail(const List *oldlist, int nskip)
 	check_list_invariants(newlist);
 	return newlist;
 }
-
-/*
- * pg_list.h defines inline versions of these functions if allowed by the
- * compiler; in which case the definitions below are skipped.
- */
-#ifndef USE_INLINE
-
-ListCell *
-list_head(const List *l)
-{
-	return l ? l->head : NULL;
-}
-
-ListCell *
-list_tail(List *l)
-{
-	return l ? l->tail : NULL;
-}
-
-int
-list_length(const List *l)
-{
-	return l ? l->length : 0;
-}
-#endif   /* ! USE_INLINE */
 
 /*
  * Temporary compatibility functions

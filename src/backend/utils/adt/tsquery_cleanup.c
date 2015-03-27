@@ -4,7 +4,7 @@
  *	 Cleanup query from NOT values and/or stopword
  *	 Utility functions to correct work.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -124,7 +124,7 @@ freetree(NODE *node)
 
 /*
  * clean tree for ! operator.
- * It's usefull for debug, but in
+ * It's useful for debug, but in
  * other case, such view is used with search in index.
  * Operator ! always return TRUE
  */

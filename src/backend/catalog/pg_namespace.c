@@ -3,7 +3,7 @@
  * pg_namespace.c
  *	  routines to support manipulation of the pg_namespace relation
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/htup_details.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
 #include "catalog/objectaccess.h"
@@ -26,10 +27,18 @@
 
 /* ----------------
  * NamespaceCreate
+ *
+ * Create a namespace (schema) with the given name and owner OID.
+ *
+ * If isTemp is true, this schema is a per-backend schema for holding
+ * temporary tables.  Currently, the only effect of that is to prevent it
+ * from being linked as a member of any active extension.  (If someone
+ * does CREATE TEMP TABLE in an extension script, we don't want the temp
+ * schema to become part of the extension.)
  * ---------------
  */
 Oid
-NamespaceCreate(const char *nspName, Oid ownerId)
+NamespaceCreate(const char *nspName, Oid ownerId, bool isTemp)
 {
 	Relation	nspdesc;
 	HeapTuple	tup;
@@ -82,11 +91,12 @@ NamespaceCreate(const char *nspName, Oid ownerId)
 	/* dependency on owner */
 	recordDependencyOnOwner(NamespaceRelationId, nspoid, ownerId);
 
-	/* dependency on extension */
-	recordDependencyOnCurrentExtension(&myself, false);
+	/* dependency on extension ... but not for magic temp schemas */
+	if (!isTemp)
+		recordDependencyOnCurrentExtension(&myself, false);
 
 	/* Post creation hook for new schema */
-	InvokeObjectAccessHook(OAT_POST_CREATE, NamespaceRelationId, nspoid, 0);
+	InvokeObjectPostCreateHook(NamespaceRelationId, nspoid, 0);
 
 	return nspoid;
 }

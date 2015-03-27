@@ -9,7 +9,7 @@
  *	  more likely to break across PostgreSQL releases than code that uses
  *	  only the official API.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/interfaces/libpq/libpq-int.h
@@ -73,14 +73,14 @@ typedef struct
 #endif
 #endif   /* ENABLE_SSPI */
 
-#ifdef USE_SSL
+#ifdef USE_OPENSSL
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
 #if (SSLEAY_VERSION_NUMBER >= 0x00907000L) && !defined(OPENSSL_NO_ENGINE)
 #define USE_SSL_ENGINE
 #endif
-#endif   /* USE_SSL */
+#endif   /* USE_OPENSSL */
 
 /*
  * POSTGRES backend dependent Constants.
@@ -145,7 +145,7 @@ typedef struct pgMessageField
 {
 	struct pgMessageField *next;	/* list link */
 	char		code;			/* field code */
-	char		contents[1];	/* field value (VARIABLE LENGTH) */
+	char		contents[FLEXIBLE_ARRAY_MEMBER];		/* value, nul-terminated */
 } PGMessageField;
 
 /* Fields needed for notice handling */
@@ -271,11 +271,25 @@ typedef struct pgLobjfuncs
 	Oid			fn_lo_create;	/* OID of backend function lo_create	*/
 	Oid			fn_lo_unlink;	/* OID of backend function lo_unlink	*/
 	Oid			fn_lo_lseek;	/* OID of backend function lo_lseek		*/
+	Oid			fn_lo_lseek64;	/* OID of backend function lo_lseek64	*/
 	Oid			fn_lo_tell;		/* OID of backend function lo_tell		*/
+	Oid			fn_lo_tell64;	/* OID of backend function lo_tell64	*/
 	Oid			fn_lo_truncate; /* OID of backend function lo_truncate	*/
+	Oid			fn_lo_truncate64;		/* OID of function lo_truncate64 */
 	Oid			fn_lo_read;		/* OID of backend function LOread		*/
 	Oid			fn_lo_write;	/* OID of backend function LOwrite		*/
 } PGlobjfuncs;
+
+/* PGdataValue represents a data field value being passed to a row processor.
+ * It could be either text or binary data; text data is not zero-terminated.
+ * A SQL NULL is represented by len < 0; then value is still valid but there
+ * are no data bytes there.
+ */
+typedef struct pgDataValue
+{
+	int			len;			/* data length in bytes, or <0 if NULL */
+	const char *value;			/* data value, without zero-termination */
+} PGdataValue;
 
 /*
  * PGconn stores all the state data associated with a single connection
@@ -310,14 +324,14 @@ struct pg_conn
 	char	   *keepalives_count;		/* maximum number of TCP keepalive
 										 * retransmits */
 	char	   *sslmode;		/* SSL mode (require,prefer,allow,disable) */
-	char	   *sslcompression;	/* SSL compression (0 or 1) */
+	char	   *sslcompression; /* SSL compression (0 or 1) */
 	char	   *sslkey;			/* client key filename */
 	char	   *sslcert;		/* client certificate filename */
 	char	   *sslrootcert;	/* root certificate filename */
 	char	   *sslcrl;			/* certificate revocation list filename */
 	char	   *requirepeer;	/* required peer credentials for local sockets */
 
-#if defined(KRB5) || defined(ENABLE_GSS) || defined(ENABLE_SSPI)
+#if defined(ENABLE_GSS) || defined(ENABLE_SSPI)
 	char	   *krbsrvname;		/* Kerberos service name */
 #endif
 
@@ -342,6 +356,7 @@ struct pg_conn
 	bool		options_valid;	/* true if OK to attempt connection */
 	bool		nonblocking;	/* whether this connection is using nonblock
 								 * sending semantics */
+	bool		singleRowMode;	/* return current query result row-by-row? */
 	char		copy_is_binary; /* 1 = copy binary, 0 = copy text */
 	int			copy_already_done;		/* # bytes already returned in COPY
 										 * OUT */
@@ -349,7 +364,9 @@ struct pg_conn
 	PGnotify   *notifyTail;		/* newest unreported Notify msg */
 
 	/* Connection data */
-	int			sock;			/* Unix FD for socket, -1 if not connected */
+	/* See PQconnectPoll() for how we use 'int' and not 'pgsocket'. */
+	pgsocket	sock;			/* FD for socket, PGINVALID_SOCKET if
+								 * unconnected */
 	SockAddr	laddr;			/* Local address */
 	SockAddr	raddr;			/* Remote address */
 	ProtocolVersion pversion;	/* FE/BE protocol version in use */
@@ -396,14 +413,22 @@ struct pg_conn
 								 * msg has no length word */
 	int			outMsgEnd;		/* offset to msg end (so far) */
 
+	/* Row processor interface workspace */
+	PGdataValue *rowBuf;		/* array for passing values to rowProcessor */
+	int			rowBufLen;		/* number of entries allocated in rowBuf */
+
 	/* Status for asynchronous result construction */
 	PGresult   *result;			/* result being constructed */
-	PGresAttValue *curTuple;	/* tuple currently being read */
+	PGresult   *next_result;	/* next result (used in single-row mode) */
+
+	/* Assorted state for SSL, GSS, etc */
 
 #ifdef USE_SSL
 	bool		allow_ssl_try;	/* Allowed to try SSL negotiation */
 	bool		wait_ssl_try;	/* Delay SSL negotiation until after
 								 * attempting normal connection */
+	bool		ssl_in_use;
+#ifdef USE_OPENSSL
 	SSL		   *ssl;			/* SSL status, if have SSL connection */
 	X509	   *peer;			/* X509 cert of server */
 #ifdef USE_SSL_ENGINE
@@ -412,6 +437,7 @@ struct pg_conn
 	void	   *engine;			/* dummy field to keep struct the same if
 								 * OpenSSL version changes */
 #endif
+#endif   /* USE_OPENSSL */
 #endif   /* USE_SSL */
 
 #ifdef ENABLE_GSS
@@ -434,7 +460,6 @@ struct pg_conn
 	int			usesspi;		/* Indicate if SSPI is in use on the
 								 * connection */
 #endif
-
 
 	/* Buffer for current error message */
 	PQExpBufferData errorMessage;		/* expansible string */
@@ -460,6 +485,24 @@ struct pg_cancel
  */
 extern char *const pgresStatus[];
 
+
+#ifdef USE_SSL
+
+#ifndef WIN32
+#define USER_CERT_FILE		".postgresql/postgresql.crt"
+#define USER_KEY_FILE		".postgresql/postgresql.key"
+#define ROOT_CERT_FILE		".postgresql/root.crt"
+#define ROOT_CRL_FILE		".postgresql/root.crl"
+#else
+/* On Windows, the "home" directory is already PostgreSQL-specific */
+#define USER_CERT_FILE		"postgresql.crt"
+#define USER_KEY_FILE		"postgresql.key"
+#define ROOT_CERT_FILE		"root.crt"
+#define ROOT_CRL_FILE		"root.crl"
+#endif
+
+#endif   /* USE_SSL */
+
 /* ----------------
  * Internal functions of libpq
  * Functions declared here need to be visible across files of libpq,
@@ -471,6 +514,7 @@ extern char *const pgresStatus[];
 
 /* === in fe-connect.c === */
 
+extern void pqDropConnection(PGconn *conn);
 extern int pqPacketSend(PGconn *conn, char pack_type,
 			 const void *buf, size_t buf_len);
 extern bool pqGetHomeDirectory(char *buf, int bufsize);
@@ -501,15 +545,12 @@ extern char *pqResultStrdup(PGresult *res, const char *str);
 extern void pqClearAsyncResult(PGconn *conn);
 extern void pqSaveErrorResult(PGconn *conn);
 extern PGresult *pqPrepareAsyncResult(PGconn *conn);
-extern void
-pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...)
-/* This lets gcc check the format string for consistency. */
-__attribute__((format(PG_PRINTF_ATTRIBUTE, 2, 3)));
-extern int	pqAddTuple(PGresult *res, PGresAttValue *tup);
+extern void pqInternalNotice(const PGNoticeHooks *hooks, const char *fmt,...) pg_attribute_printf(2, 3);
 extern void pqSaveMessageField(PGresult *res, char code,
 				   const char *value);
 extern void pqSaveParameterStatus(PGconn *conn, const char *name,
 					  const char *value);
+extern int	pqRowProcessor(PGconn *conn, const char **errmsgp);
 extern void pqHandleSendFailure(PGconn *conn);
 
 /* === in fe-protocol2.c === */
@@ -558,6 +599,7 @@ extern int	pqGets(PQExpBuffer buf, PGconn *conn);
 extern int	pqGets_append(PQExpBuffer buf, PGconn *conn);
 extern int	pqPuts(const char *s, PGconn *conn);
 extern int	pqGetnchar(char *s, size_t len, PGconn *conn);
+extern int	pqSkipnchar(size_t len, PGconn *conn);
 extern int	pqPutnchar(const char *s, size_t len, PGconn *conn);
 extern int	pqGetInt(int *result, size_t bytes, PGconn *conn);
 extern int	pqPutInt(int value, size_t bytes, PGconn *conn);
@@ -579,6 +621,8 @@ extern PostgresPollingStatusType pqsecure_open_client(PGconn *);
 extern void pqsecure_close(PGconn *);
 extern ssize_t pqsecure_read(PGconn *, void *ptr, size_t len);
 extern ssize_t pqsecure_write(PGconn *, const void *ptr, size_t len);
+extern ssize_t pqsecure_raw_read(PGconn *, void *ptr, size_t len);
+extern ssize_t pqsecure_raw_write(PGconn *, const void *ptr, size_t len);
 
 #if defined(ENABLE_THREAD_SAFETY) && !defined(WIN32)
 extern int	pq_block_sigpipe(sigset_t *osigset, bool *sigpipe_pending);
@@ -587,17 +631,28 @@ extern void pq_reset_sigpipe(sigset_t *osigset, bool sigpipe_pending,
 #endif
 
 /*
+ * The SSL implementatation provides these functions (fe-secure-openssl.c)
+ */
+extern void pgtls_init_library(bool do_ssl, int do_crypto);
+extern int	pgtls_init(PGconn *conn);
+extern PostgresPollingStatusType pgtls_open_client(PGconn *conn);
+extern void pgtls_close(PGconn *conn);
+extern ssize_t pgtls_read(PGconn *conn, void *ptr, size_t len);
+extern bool pgtls_read_pending(PGconn *conn);
+extern ssize_t pgtls_write(PGconn *conn, const void *ptr, size_t len);
+
+/*
  * this is so that we can check if a connection is non-blocking internally
  * without the overhead of a function call
  */
 #define pqIsnonblocking(conn)	((conn)->nonblocking)
 
 #ifdef ENABLE_NLS
-extern char *
-libpq_gettext(const char *msgid)
-__attribute__((format_arg(1)));
+extern char *libpq_gettext(const char *msgid) pg_attribute_format_arg(1);
+extern char *libpq_ngettext(const char *msgid, const char *msgid_plural, unsigned long n) pg_attribute_format_arg(1) pg_attribute_format_arg(2);
 #else
 #define libpq_gettext(x) (x)
+#define libpq_ngettext(s, p, n) ((n) == 1 ? (s) : (p))
 #endif
 
 /*

@@ -4,7 +4,7 @@
  *	   routines for accessing the system catalogs
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -19,10 +19,14 @@
 
 #include "access/genam.h"
 #include "access/heapam.h"
+#include "access/htup_details.h"
+#include "access/nbtree.h"
 #include "access/sysattr.h"
 #include "access/transam.h"
+#include "access/xlog.h"
 #include "catalog/catalog.h"
 #include "catalog/heap.h"
+#include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "optimizer/clauses.h"
@@ -64,6 +68,7 @@ static List *build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
  *	min_attr	lowest valid AttrNumber
  *	max_attr	highest valid AttrNumber
  *	indexlist	list of IndexOptInfos for relation's indexes
+ *	fdwroutine	if it's a foreign table, the FDW function pointers
  *	pages		number of pages
  *	tuples		number of tuples
  *
@@ -123,7 +128,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	 * Don't bother with indexes for an inheritance parent, either.
 	 */
 	if (inhparent ||
-		(IgnoreSystemIndexes && IsSystemClass(relation->rd_rel)))
+		(IgnoreSystemIndexes && IsSystemRelation(relation)))
 		hasindex = false;
 	else
 		hasindex = relation->rd_rel->relhasindex;
@@ -168,9 +173,10 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * Ignore invalid indexes, since they can't safely be used for
 			 * queries.  Note that this is OK because the data structure we
 			 * are constructing is only used by the planner --- the executor
-			 * still needs to insert into "invalid" indexes!
+			 * still needs to insert into "invalid" indexes, if they're marked
+			 * IndexIsReady.
 			 */
-			if (!index->indisvalid)
+			if (!IndexIsValid(index))
 			{
 				index_close(indexRelation, NoLock);
 				continue;
@@ -201,6 +207,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->indexcollations = (Oid *) palloc(sizeof(Oid) * ncolumns);
 			info->opfamily = (Oid *) palloc(sizeof(Oid) * ncolumns);
 			info->opcintype = (Oid *) palloc(sizeof(Oid) * ncolumns);
+			info->canreturn = (bool *) palloc(sizeof(bool) * ncolumns);
 
 			for (i = 0; i < ncolumns; i++)
 			{
@@ -208,11 +215,11 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				info->indexcollations[i] = indexRelation->rd_indcollation[i];
 				info->opfamily[i] = indexRelation->rd_opfamily[i];
 				info->opcintype[i] = indexRelation->rd_opcintype[i];
+				info->canreturn[i] = index_can_return(indexRelation, i + 1);
 			}
 
 			info->relam = indexRelation->rd_rel->relam;
 			info->amcostestimate = indexRelation->rd_am->amcostestimate;
-			info->canreturn = index_can_return(indexRelation);
 			info->amcanorderbyop = indexRelation->rd_am->amcanorderbyop;
 			info->amoptionalkey = indexRelation->rd_am->amoptionalkey;
 			info->amsearcharray = indexRelation->rd_am->amsearcharray;
@@ -341,12 +348,23 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			}
 			else
 			{
-				double		allvisfrac;				/* dummy */
+				double		allvisfrac; /* dummy */
 
 				estimate_rel_size(indexRelation, NULL,
 								  &info->pages, &info->tuples, &allvisfrac);
 				if (info->tuples > rel->tuples)
 					info->tuples = rel->tuples;
+			}
+
+			if (info->relam == BTREE_AM_OID)
+			{
+				/* For btrees, get tree height while we have the index open */
+				info->tree_height = _bt_getrootheight(indexRelation);
+			}
+			else
+			{
+				/* For other index types, just set it to "unknown" for now */
+				info->tree_height = -1;
 			}
 
 			index_close(indexRelation, NoLock);
@@ -358,6 +376,12 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 	}
 
 	rel->indexlist = indexinfos;
+
+	/* Grab the fdwroutine info using the relcache, while we have it */
+	if (relation->rd_rel->relkind == RELKIND_FOREIGN_TABLE)
+		rel->fdwroutine = GetFdwRoutineForRelation(relation, true);
+	else
+		rel->fdwroutine = NULL;
 
 	heap_close(relation, NoLock);
 
@@ -394,6 +418,7 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	{
 		case RELKIND_RELATION:
 		case RELKIND_INDEX:
+		case RELKIND_MATVIEW:
 		case RELKIND_TOASTVALUE:
 			/* it has storage, ok to call the smgr */
 			curpages = RelationGetNumberOfBlocks(rel);
@@ -417,7 +442,7 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 			 * such as temporary tables.)
 			 *
 			 * We approximate "never vacuumed" by "has relpages = 0", which
-			 * means this will also fire on genuinely empty relations.	Not
+			 * means this will also fire on genuinely empty relations.  Not
 			 * great, but fortunately that's a seldom-seen case in the real
 			 * world, and it shouldn't degrade the quality of the plan too
 			 * much anyway to err in this direction.
@@ -484,8 +509,8 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 				int32		tuple_width;
 
 				tuple_width = get_rel_data_width(rel, attr_widths);
-				tuple_width += sizeof(HeapTupleHeaderData);
-				tuple_width += sizeof(ItemPointerData);
+				tuple_width += MAXALIGN(SizeofHeapTupleHeader);
+				tuple_width += sizeof(ItemIdData);
 				/* note: integer division is intentional here */
 				density = (BLCKSZ - SizeOfPageHeaderData) / tuple_width;
 			}
@@ -663,12 +688,6 @@ get_relation_constraints(PlannerInfo *root,
 
 			cexpr = (Node *) canonicalize_qual((Expr *) cexpr);
 
-			/*
-			 * Also mark any coercion format fields as "don't care", so that
-			 * we can match to both explicit and implicit coercions.
-			 */
-			set_coercionform_dontcare(cexpr);
-
 			/* Fix Vars to have the desired varno */
 			if (varno != 1)
 				ChangeVarNodes(cexpr, 1, varno, 0);
@@ -702,6 +721,7 @@ get_relation_constraints(PlannerInfo *root,
 												  0);
 					ntest->nulltesttype = IS_NOT_NULL;
 					ntest->argisrow = type_is_rowtype(att->atttypid);
+					ntest->location = -1;
 					result = lappend(result, ntest);
 				}
 			}
@@ -768,7 +788,7 @@ relation_excluded_by_constraints(PlannerInfo *root,
 		return false;
 
 	/*
-	 * OK to fetch the constraint expressions.	Include "col IS NOT NULL"
+	 * OK to fetch the constraint expressions.  Include "col IS NOT NULL"
 	 * expressions for attnotnull columns, in case we can refute those.
 	 */
 	constraint_pred = get_relation_constraints(root, rte->relid, rel, true);
@@ -816,7 +836,7 @@ relation_excluded_by_constraints(PlannerInfo *root,
  * Exception: if there are any dropped columns, we punt and return NIL.
  * Ideally we would like to handle the dropped-column case too.  However this
  * creates problems for ExecTypeFromTL, which may be asked to build a tupdesc
- * for a tlist that includes vars of no-longer-existent types.	In theory we
+ * for a tlist that includes vars of no-longer-existent types.  In theory we
  * could dig out the required info from the pg_attribute entries of the
  * relation, but that data is not readily available to ExecTypeFromTL.
  * For now, we don't apply the physical-tlist optimization when there are
@@ -965,7 +985,7 @@ build_index_tlist(PlannerInfo *root, IndexOptInfo *index,
 
 			if (indexkey < 0)
 				att_tup = SystemAttributeDefinition(indexkey,
-											heapRelation->rd_rel->relhasoids);
+										   heapRelation->rd_rel->relhasoids);
 			else
 				att_tup = heapRelation->rd_att->attrs[indexkey - 1];
 
@@ -1010,6 +1030,7 @@ Selectivity
 restriction_selectivity(PlannerInfo *root,
 						Oid operatorid,
 						List *args,
+						Oid inputcollid,
 						int varRelid)
 {
 	RegProcedure oprrest = get_oprrest(operatorid);
@@ -1022,11 +1043,12 @@ restriction_selectivity(PlannerInfo *root,
 	if (!oprrest)
 		return (Selectivity) 0.5;
 
-	result = DatumGetFloat8(OidFunctionCall4(oprrest,
-											 PointerGetDatum(root),
-											 ObjectIdGetDatum(operatorid),
-											 PointerGetDatum(args),
-											 Int32GetDatum(varRelid)));
+	result = DatumGetFloat8(OidFunctionCall4Coll(oprrest,
+												 inputcollid,
+												 PointerGetDatum(root),
+												 ObjectIdGetDatum(operatorid),
+												 PointerGetDatum(args),
+												 Int32GetDatum(varRelid)));
 
 	if (result < 0.0 || result > 1.0)
 		elog(ERROR, "invalid restriction selectivity: %f", result);
@@ -1045,6 +1067,7 @@ Selectivity
 join_selectivity(PlannerInfo *root,
 				 Oid operatorid,
 				 List *args,
+				 Oid inputcollid,
 				 JoinType jointype,
 				 SpecialJoinInfo *sjinfo)
 {
@@ -1058,12 +1081,13 @@ join_selectivity(PlannerInfo *root,
 	if (!oprjoin)
 		return (Selectivity) 0.5;
 
-	result = DatumGetFloat8(OidFunctionCall5(oprjoin,
-											 PointerGetDatum(root),
-											 ObjectIdGetDatum(operatorid),
-											 PointerGetDatum(args),
-											 Int16GetDatum(jointype),
-											 PointerGetDatum(sjinfo)));
+	result = DatumGetFloat8(OidFunctionCall5Coll(oprjoin,
+												 inputcollid,
+												 PointerGetDatum(root),
+												 ObjectIdGetDatum(operatorid),
+												 PointerGetDatum(args),
+												 Int16GetDatum(jointype),
+												 PointerGetDatum(sjinfo)));
 
 	if (result < 0.0 || result > 1.0)
 		elog(ERROR, "invalid join selectivity: %f", result);

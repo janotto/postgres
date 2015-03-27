@@ -3,7 +3,7 @@
  * visibilitymap.c
  *	  bitmap for tracking visibility of heap tuples
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  *
@@ -16,7 +16,7 @@
  *		visibilitymap_pin_ok - check whether correct map page is already pinned
  *		visibilitymap_set	 - set a bit in a previously pinned page
  *		visibilitymap_test	 - test if a bit is set
- *		visibilitymap_count	 - count number of bits set in visibility map
+ *		visibilitymap_count  - count number of bits set in visibility map
  *		visibilitymap_truncate	- truncate the visibility map
  *
  * NOTES
@@ -82,8 +82,9 @@
  */
 #include "postgres.h"
 
-#include "access/heapam.h"
+#include "access/heapam_xlog.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -229,15 +230,22 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer buf)
  * recptr is the LSN of the XLOG record we're replaying, if we're in recovery,
  * or InvalidXLogRecPtr in normal running.  The page LSN is advanced to the
  * one provided; in normal running, we generate a new XLOG record and set the
- * page LSN to that value.
+ * page LSN to that value.  cutoff_xid is the largest xmin on the page being
+ * marked all-visible; it is needed for Hot Standby, and can be
+ * InvalidTransactionId if the page contains no tuples.
+ *
+ * Caller is expected to set the heap page's PD_ALL_VISIBLE bit before calling
+ * this function. Except in recovery, caller should also pass the heap
+ * buffer. When checksums are enabled and we're not in recovery, we must add
+ * the heap buffer to the WAL chain to protect it from being torn.
  *
  * You must pass a buffer containing the correct map page to this function.
  * Call visibilitymap_pin first to pin the right one. This function doesn't do
  * any I/O.
  */
 void
-visibilitymap_set(Relation rel, BlockNumber heapBlk, XLogRecPtr recptr,
-				  Buffer buf)
+visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
+				  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
@@ -250,34 +258,55 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, XLogRecPtr recptr,
 #endif
 
 	Assert(InRecovery || XLogRecPtrIsInvalid(recptr));
+	Assert(InRecovery || BufferIsValid(heapBuf));
 
-	/* Check that we have the right page pinned */
-	if (!BufferIsValid(buf) || BufferGetBlockNumber(buf) != mapBlock)
-		elog(ERROR, "wrong buffer passed to visibilitymap_set");
+	/* Check that we have the right heap page pinned, if present */
+	if (BufferIsValid(heapBuf) && BufferGetBlockNumber(heapBuf) != heapBlk)
+		elog(ERROR, "wrong heap buffer passed to visibilitymap_set");
 
-	page = BufferGetPage(buf);
+	/* Check that we have the right VM page pinned */
+	if (!BufferIsValid(vmBuf) || BufferGetBlockNumber(vmBuf) != mapBlock)
+		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
+
+	page = BufferGetPage(vmBuf);
 	map = PageGetContents(page);
-	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
 
 	if (!(map[mapByte] & (1 << mapBit)))
 	{
 		START_CRIT_SECTION();
 
 		map[mapByte] |= (1 << mapBit);
-		MarkBufferDirty(buf);
+		MarkBufferDirty(vmBuf);
 
 		if (RelationNeedsWAL(rel))
 		{
 			if (XLogRecPtrIsInvalid(recptr))
-				recptr = log_heap_visible(rel->rd_node, heapBlk, buf);
+			{
+				Assert(!InRecovery);
+				recptr = log_heap_visible(rel->rd_node, heapBuf, vmBuf,
+										  cutoff_xid);
+
+				/*
+				 * If data checksums are enabled (or wal_log_hints=on), we
+				 * need to protect the heap page from being torn.
+				 */
+				if (XLogHintBitIsNeeded())
+				{
+					Page		heapPage = BufferGetPage(heapBuf);
+
+					/* caller is expected to set PD_ALL_VISIBLE first */
+					Assert(PageIsAllVisible(heapPage));
+					PageSetLSN(heapPage, recptr);
+				}
+			}
 			PageSetLSN(page, recptr);
-			PageSetTLI(page, ThisTimeLineID);
 		}
 
 		END_CRIT_SECTION();
 	}
 
-	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+	LockBuffer(vmBuf, BUFFER_LOCK_UNLOCK);
 }
 
 /*
@@ -290,6 +319,13 @@ visibilitymap_set(Relation rel, BlockNumber heapBlk, XLogRecPtr recptr,
  * relation. On return, *buf is a valid buffer with the map page containing
  * the bit for heapBlk, or InvalidBuffer. The caller is responsible for
  * releasing *buf after it's done testing and setting bits.
+ *
+ * NOTE: This function is typically called without a lock on the heap page,
+ * so somebody else could change the bit just after we look at it.  In fact,
+ * since we don't lock the visibility map page either, it's even possible that
+ * someone else could have changed the bit just before we look at it, but yet
+ * we might see the old value.  It is the caller's responsibility to deal with
+ * all concurrency issues!
  */
 bool
 visibilitymap_test(Relation rel, BlockNumber heapBlk, Buffer *buf)
@@ -324,7 +360,9 @@ visibilitymap_test(Relation rel, BlockNumber heapBlk, Buffer *buf)
 	map = PageGetContents(BufferGetPage(*buf));
 
 	/*
-	 * We don't need to lock the page, as we're only looking at a single bit.
+	 * A single-bit read is atomic.  There could be memory-ordering effects
+	 * here, but for performance reasons we make it the caller's job to worry
+	 * about that.
 	 */
 	result = (map[mapByte] & (1 << mapBit)) ? true : false;
 
@@ -332,7 +370,7 @@ visibilitymap_test(Relation rel, BlockNumber heapBlk, Buffer *buf)
 }
 
 /*
- *	visibilitymap_count	 - count number of bits set in visibility map
+ *	visibilitymap_count  - count number of bits set in visibility map
  *
  * Note: we ignore the possibility of race conditions when the table is being
  * extended concurrently with the call.  New pages added to the table aren't
@@ -344,16 +382,16 @@ visibilitymap_count(Relation rel)
 	BlockNumber result = 0;
 	BlockNumber mapBlock;
 
-	for (mapBlock = 0; ; mapBlock++)
+	for (mapBlock = 0;; mapBlock++)
 	{
 		Buffer		mapBuffer;
 		unsigned char *map;
 		int			i;
 
 		/*
-		 * Read till we fall off the end of the map.  We assume that any
-		 * extra bytes in the last page are zeroed, so we don't bother
-		 * excluding them from the count.
+		 * Read till we fall off the end of the map.  We assume that any extra
+		 * bytes in the last page are zeroed, so we don't bother excluding
+		 * them from the count.
 		 */
 		mapBuffer = vm_readbuf(rel, mapBlock, false);
 		if (!BufferIsValid(mapBuffer))
@@ -439,11 +477,15 @@ visibilitymap_truncate(Relation rel, BlockNumber nheapblocks)
 		/* Clear out the unwanted bytes. */
 		MemSet(&map[truncByte + 1], 0, MAPSIZE - (truncByte + 1));
 
-		/*
+		/*----
 		 * Mask out the unwanted bits of the last remaining byte.
 		 *
-		 * ((1 << 0) - 1) = 00000000 ((1 << 1) - 1) = 00000001 ... ((1 << 6) -
-		 * 1) = 00111111 ((1 << 7) - 1) = 01111111
+		 * ((1 << 0) - 1) = 00000000
+		 * ((1 << 1) - 1) = 00000001
+		 * ...
+		 * ((1 << 6) - 1) = 00111111
+		 * ((1 << 7) - 1) = 01111111
+		 *----
 		 */
 		map[truncByte] &= (1 << truncBit) - 1;
 
@@ -484,11 +526,11 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	Buffer		buf;
 
 	/*
-	 * We might not have opened the relation at the smgr level yet, or we might
-	 * have been forced to close it by a sinval message.  The code below won't
-	 * necessarily notice relation extension immediately when extend = false,
-	 * so we rely on sinval messages to ensure that our ideas about the size of
-	 * the map aren't too far out of date.
+	 * We might not have opened the relation at the smgr level yet, or we
+	 * might have been forced to close it by a sinval message.  The code below
+	 * won't necessarily notice relation extension immediately when extend =
+	 * false, so we rely on sinval messages to ensure that our ideas about the
+	 * size of the map aren't too far out of date.
 	 */
 	RelationOpenSmgr(rel);
 
@@ -568,6 +610,8 @@ vm_extend(Relation rel, BlockNumber vm_nblocks)
 	/* Now extend the file */
 	while (vm_nblocks_now < vm_nblocks)
 	{
+		PageSetChecksumInplace(pg, vm_nblocks_now);
+
 		smgrextend(rel->rd_smgr, VISIBILITYMAP_FORKNUM, vm_nblocks_now,
 				   (char *) pg, false);
 		vm_nblocks_now++;

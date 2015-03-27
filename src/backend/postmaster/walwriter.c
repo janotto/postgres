@@ -31,7 +31,7 @@
  * should be killed by SIGQUIT and then a recovery cycle started.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  *
  *
  * IDENTIFICATION
@@ -42,8 +42,6 @@
 #include "postgres.h"
 
 #include <signal.h>
-#include <sys/time.h>
-#include <time.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -51,9 +49,10 @@
 #include "miscadmin.h"
 #include "postmaster/walwriter.h"
 #include "storage/bufmgr.h"
+#include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
-#include "storage/pmsignal.h"
+#include "storage/proc.h"
 #include "storage/smgr.h"
 #include "utils/guc.h"
 #include "utils/hsearch.h"
@@ -67,6 +66,14 @@
 int			WalWriterDelay = 200;
 
 /*
+ * Number of do-nothing loops before lengthening the delay time, and the
+ * multiplier to apply to WalWriterDelay when we do decide to hibernate.
+ * (Perhaps these need to be configurable?)
+ */
+#define LOOPS_UNTIL_HIBERNATE		50
+#define HIBERNATE_FACTOR			25
+
+/*
  * Flags set by interrupt handlers for later service in the main loop.
  */
 static volatile sig_atomic_t got_SIGHUP = false;
@@ -76,31 +83,21 @@ static volatile sig_atomic_t shutdown_requested = false;
 static void wal_quickdie(SIGNAL_ARGS);
 static void WalSigHupHandler(SIGNAL_ARGS);
 static void WalShutdownHandler(SIGNAL_ARGS);
+static void walwriter_sigusr1_handler(SIGNAL_ARGS);
 
 /*
  * Main entry point for walwriter process
  *
- * This is invoked from BootstrapMain, which has already created the basic
- * execution environment, but not enabled signals yet.
+ * This is invoked from AuxiliaryProcessMain, which has already created the
+ * basic execution environment, but not enabled signals yet.
  */
 void
 WalWriterMain(void)
 {
 	sigjmp_buf	local_sigjmp_buf;
 	MemoryContext walwriter_context;
-
-	InitLatch(WALWriterLatch()); /* initialize latch used in main loop */
-
-	/*
-	 * If possible, make this process a group leader, so that the postmaster
-	 * can signal any child processes too.	(walwriter probably never has any
-	 * child processes, but for consistency we make all postmaster child
-	 * processes do this.)
-	 */
-#ifdef HAVE_SETSID
-	if (setsid() < 0)
-		elog(FATAL, "setsid() failed: %m");
-#endif
+	int			left_till_hibernate;
+	bool		hibernating;
 
 	/*
 	 * Properly accept or ignore signals the postmaster might send us
@@ -114,7 +111,7 @@ WalWriterMain(void)
 	pqsignal(SIGQUIT, wal_quickdie);	/* hard crash time */
 	pqsignal(SIGALRM, SIG_IGN);
 	pqsignal(SIGPIPE, SIG_IGN);
-	pqsignal(SIGUSR1, SIG_IGN); /* reserve for ProcSignal */
+	pqsignal(SIGUSR1, walwriter_sigusr1_handler);
 	pqsignal(SIGUSR2, SIG_IGN); /* not used */
 
 	/*
@@ -166,7 +163,7 @@ WalWriterMain(void)
 
 		/*
 		 * These operations are really just a minimal subset of
-		 * AbortTransaction().	We don't have very many resources to worry
+		 * AbortTransaction().  We don't have very many resources to worry
 		 * about in walwriter, but we do have LWLocks, and perhaps buffers?
 		 */
 		LWLockReleaseAll();
@@ -178,6 +175,7 @@ WalWriterMain(void)
 							 false, true);
 		/* we needn't bother with the other ResourceOwnerRelease phases */
 		AtEOXact_Buffers(false);
+		AtEOXact_SMgr();
 		AtEOXact_Files();
 		AtEOXact_HashTables(false);
 
@@ -218,18 +216,43 @@ WalWriterMain(void)
 	PG_SETMASK(&UnBlockSig);
 
 	/*
+	 * Reset hibernation state after any error.
+	 */
+	left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
+	hibernating = false;
+	SetWalWriterSleeping(false);
+
+	/*
+	 * Advertise our latch that backends can use to wake us up while we're
+	 * sleeping.
+	 */
+	ProcGlobal->walwriterLatch = &MyProc->procLatch;
+
+	/*
 	 * Loop forever
 	 */
 	for (;;)
 	{
-		ResetLatch(WALWriterLatch());
+		long		cur_timeout;
+		int			rc;
 
 		/*
-		 * Emergency bailout if postmaster has died.  This is to avoid the
-		 * necessity for manual cleanup of all postmaster children.
+		 * Advertise whether we might hibernate in this cycle.  We do this
+		 * before resetting the latch to ensure that any async commits will
+		 * see the flag set if they might possibly need to wake us up, and
+		 * that we won't miss any signal they send us.  (If we discover work
+		 * to do in the last cycle before we would hibernate, the global flag
+		 * will be set unnecessarily, but little harm is done.)  But avoid
+		 * touching the global flag if it doesn't need to change.
 		 */
-		if (!PostmasterIsAlive())
-			exit(1);
+		if (hibernating != (left_till_hibernate <= 1))
+		{
+			hibernating = (left_till_hibernate <= 1);
+			SetWalWriterSleeping(hibernating);
+		}
+
+		/* Clear any already-pending wakeups */
+		ResetLatch(MyLatch);
 
 		/*
 		 * Process any requests or signals received recently.
@@ -246,13 +269,34 @@ WalWriterMain(void)
 		}
 
 		/*
-		 * Do what we're here for...
+		 * Do what we're here for; then, if XLogBackgroundFlush() found useful
+		 * work to do, reset hibernation counter.
 		 */
-		XLogBackgroundFlush();
+		if (XLogBackgroundFlush())
+			left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
+		else if (left_till_hibernate > 0)
+			left_till_hibernate--;
 
-		(void) WaitLatch(WALWriterLatch(),
-							   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
-							   WalWriterDelay /* ms */);
+		/*
+		 * Sleep until we are signaled or WalWriterDelay has elapsed.  If we
+		 * haven't done anything useful for quite some time, lengthen the
+		 * sleep time so as to reduce the server's idle power consumption.
+		 */
+		if (left_till_hibernate > 0)
+			cur_timeout = WalWriterDelay;		/* in ms */
+		else
+			cur_timeout = WalWriterDelay * HIBERNATE_FACTOR;
+
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
+					   cur_timeout);
+
+		/*
+		 * Emergency bailout if postmaster has died.  This is to avoid the
+		 * necessity for manual cleanup of all postmaster children.
+		 */
+		if (rc & WL_POSTMASTER_DEATH)
+			exit(1);
 	}
 }
 
@@ -284,7 +328,7 @@ wal_quickdie(SIGNAL_ARGS)
 	on_exit_reset();
 
 	/*
-	 * Note we do exit(2) not exit(0).	This is to force the postmaster into a
+	 * Note we do exit(2) not exit(0).  This is to force the postmaster into a
 	 * system reset cycle if some idiot DBA sends a manual SIGQUIT to a random
 	 * backend.  This is necessary precisely because we don't clean up our
 	 * shared memory state.  (The "dead man switch" mechanism in pmsignal.c
@@ -298,14 +342,33 @@ wal_quickdie(SIGNAL_ARGS)
 static void
 WalSigHupHandler(SIGNAL_ARGS)
 {
+	int			save_errno = errno;
+
 	got_SIGHUP = true;
-	SetLatch(WALWriterLatch());
+	SetLatch(MyLatch);
+
+	errno = save_errno;
 }
 
 /* SIGTERM: set flag to exit normally */
 static void
 WalShutdownHandler(SIGNAL_ARGS)
 {
+	int			save_errno = errno;
+
 	shutdown_requested = true;
-	SetLatch(WALWriterLatch());
+	SetLatch(MyLatch);
+
+	errno = save_errno;
+}
+
+/* SIGUSR1: used for latch wakeups */
+static void
+walwriter_sigusr1_handler(SIGNAL_ARGS)
+{
+	int			save_errno = errno;
+
+	latch_sigusr1_handler();
+
+	errno = save_errno;
 }

@@ -6,7 +6,7 @@
  * Attribute options are cached separately from the fixed-size portion of
  * pg_attribute entries, which are handled by the relcache.
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -18,6 +18,7 @@
 
 #include "access/reloptions.h"
 #include "utils/attoptcache.h"
+#include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
@@ -45,7 +46,7 @@ typedef struct
  *		Flush all cache entries when pg_attribute is updated.
  *
  * When pg_attribute is updated, we must flush the cache entry at least
- * for that attribute.	Currently, we just flush them all.	Since attribute
+ * for that attribute.  Currently, we just flush them all.  Since attribute
  * options are not currently used in performance-critical paths (such as
  * query execution), this seems OK.
  */
@@ -81,10 +82,9 @@ InitializeAttoptCache(void)
 	MemSet(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(AttoptCacheKey);
 	ctl.entrysize = sizeof(AttoptCacheEntry);
-	ctl.hash = tag_hash;
 	AttoptCacheHash =
 		hash_create("Attopt cache", 256, &ctl,
-					HASH_ELEM | HASH_FUNCTION);
+					HASH_ELEM | HASH_BLOBS);
 
 	/* Make sure we've initialized CacheMemoryContext. */
 	if (!CacheMemoryContext)

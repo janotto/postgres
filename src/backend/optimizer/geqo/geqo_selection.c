@@ -3,7 +3,7 @@
  * geqo_selection.c
  *	  linear selection scheme for the genetic query optimizer
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/backend/optimizer/geqo/geqo_selection.c
@@ -65,8 +65,8 @@ geqo_selection(PlannerInfo *root, Chromosome *momma, Chromosome *daddy,
 	 * one, when we can't.
 	 *
 	 * This code was observed to hang up in an infinite loop when the
-	 * platform's implementation of erand48() was broken.  We now always
-	 * use our own version.
+	 * platform's implementation of erand48() was broken.  We now always use
+	 * our own version.
 	 */
 	if (pool->size > 1)
 	{

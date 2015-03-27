@@ -17,7 +17,7 @@
  * THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
  * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
  * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.	IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+ * ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
  * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
  * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
  * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
@@ -203,9 +203,10 @@ const char *px_resolve_alias(const PX_Alias *aliases, const char *name);
 
 void		px_set_debug_handler(void (*handler) (const char *));
 
+void		px_memset(void *ptr, int c, size_t len);
+
 #ifdef PX_DEBUG
-void		px_debug(const char *fmt, ...)
-	__attribute__((format(PG_PRINTF_ATTRIBUTE, 1, 2)));
+void		px_debug(const char *fmt,...) pg_attribute_printf(1, 2);
 #else
 #define px_debug(...)
 #endif

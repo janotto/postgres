@@ -4,7 +4,7 @@
  *	  node buffer management functions for GiST buffering build algorithm.
  *
  *
- * Portions Copyright (c) 1996-2012, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2015, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * IDENTIFICATION
@@ -58,7 +58,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	 * Create a temporary file to hold buffer pages that are swapped out of
 	 * memory.
 	 */
-	gfbb->pfile = BufFileCreateTemp(true);
+	gfbb->pfile = BufFileCreateTemp(false);
 	gfbb->nFileBlocks = 0;
 
 	/* Initialize free page management. */
@@ -76,16 +76,14 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 	 * nodeBuffersTab hash is association between index blocks and it's
 	 * buffers.
 	 */
+	memset(&hashCtl, 0, sizeof(hashCtl));
 	hashCtl.keysize = sizeof(BlockNumber);
 	hashCtl.entrysize = sizeof(GISTNodeBuffer);
 	hashCtl.hcxt = CurrentMemoryContext;
-	hashCtl.hash = tag_hash;
-	hashCtl.match = memcmp;
 	gfbb->nodeBuffersTab = hash_create("gistbuildbuffers",
 									   1024,
 									   &hashCtl,
-									   HASH_ELEM | HASH_CONTEXT
-									   | HASH_FUNCTION | HASH_COMPARE);
+									   HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
 
 	gfbb->bufferEmptyingQueue = NIL;
 
@@ -107,16 +105,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
 												   sizeof(GISTNodeBuffer *));
 	gfbb->loadedBuffersCount = 0;
 
-	/*
-	 * Root path item of the tree. Updated on each root node split.
-	 */
-	gfbb->rootitem = (GISTBufferingInsertStack *) MemoryContextAlloc(
-							gfbb->context, sizeof(GISTBufferingInsertStack));
-	gfbb->rootitem->parent = NULL;
-	gfbb->rootitem->blkno = GIST_ROOT_BLKNO;
-	gfbb->rootitem->downlinkoffnum = InvalidOffsetNumber;
-	gfbb->rootitem->level = maxLevel;
-	gfbb->rootitem->refCount = 1;
+	gfbb->rootlevel = maxLevel;
 
 	return gfbb;
 }
@@ -127,9 +116,7 @@ gistInitBuildBuffers(int pagesPerBuffer, int levelStep, int maxLevel)
  */
 GISTNodeBuffer *
 gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
-				  BlockNumber nodeBlocknum,
-				  OffsetNumber downlinkoffnum,
-				  GISTBufferingInsertStack *parent)
+				  BlockNumber nodeBlocknum, int level)
 {
 	GISTNodeBuffer *nodeBuffer;
 	bool		found;
@@ -144,40 +131,19 @@ gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 		/*
 		 * Node buffer wasn't found. Initialize the new buffer as empty.
 		 */
-		GISTBufferingInsertStack *path;
-		int			level;
 		MemoryContext oldcxt = MemoryContextSwitchTo(gfbb->context);
 
-		nodeBuffer->pageBuffer = NULL;
+		/* nodeBuffer->nodeBlocknum is the hash key and was filled in already */
 		nodeBuffer->blocksCount = 0;
+		nodeBuffer->pageBlocknum = InvalidBlockNumber;
+		nodeBuffer->pageBuffer = NULL;
 		nodeBuffer->queuedForEmptying = false;
-
-		/*
-		 * Create a path stack for the page.
-		 */
-		if (nodeBlocknum != GIST_ROOT_BLKNO)
-		{
-			path = (GISTBufferingInsertStack *) palloc(
-										   sizeof(GISTBufferingInsertStack));
-			path->parent = parent;
-			path->blkno = nodeBlocknum;
-			path->downlinkoffnum = downlinkoffnum;
-			path->level = parent->level - 1;
-			path->refCount = 0; /* initially unreferenced */
-			parent->refCount++; /* this path references its parent */
-			Assert(path->level > 0);
-		}
-		else
-			path = gfbb->rootitem;
-
-		nodeBuffer->path = path;
-		path->refCount++;
+		nodeBuffer->level = level;
 
 		/*
 		 * Add this buffer to the list of buffers on this level. Enlarge
 		 * buffersOnLevels array if needed.
 		 */
-		level = path->level;
 		if (level >= gfbb->buffersOnLevelsLen)
 		{
 			int			i;
@@ -208,20 +174,6 @@ gistGetNodeBuffer(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 
 		MemoryContextSwitchTo(oldcxt);
 	}
-	else
-	{
-		if (parent != nodeBuffer->path->parent)
-		{
-			/*
-			 * A different parent path item was provided than we've
-			 * remembered. We trust caller to provide more correct parent than
-			 * we have. Previous parent may be outdated by page split.
-			 */
-			gistDecreasePathRefcount(nodeBuffer->path->parent);
-			nodeBuffer->path->parent = parent;
-			parent->refCount++;
-		}
-	}
 
 	return nodeBuffer;
 }
@@ -244,11 +196,15 @@ gistAllocateNewPageBuffer(GISTBuildBuffers *gfbb)
 }
 
 /*
- * Add specified block number into loadedBuffers array.
+ * Add specified buffer into loadedBuffers array.
  */
 static void
 gistAddLoadedBuffer(GISTBuildBuffers *gfbb, GISTNodeBuffer *nodeBuffer)
 {
+	/* Never add a temporary buffer to the array */
+	if (nodeBuffer->isTemp)
+		return;
+
 	/* Enlarge the array if needed */
 	if (gfbb->loadedBuffersCount >= gfbb->loadedBuffersLen)
 	{
@@ -570,7 +526,7 @@ typedef struct
 	bool		isnull[INDEX_MAX_KEYS];
 	GISTPageSplitInfo *splitinfo;
 	GISTNodeBuffer *nodeBuffer;
-}	RelocationBufferInfo;
+} RelocationBufferInfo;
 
 /*
  * At page split, distribute tuples from the buffer of the split page to
@@ -579,7 +535,7 @@ typedef struct
  */
 void
 gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
-								Relation r, GISTBufferingInsertStack *path,
+								Relation r, int level,
 								Buffer buffer, List *splitinfo)
 {
 	RelocationBufferInfo *relocationBuffersInfos;
@@ -591,11 +547,11 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 				i;
 	GISTENTRY	entry[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
-	GISTNodeBuffer nodebuf;
+	GISTNodeBuffer oldBuf;
 	ListCell   *lc;
 
 	/* If the splitted page doesn't have buffers, we have nothing to do. */
-	if (!LEVEL_HAS_BUFFERS(path->level, gfbb))
+	if (!LEVEL_HAS_BUFFERS(level, gfbb))
 		return;
 
 	/*
@@ -619,15 +575,13 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 	 * read the tuples straight from the heap instead of the root buffer.
 	 */
 	Assert(blocknum != GIST_ROOT_BLKNO);
-	memcpy(&nodebuf, nodeBuffer, sizeof(GISTNodeBuffer));
+	memcpy(&oldBuf, nodeBuffer, sizeof(GISTNodeBuffer));
+	oldBuf.isTemp = true;
 
 	/* Reset the old buffer, used for the new left page from now on */
 	nodeBuffer->blocksCount = 0;
 	nodeBuffer->pageBuffer = NULL;
 	nodeBuffer->pageBlocknum = InvalidBlockNumber;
-
-	/* Reassign pointer to the saved copy. */
-	nodeBuffer = &nodebuf;
 
 	/*
 	 * Allocate memory for information about relocation buffers.
@@ -656,14 +610,11 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 		/*
 		 * Create a node buffer for the page. The leftmost half is on the same
 		 * block as the old page before split, so for the leftmost half this
-		 * will return the original buffer, which was emptied earlier in this
-		 * function.
+		 * will return the original buffer. The tuples on the original buffer
+		 * were relinked to the temporary buffer, so the original one is now
+		 * empty.
 		 */
-		newNodeBuffer = gistGetNodeBuffer(gfbb,
-										  giststate,
-										  BufferGetBlockNumber(si->buf),
-										  path->downlinkoffnum,
-										  path->parent);
+		newNodeBuffer = gistGetNodeBuffer(gfbb, giststate, BufferGetBlockNumber(si->buf), level);
 
 		relocationBuffersInfos[i].nodeBuffer = newNodeBuffer;
 		relocationBuffersInfos[i].splitinfo = si;
@@ -672,60 +623,107 @@ gistRelocateBuildBuffersOnSplit(GISTBuildBuffers *gfbb, GISTSTATE *giststate,
 	}
 
 	/*
-	 * Loop through all index tuples on the buffer on the splitted page,
-	 * moving them to buffers on the new pages.
+	 * Loop through all index tuples in the buffer of the page being split,
+	 * moving them to buffers for the new pages.  We try to move each tuple to
+	 * the page that will result in the lowest penalty for the leading column
+	 * or, in the case of a tie, the lowest penalty for the earliest column
+	 * that is not tied.
+	 *
+	 * The page searching logic is very similar to gistchoose().
 	 */
-	while (gistPopItupFromNodeBuffer(gfbb, nodeBuffer, &itup))
+	while (gistPopItupFromNodeBuffer(gfbb, &oldBuf, &itup))
 	{
-		float		sum_grow,
-					which_grow[INDEX_MAX_KEYS];
+		float		best_penalty[INDEX_MAX_KEYS];
 		int			i,
 					which;
 		IndexTuple	newtup;
 		RelocationBufferInfo *targetBufferInfo;
 
-		/*
-		 * Choose which page this tuple should go to.
-		 */
 		gistDeCompressAtt(giststate, r,
 						  itup, NULL, (OffsetNumber) 0, entry, isnull);
 
-		which = -1;
-		*which_grow = -1.0f;
-		sum_grow = 1.0f;
+		/* default to using first page (shouldn't matter) */
+		which = 0;
 
-		for (i = 0; i < splitPagesCount && sum_grow; i++)
+		/*
+		 * best_penalty[j] is the best penalty we have seen so far for column
+		 * j, or -1 when we haven't yet examined column j.  Array entries to
+		 * the right of the first -1 are undefined.
+		 */
+		best_penalty[0] = -1;
+
+		/*
+		 * Loop over possible target pages, looking for one to move this tuple
+		 * to.
+		 */
+		for (i = 0; i < splitPagesCount; i++)
 		{
-			int			j;
 			RelocationBufferInfo *splitPageInfo = &relocationBuffersInfos[i];
+			bool		zero_penalty;
+			int			j;
 
-			sum_grow = 0.0f;
+			zero_penalty = true;
+
+			/* Loop over index attributes. */
 			for (j = 0; j < r->rd_att->natts; j++)
 			{
 				float		usize;
 
+				/* Compute penalty for this column. */
 				usize = gistpenalty(giststate, j,
 									&splitPageInfo->entry[j],
 									splitPageInfo->isnull[j],
 									&entry[j], isnull[j]);
+				if (usize > 0)
+					zero_penalty = false;
 
-				if (which_grow[j] < 0 || usize < which_grow[j])
+				if (best_penalty[j] < 0 || usize < best_penalty[j])
 				{
+					/*
+					 * New best penalty for column.  Tentatively select this
+					 * page as the target, and record the best penalty.  Then
+					 * reset the next column's penalty to "unknown" (and
+					 * indirectly, the same for all the ones to its right).
+					 * This will force us to adopt this page's penalty values
+					 * as the best for all the remaining columns during
+					 * subsequent loop iterations.
+					 */
 					which = i;
-					which_grow[j] = usize;
-					if (j < r->rd_att->natts - 1 && i == 0)
-						which_grow[j + 1] = -1;
-					sum_grow += which_grow[j];
+					best_penalty[j] = usize;
+
+					if (j < r->rd_att->natts - 1)
+						best_penalty[j + 1] = -1;
 				}
-				else if (which_grow[j] == usize)
-					sum_grow += usize;
+				else if (best_penalty[j] == usize)
+				{
+					/*
+					 * The current page is exactly as good for this column as
+					 * the best page seen so far.  The next iteration of this
+					 * loop will compare the next column.
+					 */
+				}
 				else
 				{
-					sum_grow = 1;
+					/*
+					 * The current page is worse for this column than the best
+					 * page seen so far.  Skip the remaining columns and move
+					 * on to the next page, if any.
+					 */
+					zero_penalty = false;		/* so outer loop won't exit */
 					break;
 				}
 			}
+
+			/*
+			 * If we find a page with zero penalty for all columns, there's no
+			 * need to examine remaining pages; just break out of the loop and
+			 * return it.
+			 */
+			if (zero_penalty)
+				break;
 		}
+
+		/* OK, "which" is the page index to push the tuple to */
 		targetBufferInfo = &relocationBuffersInfos[which];
 
 		/* Push item to selected node buffer */

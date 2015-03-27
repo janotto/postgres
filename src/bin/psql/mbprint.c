@@ -1,7 +1,7 @@
 /*
  * psql - the PostgreSQL interactive terminal
  *
- * Copyright (c) 2000-2012, PostgreSQL Global Development Group
+ * Copyright (c) 2000-2015, PostgreSQL Global Development Group
  *
  * src/bin/psql/mbprint.c
  *
@@ -20,7 +20,7 @@
  * To avoid version-skew problems, this file must not use declarations
  * from pg_wchar.h: the encoding IDs we are dealing with are determined
  * by the libpq.so we are linked with, and that might not match the
- * numbers we see at compile time.	(If this file were inside libpq,
+ * numbers we see at compile time.  (If this file were inside libpq,
  * the problem would go away...)
  *
  * Hence, we have our own definition of pg_wchar, and we get the values
@@ -168,11 +168,12 @@ mb_utf_validate(unsigned char *pwcs)
  */
 
 /*
- * pg_wcswidth is the dumb width function. It assumes that everything will
- * only appear on one line. OTOH it is easier to use if this applies to you.
+ * pg_wcswidth is the dumb display-width function.
+ * It assumes that everything will appear on one line.
+ * OTOH it is easier to use than pg_wcssize if this applies to you.
  */
 int
-pg_wcswidth(const unsigned char *pwcs, size_t len, int encoding)
+pg_wcswidth(const char *pwcs, size_t len, int encoding)
 {
 	int			width = 0;
 
@@ -181,15 +182,16 @@ pg_wcswidth(const unsigned char *pwcs, size_t len, int encoding)
 		int			chlen,
 					chwidth;
 
-		chlen = PQmblen((const char *) pwcs, encoding);
-		if (chlen > len)
+		chlen = PQmblen(pwcs, encoding);
+		if (len < (size_t) chlen)
 			break;				/* Invalid string */
 
-		chwidth = PQdsplen((const char *) pwcs, encoding);
-
+		chwidth = PQdsplen(pwcs, encoding);
 		if (chwidth > 0)
 			width += chwidth;
+
 		pwcs += chlen;
+		len -= chlen;
 	}
 	return width;
 }
@@ -383,7 +385,7 @@ unsigned char *
 mbvalidate(unsigned char *pwcs, int encoding)
 {
 	if (encoding == PG_UTF8)
-		mb_utf_validate((unsigned char *) pwcs);
+		mb_utf_validate(pwcs);
 	else
 	{
 		/*
